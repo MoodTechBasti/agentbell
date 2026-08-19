@@ -1,0 +1,37 @@
+# byte-compiled / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# author-side license secret + key minting tool (never committed)
+.license-secret
+tools/make-license.py
+
+# self-installed agent hooks (this repo dogfoods its own tool - never commit its own output)
+.clinerules/
+.continue/
+.cursor/
+.windsurf/
+.opencode/
+.kimi-code/
+.qwen/
+.rules
+AGENTS.md
+
+# internal strategy docs (not part of the public repo)
+internal/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.orig
+
+# test cache
+.pytest_cache/
+
+# Windows/WSL download metadata
+*:Zone.Identifier

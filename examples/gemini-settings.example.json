@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "AfterAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 15000,
+            "command": "/home/you/.local/bin/agentbell hook run_completed --agent gemini"
+          }
+        ]
+      }
+    ]
+  }
+}

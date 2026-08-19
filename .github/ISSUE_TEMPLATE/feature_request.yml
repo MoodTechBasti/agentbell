@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest an idea for agentbell
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: What are you trying to do that agentbell doesn't support today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: If you have an idea of how this could work, describe it here.
+    validations:
+      required: false

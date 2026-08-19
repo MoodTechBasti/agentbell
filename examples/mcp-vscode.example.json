@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "agentbell": {
+      "type": "stdio",
+      "command": "/home/you/.local/bin/agentbell",
+      "args": ["mcp"]
+    }
+  }
+}

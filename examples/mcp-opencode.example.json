@@ -1,0 +1,9 @@
+{
+  "mcp": {
+    "agentbell": {
+      "type": "local",
+      "command": ["/home/you/.local/bin/agentbell", "mcp"],
+      "enabled": true
+    }
+  }
+}

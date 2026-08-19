@@ -1,0 +1,291 @@
+# Changelog
+
+## 1.5.0 — 2026-08-19 — first public release
+
+### Changed
+
+- **The project was renamed from `agent-notify` to `agentbell`** — binary,
+  module, config and state dirs, env vars, block markers and MCP server name
+  all changed with it; the entries below are written in the new names even
+  where the older, never-published builds used the old one.
+- **Licensing moved from HMAC to Ed25519 signatures.** Keys now look like
+  `AB1-…` and carry an Ed25519 signature over their payload. `agentbell.py`
+  contains only the matching **public** key, so a key cannot be forged from
+  anything that ships, and the private seed never leaves the author's machine.
+  RFC 8032 is implemented in stdlib Python (SHA-512 + integer math) and covered
+  by the RFC's own §7.1 test vectors. Rationale: `DECISIONS.md` §2b.
+- **The build step is gone.** `tools/build.py` used to inject a symmetric
+  signing secret into the installed copy — a secret that a single-file release
+  on PyPI would have handed to anyone with `pip download` and `grep`. There is
+  nothing to inject any more: `install.sh` installs the source file directly
+  (pipx → `pip --user` → plain copy, unchanged fallback chain).
+- **"This build cannot verify keys" is gone**, because that state can no longer
+  exist: every copy verifies keys with the embedded public key. `doctor`, the
+  init wizard and `license activate` dropped their branches for it — a key that
+  does not check out is now simply reported as invalid, with a support hint.
+
+### Security
+
+- Pre-release hardening pass: the webhook rejects browser-originated requests
+  and oversized bodies, config and hook writes refuse to follow symlinks, the
+  HTTP opener never follows redirects (credentials are not replayed to another
+  host), licensing fails closed on anything it cannot verify, and files holding
+  credentials are written with stricter modes.
+
+## 1.4.1 — 2026-08-16 — every integration re-verified against the live vendor docs
+
+Every agent path and config format was re-checked against the vendors' current
+documentation (2026-08-16) before trusting other people's machines to them.
+Vendors move; this pass found two of them.
+
+### Fixed
+
+- **Windsurf changed its rule engine** (Windsurf → Devin Desktop). Current
+  builds read `.windsurf/rules/*.md` (or `.devin/rules/*.md`, preferred) with
+  `trigger: always_on` frontmatter — the Cursor-style `.mdc` written since
+  v1.4.0 is no longer the documented format. Install now writes **both** files
+  (`.md` for current builds, `.mdc` for pre-Devin ones); uninstall removes
+  only files it owns. Detection also recognizes a `.devin` directory.
+- **Qwen Code hooks no longer block the end of every turn.** Qwen's command
+  hooks support `async: true` per current docs; v1.4.0 ran them synchronously.
+  All three hooks are now async, matching the Claude/Codex wiring.
+- **Install now repairs stale hook configs, not just detects them.** The JSON
+  merger compares whole hook entries (previously only the command string), so
+  a Qwen hook written by 1.4.0 without `async` is upgraded on the next
+  `hooks install`; the Kimi and Codex TOML blocks are replaced when the binary
+  path or flags changed (a stale path pointed at a binary that no longer
+  exists).
+- **Continue detection** also checks for the `continue` binary — the CLI is
+  `continue` (or `cn` on some installs), not only `cn`.
+- **`doctor` now reports the Qwen Code MCP registration** (it was written by
+  `mcp add` but missing from the health check's client list).
+
+### Added
+
+- **Qwen Code is a first-class MCP client**: `mcp add` registers in
+  `~/.qwen/settings.json` (global; `--project` → `.qwen/settings.json`),
+  `uninstall` and `doctor` scan it.
+
+### Verified unchanged (documented, not touched)
+
+Kimi Code hooks + MCP paths, Gemini CLI `AfterAgent`, Cursor `.mdc` rules,
+Cline `.clinerules/`, Continue `.continue/rules/`, Zed `.rules`, OpenCode
+plugin dirs + event names — see DECISIONS.md §15.
+
+## 1.4.0 — 2026-08-16 — more agents
+
+Five supported agents became twelve. Rationale — including why six of them are
+wired by rule file rather than by hook — is in `DECISIONS.md` §14.
+
+### Added
+
+- **Seven more hook targets** (5 before, 12 supported agents now): **Kimi Code**
+  (`~/.kimi-code/config.toml` `[[hooks]]`, real events → finished/failed with
+  duration), **Qwen Code** (`~/.qwen/settings.json`, Claude-style JSON hooks),
+  **Windsurf** (`.windsurf/rules/agentbell.mdc`, same MDC engine as Cursor),
+  **Cline** (`.clinerules/agentbell.md`), **Continue**
+  (`.continue/rules/agentbell.md`) and **Zed** (`.rules` block, the one file
+  Zed actually reads). Seventh, **Aider** gets an `AGENTS.md` block (auto-read
+  since v0.69), so the plain `nano` edit that worked for AGENTS.md users now
+  works for Aider too.
+- The agent code became a registry (`AGENT_SPECS`: detect / install / status
+  per agent). `find_agents()`, `install_hooks()`, `hooks_status()` and the
+  `uninstall` scan all run off one table, so a new agent is one entry instead
+  of five branches.
+- `hooks status` and `uninstall` list the new agents; `init` offers to wire
+  whichever of them it detects on your machine.
+- **Kimi Code is a first-class MCP client** for `mcp add`: it registers in
+  `~/.kimi-code/mcp.json` (global; `--project` → `<proj>/.kimi-code/mcp.json`).
+  Kimi exposes the tools as `mcp__agentbell__notify` and
+  `mcp__agentbell__ask_approval`; new sessions only, then `/mcp`.
+
+## 1.3.1 — 2026-08-14 — first-setup fixes
+
+Found by running the real setup on a clean machine (2026-08-14). Every item
+below cost the user something during that run.
+
+### Fixed
+
+- **A network timeout was reported as "invalid bot token".** During `init`,
+  `getMe` timing out sent the user back to @BotFather to create replacement
+  bots — twice — for a token that was never the problem. Transient errors now
+  pass through as what they are, and the wizard offers to keep the unverified
+  token and carry on.
+- **A bad bot token aborted the whole wizard** (`SystemExit(3)`), throwing away
+  the ntfy topic and the license key already entered. The token prompt now
+  retries, and giving up only skips Telegram — everything else stays configured.
+  `find_chat_id` failing no longer crashes `init` either.
+
+### Added
+
+- **`agentbell config set <key> <value>`** — change one setting without
+  re-running the wizard (`ntfy.topic`, `ntfy.server`, `ntfy.auth`,
+  `telegram.chat_id`, `channels`, `quiet_hours`, `quiet_hours_mode`,
+  `quiet_hours_min_priority`, `approval_timeout`). Values are validated:
+  unlike the tolerant config reader, a malformed quiet-hours window is
+  rejected rather than silently dropped. `doctor`'s short-topic warning now
+  fixes itself with one pasteable line instead of "run init again".
+- **`agentbell bot install-service`** — installs the Telegram answer daemon
+  as a systemd user unit (or a launchd agent on macOS) with the absolute
+  binary path, so the approval buttons no longer depend on a terminal staying
+  open. Detects a missing systemd (WSL, containers) and prints a `nohup`
+  fallback instead of leaving a unit file that never runs. Replaces the old
+  "copy `examples/agentbell-bot.service`" advice, which only worked from a
+  git checkout.
+
+- **OpenCode MCP no longer needs hand-editing.** `mcp add` refused any
+  `opencode.jsonc` on the assumption that it carried comments — but the check
+  was the file *extension*, and the stock OpenCode config has none. It now
+  looks for real comments (a scan that ignores strings, so `"https://…"` in
+  the default `$schema` line no longer counts) and writes the file when there
+  is nothing to lose. `opencode_config_path()` also resolves to whichever file
+  actually exists, so `mcp add`, `doctor` and `uninstall` finally agree on one
+  path instead of writing a `.json` that OpenCode ignores.
+
+### Changed
+
+- Installing Codex hooks that are already present no longer prints a `note:`
+  restating the line above it.
+- The `NEXT STEPS` block no longer lists commands *after* the blocking
+  `agentbell bot`: pasting the whole block fed the following lines into the
+  daemon's stdin, so the suggested `agentbell doctor` silently never ran.
+
+## 1.3.0 — 2026-08-14 — field-test release
+
+Versions 1.0–1.2 were unreleased development builds; see DECISIONS.md for their
+design history.
+
+Hardening pass before the 2-week field test: an adversarial multi-agent audit
+(83 findings, 37 confirmed after verification) plus end-to-end runs against the
+real Claude Code 2.1.232, Codex 0.147.0, OpenCode 1.18.18 and ntfy.sh.
+Rationale for every decision is in `DECISIONS.md` §12.
+
+### Fixed — things that were simply broken
+
+- **`agentbell mcp` crashed** with an `AttributeError` — and that is exactly the
+  command every `mcp add` registration invokes. MCP integration never worked in
+  any client. The bare subcommand now *is* the stdio server, and a test asserts it.
+- **Codex hooks were never enabled.** `features.hooks = true` was appended at the
+  end of `config.toml`, where TOML makes it a key of the *last table* instead of a
+  top-level one. It is now written above the first table header. (Any config
+  containing a `[table]` — including the `[mcp_servers.agentbell]` block this
+  tool writes itself — hit this.)
+- **A new `ask` could inherit the previous ask's answer.** ntfy's `since` cursor is
+  second-granular, so an older answer could still fall inside the new window.
+  Reproduced end to end; fixed by priming the waiter with everything already on
+  the response topic.
+- **`agentbell test` always exited 0** and printed nothing, even when nothing was
+  delivered. It now reports delivery, exits 1 on failure, and names the next step.
+- **Partial delivery lost a channel:** a queued/deferred item delivered on one
+  channel was deleted even when the other channel still failed. It is now
+  re-queued with exactly the channels that failed — in the queue, the deferred
+  store and the bundle path.
+- **Ctrl-C during a queue flush destroyed the in-flight notification.** The claimed
+  item is handed back instead of consumed.
+- **A crashed sender stranded items forever** as invisible `.sending` files; they
+  are now reclaimed after 15 minutes.
+- **`hooks install` appended a second copy of every hook** when the binary path
+  changed (pipx → copy), so every turn notified twice. Stale copies of our own
+  hooks are now replaced.
+- **`uninstall` left a pip install fully working** — only the metadata directory
+  was deleted, not the module or the launcher script.
+- **The Cursor rule was invalid**: comment markers above the YAML frontmatter and
+  an unquoted colon inside it. The `.mdc` file is now written verbatim.
+- **A dead answer daemon still got approval buttons** for up to 60 s (heartbeat age
+  was checked, process liveness was not).
+- **A restarted Telegram daemon replayed up to 24 h of backlog** and could answer a
+  brand-new question with an old message. Replies that predate the question are
+  now rejected.
+- **The queue drain blocked the daemon** for minutes on a long backlog; it is now
+  capped at 20 s per cycle so approvals keep flowing.
+- **`notify` exited 3 and hid a successful ntfy delivery** when the config listed
+  Telegram without a valid license. Config-derived channels degrade; an explicit
+  `--channel telegram` still fails loudly.
+- **The approval poller and `test` ignored ntfy auth**, so both silently failed
+  against a protected self-hosted ntfy.
+- **The live approval stream died after ~46 s** (read timeout equal to ntfy's
+  keepalive) and never reconnected, silently degrading to polling.
+- **A title or tag containing a newline crashed** the CLI and the webhook, and an
+  untitled notification was literally titled "None".
+- **A hand-edited `quiet_hours` value crashed every send**; values are now
+  normalized on load and validated in the wizard.
+- **A topic of 55–64 characters broke every `ask`** (the derived `-responses`
+  topic exceeded ntfy's limit) — rejected at setup with an explanatory message.
+- **`agentbell hooks` with no subcommand** crashed like `mcp` did.
+- **Windows notifications** loaded a type and reported success without notifying.
+- Ctrl-C/Ctrl-D anywhere printed a traceback; `hooks uninstall` left an empty
+  `"hooks": {}`; deferred bundles were listed in random order; the bot daemon
+  left its lock file behind.
+
+### Security
+
+- **The paid tier was unlockable by anyone**: `AGENTBELL_LICENSE_SECRET` let a
+  user choose the *verifier's* secret and sign their own key. A build with the
+  real secret injected now ignores the environment entirely.
+- **The Telegram bot token leaked** into `history.jsonl`, `bot.json`, queue files
+  and stderr — every error message carried the full API URL. Scrubbed at the
+  single choke point.
+- **`_pid_alive` terminated processes on Windows**: `os.kill(pid, 0)` maps to
+  `TerminateProcess` there. It now queries the exit code instead.
+- `config.json` is written **0600** (license key, Telegram token, ntfy password)
+  and every config write is atomic.
+- `config show` redacts **all four** credentials — it previously printed the
+  self-hosted ntfy password and the webhook token in clear.
+- The webhook server **refuses to listen on a non-loopback address without a
+  token**, and rejects a malformed `timeout_seconds` with 400 instead of dying.
+- macOS notifications escape the message instead of interpolating it into
+  AppleScript; `notify-send` gets `--`.
+- The webhook bearer token is compared with `hmac.compare_digest`.
+- Telegram approval buttons are only accepted from the configured chat.
+- Approval buttons can carry a scoped `ntfy.action_auth` credential instead of
+  the account password (a button definition is visible to every subscriber).
+- `history.jsonl` is rotated at 2 MB instead of growing forever.
+- Agent configs are never overwritten when they contain invalid JSON.
+
+### Added
+
+- **`agentbell doctor`** — checks install, PATH, config, file mode, topic,
+  server reachability, quiet hours, license, Telegram daemon, agent hooks, MCP
+  registrations, queue backlog and state dir, and prints a **copy-paste fix
+  command** for everything that is wrong. `--send` adds a real delivery test.
+- **Desktop apps via MCP**: `mcp add` targets `claude`, `claude-desktop`,
+  `chatgpt-desktop`, `codex`, `gemini`, `cursor`, `opencode`, `vscode` —
+  globally, and only for clients actually installed — plus `--print` for
+  anything else. (ChatGPT Desktop shares Codex's MCP config; ChatGPT web is
+  remote-MCP-only.)
+- **A real OpenCode plugin** (`~/.config/opencode/plugin/agentbell.js`) instead
+  of an `AGENTS.md` request the model could ignore: `session.idle`,
+  `session.error` and `permission.asked`, with subagent sessions filtered out.
+  Installing migrates away from the old `AGENTS.md` block automatically.
+- **Turn durations for Claude Code and Codex** ("finished in 4m12s") via a silent
+  `UserPromptSubmit` start marker.
+- **`--min-duration` (default 60 s on Claude Code and Codex)** — "finished" fires
+  after every turn, so short turns you watched happen now stay silent (logged as
+  `hook.skipped_short`). Failures and unknown durations always notify.
+- `init` and `install.sh` end with a copy-paste **NEXT STEPS** block; the wizard
+  walks you through BotFather for Telegram.
+- `license activate` and `doctor` detect a build installed without the signing
+  secret, instead of blaming your key.
+- A denial can carry a reason ("no, not before the release") instead of losing it.
+
+### Changed
+
+- **Free-text answers keep their text.** "yes, but use staging" is an instruction,
+  not a bare approval. A leading negation still denies (fail-closed), a bare
+  "yes"/"ok" still approves.
+- Hooks and MCP are registered **globally** by default (`--project` forces
+  project scope) — you wire up once, not per repo.
+- MCP `ask_approval` defaults to a 120 s timeout (capped at 600 s) so desktop
+  clients do not cancel the call.
+- The queue is drained oldest-first, as documented.
+- Deferred items are bundled **per channel set**, so a channel-restricted message
+  is never republished everywhere.
+- An unreadable response topic is reported on stderr instead of looking like
+  "nobody answered".
+
+### Internal
+
+- One atomic JSON writer, one ntfy poll helper, one Telegram API call helper
+  (was five copies), one bot-state updater (was two), one quiet-hours
+  normalizer, and a rewritten `_merge_json_hooks`.
+- Test suite: 91 → 128 tests, with a regression test per confirmed finding.

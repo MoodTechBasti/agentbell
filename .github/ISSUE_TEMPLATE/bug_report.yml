@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a problem with agentbell
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected to happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor-output
+    attributes:
+      label: Output of `agentbell doctor`
+      description: >
+        Run `agentbell doctor` and paste the output here — but REPLACE your
+        topic names with <redacted> first. Topic names are credentials:
+        anyone who knows them can read your notifications and answer
+        approvals. This issue is public.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: e.g. macOS 14.5, Ubuntu 22.04, Windows 11 + WSL2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - install.sh
+        - pipx
+        - pip
+        - copy
+    validations:
+      required: true
+
+  - type: input
+    id: agent
+    attributes:
+      label: Agent involved
+      description: Which AI coding agent were you using, if any (Claude Code, Codex, Cursor, ...)?
+    validations:
+      required: false

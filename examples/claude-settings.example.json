@@ -1,0 +1,49 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "/home/you/.local/bin/agentbell hook started --agent claude --silent"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "/home/you/.local/bin/agentbell hook run_completed --agent claude --min-duration 60"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "/home/you/.local/bin/agentbell hook run_failed --agent claude"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "agent_needs_input",
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "/home/you/.local/bin/agentbell hook input_required --agent claude"
+          }
+        ]
+      }
+    ]
+  }
+}

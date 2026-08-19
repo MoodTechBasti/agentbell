@@ -1,0 +1,28 @@
+# agentbell Telegram answer daemon (premium)
+#
+# Prefer: agentbell bot install-service (it writes the correct absolute path for your install)
+#
+# You normally do NOT need this file. The CLI writes the unit itself, with the
+# absolute path of your actual install — the ExecStart below assumes
+# %h/.local/bin, which is only right for the plain-copy and `pip --user`
+# install paths. A pipx or venv install lives somewhere else entirely.
+#
+# This copy is here for reference and for hand-editing. To use it directly,
+# check the ExecStart path first (`command -v agentbell`), then:
+#   cp examples/agentbell-bot.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agentbell-bot
+# Check: agentbell bot status
+
+[Unit]
+Description=agentbell Telegram answer daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart="%h/.local/bin/agentbell" bot run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

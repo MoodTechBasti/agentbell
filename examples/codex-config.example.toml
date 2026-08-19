@@ -1,0 +1,21 @@
+# agentbell: Codex hook wiring.
+# This is what `agentbell hooks install codex` appends to ~/.codex/config.toml.
+#
+# UserPromptSubmit only records a start marker (--silent, no notification), so the
+# "finished" push can report the turn duration. --min-duration 60 keeps turns
+# shorter than a minute silent — see the README for how to change it.
+
+features.hooks = true
+
+# --- agentbell:start ---
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/home/you/.local/bin/agentbell hook started --agent codex --silent"
+async = true
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/home/you/.local/bin/agentbell hook run_completed --agent codex --min-duration 60"
+async = true
+# --- agentbell:end ---
