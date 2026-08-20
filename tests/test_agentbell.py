@@ -2827,7 +2827,11 @@ class TestFieldTestRegressions(unittest.TestCase):
             binary = an.agentbell_binary()
             self.assertIn(binary, body)
             self.assertTrue(os.path.isabs(binary))
-            self.assertIn("bot run", body)
+            if sys.platform == "darwin":
+                # launchd plists carry argv as separate <string> elements
+                self.assertIn("<string>bot</string><string>run</string>", body)
+            else:
+                self.assertIn("bot run", body)
             self.assertTrue(note)
         finally:
             an.subprocess.run = original_run
