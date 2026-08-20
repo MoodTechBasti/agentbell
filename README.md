@@ -153,10 +153,7 @@ That list is the whole product for most people. Nothing above nags, expires, or 
 > - **Approve/Deny buttons that are authenticated to you.** A Telegram chat is tied to your account — unlike an ntfy topic, which anyone who learns its name could answer. (Via the `agentbell bot` daemon.)
 > - Plus **parallel delivery**: ntfy *and* Telegram at once, first answer wins.
 >
-> **Buying a key:** the €4.99 checkout goes live with the public launch and will be linked right here. You'll get an `AB1-…` key by email within 24 hours (usually much faster), then: `agentbell license activate AB1-...`
-> <!-- AT LAUNCH replace the line above with:
-> [**Buy a lifetime key — €4.99**](https://buy.polar.sh/REPLACE_ME) — you get an `AB1-…` key by email within 24 hours (usually much faster), then: `agentbell license activate AB1-...`
-> -->
+> [**Buy a lifetime key — €4.99**](https://buy.polar.sh/polar_cl_MAAwIuriOXF45xu9Fm0dbgr9iTIJFqsKM) — you get an `AB1-…` key by email within 24 hours (usually much faster), then: `agentbell license activate AB1-...`
 > The key never expires and isn't tied to a machine — use it on every computer you work on. It's verified offline; nothing about you is ever sent anywhere. VAT is included and the payment provider sends your invoice. Not what you expected? Reply to the purchase email within 14 days and you get a refund, no questions asked.
 >
 > **The honest part:** the paywall is one `if` in a file you can read, and the project is MIT — a fork that deletes it is legal. €4.99 is priced as "less than the five minutes that would take." If it isn't worth that to you, the free core is complete and I'd rather you use it. What the key *is*: an Ed25519 signature over your customer id, checked against a public key that sits in plain sight in `agentbell.py`. It can't be forged, it's verified entirely on your machine (no network, ever), and there's no secret hidden in the install for anyone to dig out. See `DECISIONS.md` §2b for the full scheme and what it deliberately doesn't protect against.
