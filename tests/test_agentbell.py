@@ -150,6 +150,20 @@ class MockNtfy:
 
         return Handler
 
+    def inject(self, topic, body, message_id):
+        """Publish with a caller-chosen message id.
+
+        Same record a POST would make, minus the random id: a test that has to
+        know an id *before* the message exists (claim/dedupe races) cannot use
+        the HTTP path, where the id is only known after the fact.
+        """
+        record = {"id": message_id, "body": body, "ts": time.time(), "headers": {}}
+        self.posts.setdefault(topic, []).append(record)
+        if self.stream_enabled:
+            for q in list(self.subscribers.get(topic, [])):
+                q.put(record)
+        return record
+
     def stop(self):
         self.server.shutdown()
         self.server.server_close()
@@ -1786,6 +1800,8 @@ class TestApprovalHardening(unittest.TestCase):
 
     def setUp(self):
         shutil.rmtree(os.path.join(an.state_dir(), "ntfy-pending"), ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.remove(an._consumed_path("ntfy"))
 
     def _run_ask_async(self, cfg, **kwargs):
         holder = {}
@@ -1847,6 +1863,64 @@ class TestApprovalHardening(unittest.TestCase):
         self.assertFalse(thread_a.is_alive())
         self.assertTrue(holder_a["result"]["approved"])
         self.assertEqual(holder_a["result"].get("channel"), "ntfy")
+
+    def test_free_text_claimed_by_another_ask_is_not_answered_twice(self):
+        """The case the newest-open check alone cannot decide.
+
+        On a slow box the ask that took a free-text reply is already finished
+        - and its pending marker deleted - by the time a second ask's poll
+        reaches the same message. That ask then finds itself "newest open" and
+        answers the very same reply. The claim recorded before the marker
+        disappeared is what stops it.
+        """
+        cfg = make_config(self.ntfy.url, topic="claimed")
+        holder, thread = self._run_ask_async(cfg, message="Which env?", timeout_seconds=20)
+        posts = self._wait_posts("claimed", 1)
+        approval_id = an.re.search(r"ID: ([0-9a-f]+)", posts[-1]["body"]).group(1)
+        # The other, newer ask: it takes the reply and shuts down (marker gone)
+        # before the message is ever handed to the ask above.
+        other_id = "b" * 16
+        an.write_ntfy_pending(other_id, "Second question?", 20)
+        other = an.ApprovalWaiter(cfg, "claimed-responses", 20, approval_id=other_id)
+        other._offer("race-msg-1", "race-claimed-reply")
+        self.assertEqual(other.messages.get_nowait(), "race-claimed-reply")
+        an.remove_ntfy_pending(other_id)
+        self.ntfy.inject("claimed-responses", "race-claimed-reply", "race-msg-1")
+        deadline = time.monotonic() + 15
+        ignored = False
+        while time.monotonic() < deadline and not ignored and "result" not in holder:
+            ignored = any(
+                r.get("event") == "stale_answer" and r.get("text") == "race-claimed-reply"
+                for r in an.read_history(limit=200))
+            time.sleep(0.05)
+        self.assertNotIn("result", holder,
+                         "a reply another ask had already claimed answered this one too")
+        self.assertTrue(ignored, "the claimed reply was never processed")
+        self.assertTrue(thread.is_alive())        # still waiting, not answered
+        # its own button answer still gets through
+        urllib.request.urlopen(
+            urllib.request.Request(f"{self.ntfy.url}/claimed-responses", method="POST",
+                                   data=f"APPROVED {approval_id}".encode())
+        ).read()
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(holder["result"]["approved"])
+
+    def test_claim_consumed_is_once_only_and_bounded(self):
+        with contextlib.suppress(OSError):
+            os.remove(an._consumed_path("claimtest"))
+        self.assertTrue(an.claim_consumed("claimtest", "abc"))
+        self.assertFalse(an.claim_consumed("claimtest", "abc"))
+        self.assertTrue(an.claim_consumed("claimtest", "def"))
+        self.assertTrue(an.claim_consumed("claimtest", None))   # nothing to key on
+        for i in range(an.CONSUMED_KEEP_LINES + 20):
+            an.claim_consumed("claimtest", f"id-{i}")
+        path = an._consumed_path("claimtest")
+        self.assertLessEqual(len(an._read_consumed("claimtest")), an.CONSUMED_KEEP_LINES)
+        self.assertEqual(os.stat(path).st_mode & 0o077, 0)
+        newest = f"id-{an.CONSUMED_KEEP_LINES + 19}"
+        self.assertFalse(an.claim_consumed("claimtest", newest))   # newest kept
+        os.remove(path)
 
     def test_stale_button_answer_ignored(self):
         cfg = make_config(self.ntfy.url, topic="staleid")

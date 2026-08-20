@@ -1322,6 +1322,64 @@ def newest_ntfy_pending():
     return newest_pending("ntfy-pending")
 
 
+# A free-text reply belongs to exactly one ask, but on ntfy every parallel ask
+# polls the same response topic and sees it. The winner records the claim here
+# *before* its pending marker is removed, so a slower poller that finds the
+# marker already gone - and would otherwise conclude it is now the newest open
+# question itself - still sees the claim and leaves the reply alone. Bounded
+# like history.jsonl: only replies from the recent past can still be offered.
+CONSUMED_KEEP_LINES = 200
+
+_CONSUMED_LOCK = threading.Lock()
+
+
+def _consumed_path(name):
+    return os.path.join(state_dir(), f"{name}-consumed")
+
+
+def _read_consumed(name):
+    try:
+        with open(_consumed_path(name), "r", encoding="utf-8", errors="replace") as fh:
+            return [line.strip() for line in fh if line.strip()]
+    except OSError:
+        return []
+
+
+def claim_consumed(name, message_id):
+    """Claim an incoming reply; False if another ask already claimed it."""
+    if not message_id:
+        return True          # nothing to key on: keep the pre-existing behavior
+    key = str(message_id)
+    with _CONSUMED_LOCK:
+        claimed = _read_consumed(name)
+        if key in claimed:
+            return False
+        ensure_state_dir()
+        path = _consumed_path(name)
+        with open_private(path, "a") as fh:
+            fh.write(key + "\n")
+        if len(claimed) + 1 > CONSUMED_KEEP_LINES:
+            _trim_consumed(path)
+    return True
+
+
+def _trim_consumed(path):
+    """Keep the claim log at CONSUMED_KEEP_LINES; the oldest ids are dead."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()[-CONSUMED_KEEP_LINES:]
+        tmp = path + ".tmp"
+        with open_private(tmp, "w") as fh:
+            fh.writelines(lines)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a claim log we cannot rewrite must not fail the answer
+
+
+def claim_ntfy_message(message_id):
+    return claim_consumed("ntfy", message_id)
+
+
 def _tg_pending_path(approval_id):
     return os.path.join(_pending_dir("tg-pending"), f"{approval_id}.json")
 
@@ -2093,6 +2151,16 @@ class ApprovalWaiter:
                 # asks do not cross-talk (same rule as Telegram, documented)
                 newest = newest_ntfy_pending()
                 if newest and newest.get("approval_id") != self.approval_id:
+                    self._log_stale(text)
+                    return
+                # Claiming AFTER the check above is what closes the race: the
+                # ask that took this reply recorded its claim before dropping
+                # its pending marker, so "the newest marker is gone" and "the
+                # claim is on disk" can never both be missed. Without this, a
+                # poll that reaches the check late - slow runner, buffered
+                # stream - promotes itself to newest and answers the same
+                # reply a second time.
+                if not claim_ntfy_message(message_id):
                     self._log_stale(text)
                     return
         self.messages.put(text)
