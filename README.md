@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/MoodTechBasti/agentbell/actions/workflows/ci.yml/badge.svg)](https://github.com/MoodTechBasti/agentbell/actions) [![License](https://img.shields.io/github/license/MoodTechBasti/agentbell)](LICENSE) ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg) ![Dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen.svg)
 
-[Setup](#60-second-setup) · [Approval flow](#approval-flow-human-in-the-loop) · [Agents](#agents-what-gets-wired-up) · [Free vs. premium](#free-vs-premium) · [Commands](#quick-reference) · [MCP](#desktop-apps-and-editors-mcp) · [Trust model](#trust-model) · [Troubleshooting](#troubleshooting) · [FAQ](#faq)
+[Setup](#60-second-setup) · [Approval flow](#approval-flow-human-in-the-loop) · [Agents](#agents-what-gets-wired-up) · [Any other agent](#any-other-agent) · [Free vs. premium](#free-vs-premium) · [Commands](#quick-reference) · [MCP](#desktop-apps-and-editors-mcp) · [Trust model](#trust-model) · [Troubleshooting](#troubleshooting) · [FAQ](#faq)
 
 ---
 
@@ -18,9 +18,9 @@ You jump between ChatGPT, Claude, Gemini, Cursor, DeepSeek… Desktop apps, CLI,
 - When it really needs a decision, you tap **Approve** or **Deny** from your phone — no running back to the keyboard
 - One stdlib-only Python file, zero dependencies, free, no account, no server
 
-Works with **Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Kimi Code, Qwen Code, Windsurf, Cline, Continue, Zed, Aider**, the **ChatGPT and Claude desktop apps** (via MCP), CI jobs, and any shell script.
+Works with **Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Kimi Code, Qwen Code, Windsurf, Cline, Continue, Zed, Aider**, the **ChatGPT and Claude desktop apps** (via MCP), CI jobs, any shell script — and [any other agent](#any-other-agent), via `agentbell integrate`.
 
-> **Status:** first public release (v1.5.0) — feedback wanted.
+> **Status:** v1.6.0 — feedback wanted.
 
 <!-- demo: docs/demo.gif — 20s: watch build → phone push → ask blocks → phone Approve → terminal continues -->
 
@@ -106,7 +106,7 @@ Exit 0 means "approved **or** answered" — so if you chain `agentbell ask "Depl
 
 ## Agents: what gets wired up
 
-`agentbell hooks install <agent>` does the wiring for you. Nothing is written into your agent session, nothing blocks a turn.
+`agentbell hooks install <agent>` does the wiring for you. Nothing is written into your agent session, nothing blocks a turn. (Your agent isn't in the table? See [Any other agent](#any-other-agent).)
 
 | Agent | Mechanism | Scope | Events |
 |---|---|---|---|
@@ -129,7 +129,7 @@ Claude Code, Codex, OpenCode, Gemini CLI, Kimi Code and Qwen Code have real hook
 
 ### No spam while you're watching
 
-"Finished" fires after *every* turn — a 20-second answer you watched happen isn't worth a push. So for Claude Code and Codex the installed hook carries `--min-duration 60`: turns shorter than a minute stay silent (logged as `hook.skipped_short` in `history`, so it's never a mystery). **Failures always send a notification**, and so does any turn whose duration is unknown.
+"Finished" fires after *every* turn — a 20-second answer you watched happen isn't worth a push. So for Claude Code, Codex, Kimi Code and Qwen Code the installed hook carries `--min-duration 60`: turns shorter than a minute stay silent (logged as `hook.skipped_short` in `history`, so it's never a mystery). **Failures always send a notification**, and so does any turn whose duration is unknown.
 
 Want a different threshold? Change the number in the hook command, or re-install:
 
@@ -144,6 +144,27 @@ Custom agents and scripts just call the CLI:
 long_job && agentbell notify "done" || agentbell notify "FAILED" --priority urgent
 agentbell watch -- long_job          # …or let watch do both
 ```
+
+---
+
+## Any other agent
+
+The runtime is agent-agnostic: any agent that can run a shell command or register an MCP server can use agentbell — it doesn't need to be in the table above. Instead of shipping an installer per vendor, agentbell publishes a **contract** and observes the results:
+
+```bash
+agentbell integrate    # prints the self-integration guide (changes nothing)
+agentbell verify       # did it actually work? (read-only, sends nothing)
+```
+
+Hand the `integrate` output to the agent ("integrate yourself with this"). It wires up **its own** config files, with its own permissions — agentbell never edits configs it doesn't have an installer for. Then one real turn plus `agentbell verify --agent <slug> --since 10m` shows whether events actually arrived, were held by quiet hours, or look like a double integration. `agentbell integrate --json` prints the same contract as a machine-readable manifest.
+
+Three classes, honestly labeled:
+
+- **Native** — the 12 agents in the table: installers maintained and tested here.
+- **Self-integrated** — wired by the agent itself against the printed contract. Counts as *verified* only after `verify` has seen a real lifecycle event (a `--force` smoke test is marked as such and doesn't count).
+- **Rules-based** — the agent only reads an instructions file: best-effort by construction; the model can skip the rule.
+
+> **Status:** field-verified with a previously unknown agent so far: **GitHub Copilot CLI 1.0.80** (2026-08-21: self-integrated from the printed contract alone — real lifecycle events, `verify` exit 0, idempotent re-run, clean removal; evidence in `FIELD_TEST.md`). *This line gets updated as real integrations are reported.*
 
 ---
 
@@ -218,6 +239,11 @@ agentbell hooks install claude codex opencode gemini cursor
 agentbell hooks install all             # every supported agent, detected or not
 agentbell hooks status
 agentbell hooks uninstall all
+
+# any agent not in the list above
+agentbell integrate                   # print the self-integration contract (changes nothing)
+agentbell integrate --json            # same contract as a machine-readable manifest
+agentbell verify --agent <slug>       # did events actually arrive? read-only, sends nothing
 
 # expose as an MCP tool (desktop apps + editors)
 agentbell mcp add                     # all clients it can detect
@@ -343,6 +369,8 @@ What this tool actually protects, and what it doesn't. Read this before you gate
 **The webhook server trusts its loopback.** On loopback it accepts requests from any local process. Set `webhook.token` even locally; browser-originated requests are rejected. A non-loopback `listen` without a token is refused outright.
 
 **ntfy.sh free-tier limits that matter:** 250 messages/day · at most 3 action buttons per notification · 4 KB message size · **no delivery guarantee** — it's best-effort. Self-hosting or ntfy's paid tiers are the reliability path.
+
+**Self-integration is the agent's work, not agentbell's.** `agentbell integrate` only prints instructions — agentbell never edits configs of agents it has no installer for, and gains no new write surface from the feature. The guide's safety rails (only your own configs, diff + explicit OK outside the project, never read agentbell's config or state) are instructions to a model, not something agentbell can enforce. That's also why `verify` deliberately never prints your topic, server or paths: it's the one status command designed to be safe to hand to an agent. `doctor` does print the topic — keep it for humans.
 
 **Not a security boundary:** agentbell doesn't authenticate who publishes to your topic and doesn't encrypt message bodies end-to-end.
 

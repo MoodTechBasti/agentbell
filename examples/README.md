@@ -10,6 +10,10 @@ The paths below all say `/home/you/.local/bin/agentbell`. Yours comes from
 `command -v agentbell`; `agentbell mcp add --print` prints the snippets
 with it already filled in.
 
+Using an agent that has no example here? `agentbell integrate` prints a
+self-integration guide any agent can follow (and `--json` a machine-readable
+manifest); `agentbell verify` then shows whether its events actually arrive.
+
 ---
 
 ## Agent hooks

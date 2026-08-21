@@ -1,5 +1,131 @@
 # Changelog
 
+## 1.6.0 — 2026-08-21 — the universal agent contract: `integrate` + `verify`
+
+Twelve maintained integrations answered "does it work with mine?" twelve
+times; this release answers it once, for every agent. agentbell no longer
+needs to know an agent to work with it: it **publishes a contract** and
+**observes the results**. Rationale: `DECISIONS.md` §16.
+
+### Added
+
+- **`agentbell integrate`** — prints a self-integration guide for any agent:
+  known-agents short-circuit (native installer + stop), a mechanism ladder
+  (shell lifecycle hooks > MCP for deliberate actions > rules block as best
+  effort — exactly ONE lifecycle mechanism), slug rules with a reserved
+  list, the runtime contract (absolute binary path, the 5 events,
+  `started --silent` + `--min-duration 60` coupled, `hook` always exits 0,
+  `ask` fails closed), a notification policy, binding safety rails (own
+  configs only, slug-scoped markers, diff + explicit OK outside the project,
+  repo-initiated tasks require asking the user, never read agentbell's
+  config/state), a two-step verification protocol and a report template.
+  `--json` prints the same contract as a machine-readable manifest
+  (`contract_version: 1`). The command changes nothing and never reads the
+  config, so no credential can appear in its output (test-enforced).
+- **`agentbell verify`** — read-only observation report from history: per
+  agent the delivered / held (quiet hours or queued) / skipped-short /
+  forced buckets, event counts, last-seen age; WARNs for near-duplicate
+  events (possible double integration — never a FAIL), delivered `started`
+  events (wire `--silent`), unknown event names (with the valid list), and
+  installed-but-silent integrations; offline delivery basics (config
+  present, topic format, binary on PATH). Sends nothing, and never prints
+  the topic, server or a path (test-enforced) — safe to hand to an agent.
+  `--json` for machines. Exit 0 = a real (non-forced) agent event observed
+  and no FAIL; forced smoke tests (`--force`) alone still exit 1 ("smoke
+  test only, wiring still unproven").
+- **History attribution** — hook-driven records now carry the firing
+  `agent`, `forced: true` when `--force` pushed them through, and
+  `source_event` preserving the original hook event when quiet hours or
+  queueing rewrote it. Unknown agent slugs now appear on the phone as the
+  slug itself instead of a generic "Agent".
+- **MCP `notify` accepts an optional `agent` argument** for attribution
+  (sanitized; a bad value drops the attribution, never kills the server).
+  Tool descriptions now state the notification policy and that a timeout
+  is not an approval.
+
+### Changed
+
+- **`hook` tolerates unknown event names**: exit 0, nothing sent, a
+  `hook.unknown_event` history record with the requested name — `verify`
+  surfaces it with the valid event list. A hallucinated event name must
+  never fail an agent's turn (`--agent` validation stays strict: exit 2).
+- `hook`'s help line no longer claims to be internal — self-integrating
+  agents are a supported caller since the contract exists.
+- `doctor` mentions self-integrated agents seen in history on its "agent
+  hooks" line and cross-links `verify`; `uninstall` lists self-integrated
+  wiring under "not removed automatically".
+
+### Fixed (found by the Tier-1 field test, see below)
+
+- **`agentbell test` no longer reports "NOT delivered" for delivered
+  messages.** The confirmation poll used an epoch cursor from the *local*
+  clock; with the local clock ahead of the server's (WSL2 clock drift), the
+  server-side `since` filter hid the delivered message, and poll errors were
+  silently swallowed. The poll now uses a server-relative duration window
+  (`since=90s`), the last poll error is reported as the failure reason, and
+  the output separates three honest states: "NOT delivered" (publish
+  failed), "sent, but NOT confirmed" (server accepted the message, read-back
+  failed — still exit 1, unconfirmed is not proven), and "delivered and
+  confirmed" (published *and* read back from the server; only your phone's
+  subscription proves the final hop). `doctor --send` reports the middle
+  state as a WARN instead of a false "did NOT arrive" FAIL. The same
+  local-clock bug class was fixed in the `ask` receiver: its prime/stream/
+  poll replay windows are now server-relative duration strings (deduplicated
+  by message id), so clock drift can no longer blind the poll fallback that
+  exists precisely for servers with unreliable streams.
+- **`verify` no longer flags rapid real permission prompts as a "possible
+  double integration".** The near-duplicate heuristic counted *any*
+  same-label events ≤5 s apart; GitHub Copilot CLI legitimately raised
+  several `permission_required` prompts within one second. Duplicate
+  detection now covers per-turn lifecycle events only (`started`,
+  `run_completed`, `run_failed`), tracks per event label (an interleaved
+  interaction event no longer hides a real turn duplicate — detection got
+  *stronger* there), and skips `--force` smoke tests (a re-run command is a
+  human, not a second integration).
+
+### Fixed (found by CI)
+
+- **A published contract can no longer carry the calling context as its
+  executable.** `agentbell_binary()` fell back to `sys.argv[0]` verbatim;
+  under `python -m unittest` the stdlib rewrites argv[0] to the literal
+  string `"python -m unittest"`, so with agentbell not on PATH the contract
+  advertised `<cwd>/python -m unittest hook …` as a runnable command (every
+  CI job; same class for any embedder with a foreign argv[0]). argv[0] is
+  now only trusted when it names a real agentbell entry point on disk
+  (launcher, `agentbell.py`, `agentbell.exe` — case-insensitive stem);
+  otherwise the fallback is the module file itself. A relative argv[0] after
+  a `chdir` is rejected by the same existence check.
+- **Uninstall, self-heal and `hooks status` now recognize every binary
+  shape.** The "is this hook ours?" test was the substring `agentbell hook`,
+  which only matches the bare-launcher shape — hooks installed from a
+  checkout (`…/agentbell.py hook …`) or on Windows (`'…\agentbell.exe'
+  hook …`, always quoted) were invisible to uninstall, repair and status.
+  The matcher now parses the command and compares the first token's
+  basename stem against `agentbell`; a wrapped command (`bash -c '…'`) is
+  deliberately not touched — it is the user's, not ours.
+- **Contract commands now embed the binary shell-quoted.** The manifest and
+  guide built commands as `f"{binary} hook …"` with the raw path; a Windows
+  path (backslashes) or any path with spaces did not survive the shell
+  split the host applies before executing — the same quoting the native
+  hook installers already used everywhere else.
+- **The Windows test jobs were red before this branch and are repaired
+  with it:** on Windows `os.path.expanduser` ignores `HOME` and reads
+  `USERPROFILE`, so tests that only moved `HOME` read and wrote the real
+  runner profile (state leaked between tests; installs landed where
+  assertions never looked). Test homes now move both variables; the bot
+  service test is skipped on Windows (no installer there by design); the
+  remaining assertions are binary-shape-independent.
+
+### Field-verified
+
+- **Tier 1 passed (2026-08-21): GitHub Copilot CLI 1.0.80** self-integrated
+  against the printed contract alone — chose its own slug and native hooks,
+  wired all 5 events with the paired anti-spam flags, produced a real
+  (non-forced) `run_completed` after an ~8-minute turn, passed
+  `verify --agent github-copilot-cli --since 10m`, was idempotent on a
+  second `integrate` run, and removed itself cleanly. Details in
+  `FIELD_TEST.md`.
+
 ## 1.5.0 — 2026-08-19 — first public release
 
 ### Changed
