@@ -164,7 +164,7 @@ Three classes, honestly labeled:
 - **Self-integrated** — wired by the agent itself against the printed contract. Counts as *verified* only after `verify` has seen a real lifecycle event (a `--force` smoke test is marked as such and doesn't count).
 - **Rules-based** — the agent only reads an instructions file: best-effort by construction; the model can skip the rule.
 
-> **Status:** the contract is new. Field-verified with a previously unknown agent so far: — *(this line gets updated as real integrations are reported; see `FIELD_TEST.md`)*.
+> **Status:** field-verified with a previously unknown agent so far: **GitHub Copilot CLI 1.0.80** (2026-08-21: self-integrated from the printed contract alone — real lifecycle events, `verify` exit 0, idempotent re-run, clean removal; evidence in `FIELD_TEST.md`). *This line gets updated as real integrations are reported.*
 
 ---
 

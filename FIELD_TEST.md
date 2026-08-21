@@ -50,8 +50,8 @@ If anything is ever unclear: **`agentbell doctor`** prints the problem *and* the
 | 20 | License status | `agentbell license status` | Correct premium state |
 | 21 | Change one setting | `agentbell config set ntfy.topic <long-random>` | Written + re-subscribe hint; `doctor` turns the topic WARN into OK; no wizard needed |
 | 22 | Setup survives a hiccup | in `init`, paste a bot token while offline | Says "could not reach Telegram", offers to keep it — the license key and topic entered before are **not** lost |
-| 23 | Self-integration (unknown agent) | hand `agentbell integrate` output to an agent NOT in the table (e.g. GitHub Copilot CLI), let it wire itself, finish one real turn | `verify --agent <slug> --since 10m` exit 0, event shown as real (not forced); push arrived with the slug as its label |
-| 24 | Double integration is detected | wire the same agent via hooks AND the Appendix A rules block on purpose, finish a turn | Two pushes; `agentbell verify` WARNs "possible double integration"; after removing one mechanism, a fresh window is clean (`verify --since 10m`) — the default 7-day window keeps warning until the old duplicate records age out |
+| 23 | Self-integration (unknown agent) | hand `agentbell integrate` output to an agent NOT in the table (e.g. GitHub Copilot CLI), let it wire itself, finish one real turn | `verify --agent <slug> --since 10m` exit 0, event shown as real (not forced); push arrived with the slug as its label — **passed 2026-08-21** with GitHub Copilot CLI 1.0.80, see Tier-1 result below |
+| 24 | Double integration is detected | wire the same agent via hooks AND the Appendix A rules block on purpose, finish a turn **of at least 60 s** (a shorter turn hits `--min-duration` on the hook side, leaves only one `run_completed` record and defeats the check) | Two pushes; `agentbell verify` WARNs "possible double integration"; after removing one mechanism, a fresh window is clean (`verify --since 10m`) — the default 7-day window keeps warning until the old duplicate records age out |
 
 ## Agent wiring — all 12
 
@@ -103,14 +103,47 @@ drift. Evidence to keep per tier: exit codes, `verify --agent <slug> --json`,
 `history --json` excerpt, the agent's own section-8 report, phone screenshot.
 
 - **Tier 1 — unknown agent with real lifecycle hooks (highest value).**
-  Candidates, best first: GitHub Copilot CLI (`npm i -g @github/copilot`;
-  hooks incl. `Stop`/`ErrorOccurred` in `~/.copilot/hooks/*.json`), Factory
-  Droid (`~/.factory/hooks.json`), Auggie CLI (`~/.augment/settings.json`),
+  **PASSED 2026-08-21 with GitHub Copilot CLI 1.0.80** — see result block
+  below. Further candidates, best first: Factory Droid
+  (`~/.factory/hooks.json`), Auggie CLI (`~/.augment/settings.json`),
   Goose (hooks shipped 2026-05). Flow: install → run `agentbell integrate`
   → hand the output to the agent → let it wire itself → end the session →
   one real turn → `agentbell verify --agent <slug> --since 10m` (expect
   exit 0, event NOT marked forced) → re-run its integration (idempotent?)→
   `agentbell verify` (no duplicate WARN) → have it remove the wiring.
+
+### Tier-1 result: GitHub Copilot CLI 1.0.80 (2026-08-21, WSL2, v1.6.0 branch)
+
+The agent received **only** the `agentbell integrate` output as
+agentbell-specific knowledge (no repo, source, README, config, state,
+history, topic, token or credential access). Observed, with evidence kept
+per the rules above:
+
+- Detected its own native lifecycle hooks, chose the unreserved slug
+  `github-copilot-cli`, proposed exactly ONE deterministic hook integration
+  (`~/.copilot/hooks/agentbell-github-copilot-cli.json`) and waited for
+  explicit user approval before writing outside the project.
+- Wired all five events; used the paired anti-spam flags
+  (`started --silent`, `run_completed --min-duration 60`).
+- Its forced smoke test was correctly NOT counted as wiring proof; real
+  `permission_required` events from real Copilot prompts and a real
+  non-forced `run_completed` after an ~8-minute turn arrived on the phone.
+- `agentbell verify --agent github-copilot-cli --since 10m` exit 0 (row 23
+  **passed**).
+- A second `integrate` run recognized the integration as complete and
+  changed nothing — no second hook file, no second lifecycle mechanism.
+- Removal via its own documented steps left no agentbell wiring behind.
+
+Row 24 (deliberate double integration via hooks AND rules block) was **not**
+exercised in this run and stays open.
+
+The same run exposed two false alarms in agentbell's own diagnostics, both
+root-caused and fixed on this branch (DECISIONS §16i, CHANGELOG 1.6.0
+"Fixed"): `agentbell test` reported "NOT delivered" for delivered messages
+(local-clock poll cursor vs. server-side `since` filter under WSL2 clock
+drift, poll errors swallowed), and `verify` warned "possible double
+integration" for several real `permission_required` prompts inside one
+second (the near-duplicate heuristic now only covers per-turn events).
 - **Tier 2 — MCP-only agent.** Candidates: Crush (Charm), Amp, Warp Agent
   CLI. Expect: `mcpServers` entry in the host's own config, `ask_approval`
   answerable from the phone, `notify` with `agent` attributed in history.
