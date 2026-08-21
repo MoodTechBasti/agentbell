@@ -3089,13 +3089,17 @@ def _install_block_file(path, content, add=True, replace_stale=False):
             # surrounding user text belongs to agentbell.
             if len(matches) != 1:
                 return False
-            replacement = f"{BLOCK_START}\n{content.rstrip()}\n{BLOCK_END}"
             match = matches[0]
+            # The lone block may belong to a different agent's integration
+            # (e.g. a not-yet-migrated marker). Never guess and overwrite it.
+            owner = re.search(r"--agent ([^\s`]+)", content)
+            if owner and owner.group(0) not in match.group(0):
+                return False
+            replacement = f"{BLOCK_START}\n{content.rstrip()}\n{BLOCK_END}"
             if match.group(0) == replacement:
                 return False
             new_text = text[:match.start()] + replacement + text[match.end():]
-            with _open_nofollow(path, "w") as fh:
-                fh.write(new_text)
+            _write_text_atomic(path, new_text)
             return True
     else:
         text = ""
