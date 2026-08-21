@@ -525,3 +525,139 @@ Added:
   `uninstall`/`doctor` scan it. Stdio format `command`/`args` confirmed against
   the Qwen Code MCP reference.
 - **Continue detection** also looks for the `continue` binary (was `cn` only).
+
+---
+
+## 16. v1.6.0: the universal agent contract — `integrate` + `verify`
+
+§15 named the problem without meaning to: twelve integrations are twelve
+claims about other people's products, and two of seven were already stale
+after three months. Agent #13 was never going to fix that — it would have
+been claim #13. This release answers the treadmill differently.
+
+### 16a. The inversion: publish a contract, observe the results
+
+**Decision:** agentbell does not integrate unknown agents. `agentbell
+integrate` prints a versioned, platform- and state-aware self-integration
+guide (`--json`: the same contract as a machine-readable manifest); the agent
+performs the integration **in its own config files, with its own
+permissions**; `agentbell verify` reports what actually happened, from
+history records alone.
+
+**Why not write foreign configs ourselves:** an installer for an agent we
+don't know means writing a config format we cannot validate, cannot repair
+and cannot cleanly uninstall — §15's treadmill with worse failure modes, plus
+a trust-boundary violation (agentbell would need write access to arbitrary
+config surfaces). The inversion gives agentbell **no new write surface at
+all**: both new commands are read-only (the guide's smoke test sends one
+notification, run by the agent, through the existing `hook` path).
+
+**The honest limitation:** a printed contract is followed by a model, not
+enforced by code. Self-integration is probabilistic where our native hook
+installers are deterministic — which is why the three classes (native /
+self-integrated / rules-based) are labeled everywhere, and why "verified"
+is a per-agent observation, not a product claim.
+
+### 16b. Why the runtime already made this possible
+
+The runtime layer was agent-agnostic before this release: `hook` accepts any
+`--agent` matching `[A-Za-z0-9_-]{1,32}`, `notify`/`ask`/MCP/webhook don't
+care who calls them, `ask` fails closed everywhere. What was missing was
+discoverability (nothing printed the contract), attribution (history records
+carried no `agent` field, unknown slugs showed as "Agent" on the phone),
+observability (suppressed/deferred/queued rewrote the event name and
+destroyed the evidence), and honesty (no way to say what "supported" means
+per class). Those four gaps are what v1.6.0 actually built.
+
+### 16c. `verify` is observation, not certification
+
+A `verify` that "certifies" an integration would be circular: the agent can
+fire a manual smoke event that is indistinguishable from a real lifecycle
+event. So:
+
+- `--force` events are recorded with `forced: true` and reported separately
+  ("N forced smoke tests") — they prove the delivery path, never the wiring.
+- The trust anchor is procedural: one **real agent turn** after the
+  integration, then `verify --agent <slug> --since 10m`.
+- Quiet hours and queueing rewrite a record's event to
+  `suppressed`/`deferred`/`queued`; the new `source_event` field preserves
+  the original hook event. Without it, "arrived but held" reads as "never
+  fired" and users would double-install during quiet hours.
+- Duplicates (same slug, same event, ≤5 s apart) are a **WARN, never a
+  FAIL**: two parallel sessions are legitimate; `history` disambiguates.
+  A runtime dedupe was rejected — it could swallow wanted notifications.
+- **`verify` never prints the topic, server or any path** (test-enforced).
+  It is the one status command designed to be handed to an agent; the guide
+  points agents at it and never at `doctor`/`config show`. `doctor` keeps
+  printing the topic — it is a human command with an explicit warning, and
+  degrading its UX to defend against an agent running it uninvited is the
+  wrong trade (documented residual risk in the README trust model).
+- doctor vs. verify: doctor = "is agentbell healthy", verify = "did agent
+  integrations actually fire". doctor's agent-hooks line mentions
+  self-integrated slugs it has seen; the real assessment lives in verify.
+
+### 16d. Attribution via an `agent` field, not a new log
+
+History already records every delivery decision; a second log would need its
+own rotation, its own consumers and a sync story. `send_notification` gained
+an optional `agent` kwarg (the only hot-path change), `run_hook` passes it
+through, and `verify` filters on it. Records without the field (plain
+`notify`, webhook) simply don't participate. MCP `notify` accepts an
+optional `agent` argument, sanitized by `safe_agent_name()` — invalid values
+drop the attribution instead of killing the MCP server (contrast
+`validate_agent_name`, whose SystemExit(2) is correct for the CLI where the
+name becomes a state-file path).
+
+### 16e. Unknown hook events: tolerant for events, strict for --agent
+
+`hook <event>` no longer argparse-rejects unknown event names: a
+self-integrating agent that invents `task_done` would otherwise die with
+exit 2 — violating "a hook must never fail the agent's turn". Unknown events
+now exit 0, send nothing, and write a `hook.unknown_event` record with the
+requested name; `verify` turns those into a WARN with the valid event list.
+Never-fail-a-turn beats clean-error **only for the event name**: `--agent`
+stays strict (exit 2) because it is interpolated into a state-file path —
+that validation is a security boundary, not ergonomics.
+
+### 16f. Slug-scoped rule markers
+
+The guide's Appendix A wraps the standard instructions block in
+`<!-- agentbell:<slug>:start/end -->` instead of the generic
+`<!-- agentbell:start -->`. The generic markers belong to
+`hooks install`/`uninstall`/purge (substring checks in
+`_install_block_file`); a self-integrated block using them would be
+mangled by `hooks uninstall zed` in the same file. The scoped markers are
+invisible to those substring checks — collision-free by construction
+(test-enforced: the generic marker does not appear in the guide).
+
+### 16g. Relationship to the field-test gate (§8.1)
+
+This feature is read-only and **adds** field-test rows (self-integration,
+double-integration detection) — it does not substitute for the open gate.
+The README's "any agent" claim is deliberately gated: it is phrased as a
+contract statement with a visible verification status ("field-verified so
+far with: —") until at least one genuinely unknown agent has been integrated
+end-to-end by a real user.
+
+### 16h. Deliberately not built (and what would change that)
+
+- **A registry of self-integrations (`agents.d`)** — deferred, not rejected.
+  History-based visibility covers doctor/verify today; a registry earns its
+  state cost when several self-integrations are active at once and need
+  names, uninstall hints or per-agent settings.
+- **verify --send** — `test`/`doctor --send` exist; "read-only, offline,
+  safe" is the property that makes verify handable to agents.
+- **A third MCP tool serving the guide** — an MCP-capable agent can run the
+  CLI or be handed the text; a tool would duplicate the contract surface.
+- **A webhook `agent` field** — webhook callers are scripts/CI, which
+  already choose their own message text; attribution solves an agent
+  problem the webhook doesn't have. Add it when a real consumer appears.
+- **Auto-repair of foreign wiring** — agentbell cannot know whether a
+  changed foreign config is drift or intent. The guide requires agents to
+  document removal steps instead.
+- **Changing the rule template of the six existing rule agents** (e.g. to
+  absolute paths or richer policy): block installs don't self-heal
+  (`_install_block_file` only adds/removes), so a text change would diverge
+  across already-installed copies. Separate decision, taken deliberately
+  later; the guide embeds the template verbatim so there is exactly one
+  text to evolve.

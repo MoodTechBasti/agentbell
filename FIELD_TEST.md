@@ -1,4 +1,4 @@
-# FIELD TEST — 2-week checklist (v1.5.0)
+# FIELD TEST — 2-week checklist (v1.6.0)
 
 Goal: use the tool like a real user for two weeks and tick off every path below.
 Budget: ~20 minutes for the first pass, then just use it.
@@ -50,6 +50,8 @@ If anything is ever unclear: **`agentbell doctor`** prints the problem *and* the
 | 20 | License status | `agentbell license status` | Correct premium state |
 | 21 | Change one setting | `agentbell config set ntfy.topic <long-random>` | Written + re-subscribe hint; `doctor` turns the topic WARN into OK; no wizard needed |
 | 22 | Setup survives a hiccup | in `init`, paste a bot token while offline | Says "could not reach Telegram", offers to keep it — the license key and topic entered before are **not** lost |
+| 23 | Self-integration (unknown agent) | hand `agentbell integrate` output to an agent NOT in the table (e.g. GitHub Copilot CLI), let it wire itself, finish one real turn | `verify --agent <slug> --since 10m` exit 0, event shown as real (not forced); push arrived with the slug as its label |
+| 24 | Double integration is detected | wire the same agent via hooks AND the Appendix A rules block on purpose, finish a turn | Two pushes; `agentbell verify` WARNs "possible double integration"; after removing one mechanism, a fresh window is clean (`verify --since 10m`) — the default 7-day window keeps warning until the old duplicate records age out |
 
 ## Agent wiring — all 12
 
@@ -92,6 +94,36 @@ Also worth checking once, on any agent: `agentbell hooks status` lists it as
 installed, and `agentbell hooks uninstall <agent>` leaves the rest of the
 config file — including your own rules — intact.
 
+## Self-integration field test (rows 23-24, expanded)
+
+The strong "any agent" claim stays gated until Tier 1 passes at least once
+(see README "Any other agent" and DECISIONS §16g). Candidates were checked
+against live vendor docs on 2026-08-21 — re-check before testing, vendors
+drift. Evidence to keep per tier: exit codes, `verify --agent <slug> --json`,
+`history --json` excerpt, the agent's own section-8 report, phone screenshot.
+
+- **Tier 1 — unknown agent with real lifecycle hooks (highest value).**
+  Candidates, best first: GitHub Copilot CLI (`npm i -g @github/copilot`;
+  hooks incl. `Stop`/`ErrorOccurred` in `~/.copilot/hooks/*.json`), Factory
+  Droid (`~/.factory/hooks.json`), Auggie CLI (`~/.augment/settings.json`),
+  Goose (hooks shipped 2026-05). Flow: install → run `agentbell integrate`
+  → hand the output to the agent → let it wire itself → end the session →
+  one real turn → `agentbell verify --agent <slug> --since 10m` (expect
+  exit 0, event NOT marked forced) → re-run its integration (idempotent?)→
+  `agentbell verify` (no duplicate WARN) → have it remove the wiring.
+- **Tier 2 — MCP-only agent.** Candidates: Crush (Charm), Amp, Warp Agent
+  CLI. Expect: `mcpServers` entry in the host's own config, `ask_approval`
+  answerable from the phone, `notify` with `agent` attributed in history.
+- **Tier 3 — rules-file-only agent.** Expect the Appendix A block with
+  slug-scoped markers. Record the follow-rate over several turns — a rule
+  the model obeyed once is not "verified", it is "observed once".
+- **Tier 4 — failure modes.** (a) agentbell not on PATH → guide must show
+  the absolute path and the PATH hint; (b) quiet hours active during the
+  integration → `verify` must show the event as held, not missing;
+  (c) two parallel sessions, same slug → duplicate WARN but exit 0;
+  (d) rules-based agent forgets the rule → nothing arrives, and that is a
+  result to write down, not a bug to hunt.
+
 ## Things worth trying on purpose
 
 - Kill the network mid-`watch` and see the queue catch it.
@@ -109,6 +141,8 @@ config file — including your own rules — intact.
 - **Six agents are wired by rule file, not by hook**: Cursor, Windsurf, Cline, Continue, Zed and Aider have no lifecycle hooks, so their wiring is an instruction the agent is asked to follow. Best-effort by construction — the model can skip it, and sometimes will. The other six (Claude Code, Codex, Gemini CLI, OpenCode, Kimi Code, Qwen Code) have real hook systems and are deterministic.
 - **ChatGPT web** cannot use a local MCP server (desktop app can).
 - **Premium**: Telegram channel, parallel delivery and Telegram buttons need a lifetime key.
+- **A manual smoke test without `--force` is indistinguishable from a real event**: `verify` marks `--force` events as smoke tests, but an agent running the plain hook command by hand looks like real wiring. The trust anchor is procedural — end the session, do one real turn, then `verify`.
+- **MCP attribution only works when the client passes `agent`**: the `notify` tool's `agent` argument is optional; calls without it appear in history without attribution.
 
 ## When something surprises you
 

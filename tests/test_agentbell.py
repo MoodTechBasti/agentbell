@@ -6,6 +6,8 @@ import json
 import os
 import queue
 import random
+import re
+import shlex
 import shutil
 import socket
 import sys
@@ -2298,7 +2300,9 @@ class TestCliWiring(unittest.TestCase):
                      ["bot", "status"], ["mcp"], ["mcp", "run"], ["mcp", "add"], ["history"],
                      ["queue"], ["queue", "list"], ["queue", "flush"], ["uninstall"],
                      ["config", "show"], ["config", "path"], ["config", "set", "k", "v"],
-                     ["bot", "install-service"], ["license", "status"]):
+                     ["bot", "install-service"], ["license", "status"],
+                     ["verify"], ["verify", "--agent", "x"], ["integrate"],
+                     ["integrate", "--json"], ["hook", "totally_made_up_event"]):
             args = parser.parse_args(argv)
             self.assertTrue(callable(getattr(args, "func", None)), f"no func for {argv}")
 
@@ -2357,6 +2361,22 @@ class TestDoctor(unittest.TestCase):
         quiet = [c for c in an.doctor_checks(cfg) if c["name"] == "quiet hours"][0]
         self.assertEqual(quiet["status"], an.WARN)
         self.assertIn("ACTIVE", quiet["detail"])
+
+    def test_doctor_mentions_self_integrated_agents(self):
+        an.write_history({"event": "hook.run_completed", "agent": "doc-selfint",
+                          "delivered": ["ntfy"]})
+        cfg = make_config("http://127.0.0.1:1")
+        original_status = an.hooks_status
+        original_find = an.find_agents
+        an.hooks_status = lambda project=None: []
+        an.find_agents = lambda: []
+        try:
+            hooks = [c for c in an.doctor_checks(cfg) if c["name"] == "agent hooks"][0]
+        finally:
+            an.hooks_status = original_status
+            an.find_agents = original_find
+        self.assertEqual(hooks["status"], an.OK)
+        self.assertIn("doc-selfint", hooks["detail"])
 
     def test_doctor_reports_an_invalid_license_key(self):
         cfg = make_config("http://127.0.0.1:1")
@@ -3370,6 +3390,711 @@ class TestInsecureAskWarning(unittest.TestCase):
             sys.stderr = stderr
         # second call must be silent: the flag prevents duplicates
         self.assertEqual(buf.getvalue(), "")
+
+
+class TestHookAttribution(unittest.TestCase):
+    """History records carry the firing agent, so `verify` can observe
+    self-integrated agents. Unique slugs per test: history.jsonl is shared
+    suite-wide."""
+
+    def setUp(self):
+        self.ntfy = MockNtfy()
+        self.cfg = make_config(self.ntfy.url, topic="attributiontopic")
+
+    def tearDown(self):
+        self.ntfy.stop()
+
+    def _recs(self, slug):
+        return [r for r in an.read_history(limit=0) if r.get("agent") == slug]
+
+    def _posts(self):
+        return self.ntfy.posts.get("attributiontopic", [])
+
+    def test_hook_history_carries_agent_and_event(self):
+        an.run_hook(self.cfg, "run_completed", "att-basic")
+        recs = self._recs("att-basic")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["event"], "hook.run_completed")
+        self.assertNotIn("source_event", recs[0])
+        self.assertNotIn("forced", recs[0])
+
+    def test_plain_notify_has_no_agent_field(self):
+        an.send_notification(self.cfg, "att plain notify marker")
+        recs = [r for r in an.read_history(limit=0)
+                if r.get("message") == "att plain notify marker"]
+        self.assertEqual(len(recs), 1)
+        self.assertNotIn("agent", recs[0])
+        self.assertNotIn("forced", recs[0])
+
+    def test_unknown_slug_appears_as_slug_not_agent(self):
+        an.run_hook(self.cfg, "run_completed", "att-roo-code")
+        body = self._posts()[-1]["body"]
+        self.assertIn("att-roo-code", body)
+        self.assertNotIn("Agent finished", body)
+
+    def test_suppressed_keeps_source_event(self):
+        self.cfg.data["quiet_hours"] = [{"start": "00:00", "end": "23:59"}]
+        self.cfg.data["quiet_hours_min_priority"] = 5
+        an.run_hook(self.cfg, "run_completed", "att-supp")
+        recs = self._recs("att-supp")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["event"], "suppressed")
+        self.assertEqual(recs[0]["source_event"], "hook.run_completed")
+
+    def test_force_marks_the_record_as_forced(self):
+        self.cfg.data["quiet_hours"] = [{"start": "00:00", "end": "23:59"}]
+        self.cfg.data["quiet_hours_min_priority"] = 5
+        an.run_hook(self.cfg, "run_completed", "att-forced", force=True)
+        recs = self._recs("att-forced")
+        self.assertEqual(len(recs), 1)
+        self.assertIs(recs[0]["forced"], True)
+        self.assertEqual(recs[0]["event"], "hook.run_completed")
+        self.assertEqual(len(self._posts()), 1)
+
+    def test_plain_forced_notify_carries_no_forced_field(self):
+        an.send_notification(self.cfg, "att plain forced marker", force=True)
+        recs = [r for r in an.read_history(limit=0)
+                if r.get("message") == "att plain forced marker"]
+        self.assertEqual(len(recs), 1)
+        self.assertNotIn("forced", recs[0])
+
+    def test_unknown_event_exits_zero_records_and_sends_nothing(self):
+        args = an.build_parser().parse_args(
+            ["hook", "totally_made_up_event", "--agent", "att-unk-evt"])
+        with self.assertRaises(SystemExit) as ctx:
+            an.cmd_hook(args)
+        self.assertEqual(ctx.exception.code, 0)
+        recs = self._recs("att-unk-evt")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["event"], "hook.unknown_event")
+        self.assertEqual(recs[0]["requested"], "totally_made_up_event")
+        self.assertEqual(self._posts(), [])
+
+    def test_unknown_event_with_bad_agent_still_exits_two(self):
+        args = an.build_parser().parse_args(
+            ["hook", "totally_made_up_event", "--agent", "../../evil"])
+        with self.assertRaises(SystemExit) as ctx:
+            an.cmd_hook(args)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_alias_still_normalizes_without_choices(self):
+        args = an.build_parser().parse_args(["hook", "done", "--agent", "att-alias"])
+        with self.assertRaises(SystemExit) as ctx:
+            an.cmd_hook(args)
+        self.assertEqual(ctx.exception.code, 0)
+        recs = self._recs("att-alias")
+        self.assertEqual(len(recs), 1)
+        self.assertNotEqual(recs[0]["event"], "hook.unknown_event")
+
+    def test_deferred_run_keeps_agent_and_source_event(self):
+        self.cfg.data["quiet_hours"] = [{"start": "00:00", "end": "23:59"}]
+        self.cfg.data["quiet_hours_min_priority"] = 5
+        self.cfg.data["quiet_hours_mode"] = "defer"
+        an.run_hook(self.cfg, "run_completed", "att-defer")
+        recs = self._recs("att-defer")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["event"], "deferred")
+        self.assertEqual(recs[0]["source_event"], "hook.run_completed")
+        for name in (os.listdir(an.deferred_dir())
+                     if os.path.isdir(an.deferred_dir()) else []):
+            os.remove(os.path.join(an.deferred_dir(), name))
+
+    def test_mcp_notify_with_agent_is_attributed(self):
+        original = an.Config
+        an.Config = lambda *a, **kw: self.cfg
+        try:
+            result = an.mcp_tool_call("notify", {"message": "mcp attributed",
+                                                 "agent": "att-mcp"})
+        finally:
+            an.Config = original
+        self.assertEqual(result, "sent")
+        recs = self._recs("att-mcp")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["event"], "notify")
+
+    def test_mcp_notify_with_hostile_agent_survives_without_field(self):
+        original = an.Config
+        an.Config = lambda *a, **kw: self.cfg
+        try:
+            result = an.mcp_tool_call("notify", {"message": "att hostile mcp marker",
+                                                 "agent": "../../etc/passwd"})
+        finally:
+            an.Config = original
+        self.assertEqual(result, "sent")
+        recs = [r for r in an.read_history(limit=0)
+                if r.get("message") == "att hostile mcp marker"]
+        self.assertEqual(len(recs), 1)
+        self.assertNotIn("agent", recs[0])
+
+    def test_safe_agent_name(self):
+        self.assertEqual(an.safe_agent_name("roo-code"), "roo-code")
+        self.assertIsNone(an.safe_agent_name(None))
+        self.assertIsNone(an.safe_agent_name("../../x"))
+        self.assertIsNone(an.safe_agent_name(""))
+        self.assertIsNone(an.safe_agent_name("a" * 33))
+
+    def test_queued_keeps_source_event_and_agent(self):
+        cfg = make_config("http://127.0.0.1:1")   # nothing listening -> queued
+        an.run_hook(cfg, "run_failed", "att-queued")
+        recs = self._recs("att-queued")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["event"], "queued")
+        self.assertEqual(recs[0]["source_event"], "hook.run_failed")
+        for name in os.listdir(an.queue_dir()) if os.path.isdir(an.queue_dir()) else []:
+            os.remove(os.path.join(an.queue_dir(), name))
+
+
+def _iso(epoch):
+    return an.datetime.datetime.fromtimestamp(epoch).astimezone().isoformat(
+        timespec="seconds")
+
+
+class TestVerifyPrimitives(unittest.TestCase):
+    """_parse_since / _history_ts / hook_observations against hand-written
+    records - no config, no network, no state dir."""
+
+    def test_parse_since(self):
+        self.assertEqual(an._parse_since("7d"), 7 * 86400)
+        self.assertEqual(an._parse_since("12h"), 12 * 3600)
+        self.assertEqual(an._parse_since("90m"), 5400)
+        self.assertEqual(an._parse_since("45s"), 45)
+        self.assertEqual(an._parse_since("45"), 45)
+        for bad in ("", None, "x7", "-5", "7 d", "1.5h"):
+            with self.assertRaises(SystemExit) as ctx:
+                an._parse_since(bad)
+            self.assertEqual(ctx.exception.code, 2)
+
+    def test_history_ts(self):
+        now = time.time()
+        self.assertAlmostEqual(an._history_ts({"ts": _iso(now)}), now, delta=1.5)
+        self.assertIsNone(an._history_ts({}))
+        self.assertIsNone(an._history_ts({"ts": "not-a-date"}))
+        self.assertIsNone(an._history_ts({"ts": 12345}))
+
+    def test_buckets_and_window(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 30), "agent": "vp-a", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 20), "agent": "vp-a", "event": "suppressed",
+             "source_event": "hook.run_failed"},
+            {"ts": _iso(now - 10), "agent": "vp-a", "event": "hook.skipped_short"},
+            {"ts": _iso(now - 5), "agent": "vp-a", "event": "hook.run_completed",
+             "delivered": [], "errors": {"ntfy": "down"}},
+            {"ts": _iso(now - 9000), "agent": "vp-a", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},                      # outside the window
+            {"ts": _iso(now - 15), "event": "notify", "delivered": ["ntfy"]},  # no agent
+            {"agent": "vp-a", "event": "hook.run_completed"},                  # no ts
+        ]
+        obs = an.hook_observations(records, since_seconds=3600, now=now)
+        self.assertEqual(list(obs), ["vp-a"])
+        a = obs["vp-a"]
+        self.assertEqual(a["count"], 4)
+        self.assertEqual(a["delivered"], 1)
+        self.assertEqual(a["held"], 1)
+        self.assertEqual(a["skipped_short"], 1)
+        self.assertEqual(a["failed"], 1)
+        self.assertEqual(a["events"]["run_completed"], 2)
+        self.assertEqual(a["events"]["run_failed"], 1)
+        self.assertEqual(a["events"]["skipped_short"], 1)
+        self.assertNotIn("_last", a)
+
+    def test_queued_with_source_event_counts_as_held(self):
+        now = time.time()
+        records = [{"ts": _iso(now - 3), "agent": "vp-q", "event": "queued",
+                    "source_event": "hook.run_completed"}]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(obs["vp-q"]["held"], 1)
+        self.assertEqual(obs["vp-q"]["events"], {"run_completed": 1})
+
+    def test_duplicates_within_five_seconds(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 10), "agent": "vp-d", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 8), "agent": "vp-d", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(len(obs["vp-d"]["duplicates"]), 1)
+        self.assertEqual(obs["vp-d"]["duplicates"][0]["event"], "run_completed")
+
+    def test_no_duplicate_at_sixty_seconds_or_different_event(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 120), "agent": "vp-n", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 60), "agent": "vp-n", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 58), "agent": "vp-n", "event": "hook.run_failed",
+             "delivered": ["ntfy"]},
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(obs["vp-n"]["duplicates"], [])
+
+    def test_skipped_short_never_a_duplicate(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 10), "agent": "vp-s", "event": "hook.skipped_short"},
+            {"ts": _iso(now - 9), "agent": "vp-s", "event": "hook.skipped_short"},
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(obs["vp-s"]["duplicates"], [])
+
+    def test_forced_and_started_and_unknown_are_tracked(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 30), "agent": "vp-f", "event": "hook.run_completed",
+             "delivered": ["ntfy"], "forced": True},
+            {"ts": _iso(now - 20), "agent": "vp-f", "event": "hook.started",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 10), "agent": "vp-f", "event": "hook.unknown_event",
+             "requested": "task_done"},
+            {"ts": _iso(now - 9), "agent": "vp-f", "event": "hook.unknown_event",
+             "requested": "task_done"},
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        f = obs["vp-f"]
+        self.assertEqual(f["forced"], 1)
+        self.assertEqual(f["started_delivered"], 1)
+        self.assertEqual(f["unknown_events"], {"task_done": 2})
+        self.assertEqual(f["count"], 2)   # unknown events are not observations
+
+
+class TestVerify(unittest.TestCase):
+    """`verify` observes, sends nothing, and never leaks the topic/server.
+    Unique slugs per test - history.jsonl is shared suite-wide."""
+
+    TOPIC = "leakmarker-topic-98765abc"
+    SERVER = "http://leak-server-marker.invalid"
+
+    def _cfg(self, topic=None):
+        tmp = tempfile.mkdtemp()
+        cfg = an.Config({
+            "ntfy": {"server": self.SERVER, "topic": topic or self.TOPIC, "auth": None},
+            "channels": ["ntfy"],
+        }, path=os.path.join(tmp, "config.json"))
+        cfg.save()
+        return cfg
+
+    def _run(self, cfg, argv):
+        """cmd_verify with a fixed Config; returns (exit_code, stdout)."""
+        args = an.build_parser().parse_args(["verify"] + argv)
+        original = an.Config
+        an.Config = lambda *a, **kw: cfg
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = an.cmd_verify(args)
+        finally:
+            an.Config = original
+        return code, buf.getvalue()
+
+    def test_no_events_is_unverified_exit_one(self):
+        code, out = self._run(self._cfg(), ["--agent", "vf-none"])
+        self.assertEqual(code, 1)
+        self.assertIn("nothing known", out)
+
+    def test_two_events_verify_exit_zero(self):
+        for _ in range(2):
+            an.write_history({"event": "hook.run_completed", "agent": "vf-two",
+                              "delivered": ["ntfy"]})
+        code, out = self._run(self._cfg(), ["--agent", "vf-two"])
+        self.assertEqual(code, 0)
+        self.assertIn("2 event(s)", out)
+        self.assertIn("self-integrated", out)
+
+    def test_window_excludes_old_events(self):
+        an.write_history({"event": "hook.run_completed", "agent": "vf-old",
+                          "delivered": ["ntfy"],
+                          "ts": _iso(time.time() - 3600)})
+        code, _ = self._run(self._cfg(), ["--agent", "vf-old", "--since", "10m"])
+        self.assertEqual(code, 1)
+        code, _ = self._run(self._cfg(), ["--agent", "vf-old", "--since", "2h"])
+        self.assertEqual(code, 0)
+
+    def test_duplicate_warns_but_never_fails(self):
+        now = time.time()
+        for offset in (6, 3):
+            an.write_history({"event": "hook.run_completed", "agent": "vf-dup",
+                              "delivered": ["ntfy"], "ts": _iso(now - offset)})
+        code, out = self._run(self._cfg(), ["--agent", "vf-dup"])
+        self.assertEqual(code, 0)
+        self.assertIn("double integration", out)
+        self.assertIn("ONE lifecycle mechanism", out)
+
+    def test_held_and_forced_are_reported_honestly(self):
+        an.write_history({"event": "suppressed", "source_event": "hook.run_completed",
+                          "agent": "vf-held"})
+        an.write_history({"event": "hook.run_completed", "agent": "vf-held",
+                          "delivered": ["ntfy"], "forced": True,
+                          "ts": _iso(time.time() - 30)})
+        code, out = self._run(self._cfg(), ["--agent", "vf-held"])
+        self.assertEqual(code, 0)
+        self.assertIn("1 held", out)
+        self.assertIn("1 forced smoke test", out)
+
+    def test_broken_topic_fails_despite_events(self):
+        an.write_history({"event": "hook.run_completed", "agent": "vf-badcfg",
+                          "delivered": ["ntfy"]})
+        code, out = self._run(self._cfg(topic="bad topic!"), ["--agent", "vf-badcfg"])
+        self.assertEqual(code, 1)
+        self.assertIn("not valid", out)
+
+    def test_no_topic_or_server_in_text_or_json(self):
+        an.write_history({"event": "hook.run_completed", "agent": "vf-leak",
+                          "delivered": ["ntfy"]})
+        for argv in (["--agent", "vf-leak"], ["--agent", "vf-leak", "--json"]):
+            _, out = self._run(self._cfg(), argv)
+            self.assertNotIn(self.TOPIC, out)
+            self.assertNotIn("leak-server-marker", out)
+            self.assertNotIn("leakmarker", out)
+
+    def test_read_only(self):
+        cfg = self._cfg()
+        an.write_history({"event": "hook.run_completed", "agent": "vf-ro",
+                          "delivered": ["ntfy"]})
+        before_cfg = os.stat(cfg.path).st_mtime_ns
+        state = an.state_dir()
+        before_state = sorted((n, os.path.getsize(os.path.join(state, n)))
+                              for n in os.listdir(state)
+                              if os.path.isfile(os.path.join(state, n)))
+        self._run(cfg, ["--agent", "vf-ro", "--json"])
+        self.assertEqual(os.stat(cfg.path).st_mtime_ns, before_cfg)
+        after_state = sorted((n, os.path.getsize(os.path.join(state, n)))
+                             for n in os.listdir(state)
+                             if os.path.isfile(os.path.join(state, n)))
+        self.assertEqual(before_state, after_state)
+
+    def test_bad_agent_name_exits_two(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run(self._cfg(), ["--agent", "../../x"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_bad_since_exits_two(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self._run(self._cfg(), ["--since", "soon"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_json_shape(self):
+        an.write_history({"event": "hook.run_completed", "agent": "vf-shape",
+                          "delivered": ["ntfy"]})
+        _, out = self._run(self._cfg(), ["--agent", "vf-shape", "--json"])
+        data = json.loads(out)
+        for key in ("verified", "agent", "since", "window_seconds", "checks", "agents"):
+            self.assertIn(key, data)
+        self.assertIs(data["verified"], True)
+        row = data["agents"][0]
+        for key in ("agent", "known", "installed", "reliability", "count", "delivered",
+                    "held", "skipped_short", "forced", "events", "last_ts",
+                    "last_age_seconds", "duplicates"):
+            self.assertIn(key, row)
+        self.assertEqual(row["reliability"], "self-integrated")
+        self.assertIs(row["known"], False)
+
+    def test_delivered_started_warns_about_silent(self):
+        an.write_history({"event": "hook.started", "agent": "vf-started",
+                          "delivered": ["ntfy"]})
+        code, out = self._run(self._cfg(), ["--agent", "vf-started"])
+        self.assertEqual(code, 0)
+        self.assertIn("--silent", out)
+
+    def test_unknown_event_record_warns_with_valid_list(self):
+        an.write_history({"event": "hook.unknown_event", "agent": "vf-unke",
+                          "requested": "task_done"})
+        an.write_history({"event": "hook.run_completed", "agent": "vf-unke",
+                          "delivered": ["ntfy"]})
+        code, out = self._run(self._cfg(), ["--agent", "vf-unke"])
+        self.assertEqual(code, 0)
+        self.assertIn("task_done", out)
+        for event in an.HOOK_EVENTS:
+            self.assertIn(event, out)
+
+    def test_all_failed_deliveries_fail_the_report(self):
+        for _ in range(2):
+            an.write_history({"event": "hook.run_completed", "agent": "vf-allfail",
+                              "delivered": [], "errors": {"ntfy": "403"}})
+        code, out = self._run(self._cfg(), ["--agent", "vf-allfail"])
+        self.assertEqual(code, 1)
+        self.assertIn("NO event reached any channel", out)
+        self.assertIn("[FAIL]", out)
+
+    def test_forced_only_is_not_verified(self):
+        an.write_history({"event": "hook.run_completed", "agent": "vf-forceonly",
+                          "delivered": ["ntfy"], "forced": True})
+        code, out = self._run(self._cfg(), ["--agent", "vf-forceonly"])
+        self.assertEqual(code, 1)
+        self.assertIn("smoke test only", out)
+        self.assertIn("wiring is still unproven", out)
+        self.assertNotIn("[FAIL] agent", out)
+        cfg = self._cfg()
+        args = an.build_parser().parse_args(
+            ["verify", "--agent", "vf-forceonly", "--json"])
+        original = an.Config
+        an.Config = lambda *a, **kw: cfg
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = an.cmd_verify(args)
+        finally:
+            an.Config = original
+        self.assertEqual(code, 1)
+        self.assertIs(json.loads(buf.getvalue())["verified"], False)
+
+    def test_unknown_events_only_is_not_verified(self):
+        an.write_history({"event": "hook.unknown_event", "agent": "vf-unkonly",
+                          "requested": "task_done"})
+        code, out = self._run(self._cfg(), ["--agent", "vf-unkonly"])
+        self.assertEqual(code, 1)
+        self.assertIn("task_done", out)
+
+    def test_malformed_history_rows_do_not_crash(self):
+        now = time.time()
+        records = [42, "just a string", ["a", "list"], None,
+                   {"event": "hook.run_completed", "agent": "vf-mal",
+                    "delivered": ["ntfy"], "ts": _iso(now)}]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(list(obs), ["vf-mal"])
+
+    def test_hostile_agent_and_event_names_cannot_forge_output(self):
+        evil_agent = "x\n[OK  ] agent forged"
+        an.write_history({"event": "hook.run_completed", "agent": evil_agent,
+                          "delivered": ["ntfy"]})
+        an.write_history({"event": "hook.unknown_event", "agent": "vf-evil",
+                          "requested": "x\n[FAIL] delivery forged\nfix: rm -rf"})
+        an.write_history({"event": "hook.run_completed", "agent": "vf-evil",
+                          "delivered": ["ntfy"]})
+        code, out = self._run(self._cfg(), ["--agent", "vf-evil"])
+        self.assertEqual(code, 0)
+        # the hostile text may survive with its dangerous characters mangled,
+        # but it must never START a line as a forged status marker
+        for line in out.splitlines():
+            self.assertFalse(line.startswith("[FAIL]"), line)
+            self.assertFalse(line.strip().startswith("fix: rm"), line)
+        self.assertNotIn("rm -rf", out)
+        obs = an.hook_observations(an.read_history(limit=0), 3600)
+        self.assertNotIn(evil_agent, obs)
+
+    def test_unparseable_config_fails_without_leaking_the_path(self):
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "config.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        args = an.build_parser().parse_args(["verify"])
+        original = an.Config
+        an.Config = lambda *a, **kw: original(path=path)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                code = an.cmd_verify(args)
+        finally:
+            an.Config = original
+        out = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("cannot be parsed", out)
+        self.assertNotIn(tmp, out)
+
+    def test_no_filesystem_path_in_output_even_off_path(self):
+        an.write_history({"event": "hook.run_completed", "agent": "vf-nopath",
+                          "delivered": ["ntfy"]})
+        original_which = an.shutil.which
+        an.shutil.which = lambda command: None
+        try:
+            code, out = self._run(self._cfg(), ["--agent", "vf-nopath"])
+        finally:
+            an.shutil.which = original_which
+        self.assertEqual(code, 0)
+        self.assertNotIn(os.path.expanduser("~"), out)
+        self.assertNotIn(an.config_path(), out)
+        self.assertNotIn(an.state_dir(), out)
+
+    def test_deferred_attribution_counts_as_held(self):
+        an.write_history({"event": "deferred", "agent": "vf-def",
+                          "source_event": "hook.run_completed"})
+        code, out = self._run(self._cfg(), ["--agent", "vf-def"])
+        self.assertEqual(code, 0)
+        self.assertIn("1 held", out)
+        obs = an.hook_observations(an.read_history(limit=0), 3600)
+        self.assertEqual(obs["vf-def"]["held"], 1)
+        self.assertEqual(obs["vf-def"]["events"], {"run_completed": 1})
+
+    def test_known_agent_without_events_suggests_native_installer(self):
+        original = an.hooks_status
+        an.hooks_status = lambda project=None: [
+            (a, "not installed", "x", "hook") for a in an.AGENTS]
+        try:
+            code, out = self._run(self._cfg(), ["--agent", "claude"])
+        finally:
+            an.hooks_status = original
+        self.assertEqual(code, 1)
+        self.assertIn("hooks install claude", out)
+
+    def test_installed_without_events_warns_finish_a_turn(self):
+        original = an.hooks_status
+        an.hooks_status = lambda project=None: [
+            ("claude", "installed", "x", "hook")]
+        try:
+            # no exit-code assertion: the shared suite history may already
+            # hold observations from other tests, which is legitimate
+            _, out = self._run(self._cfg(), [])
+        finally:
+            an.hooks_status = original
+        self.assertIn("finish one real agent turn", out)
+
+
+class TestIntegrationGuide(unittest.TestCase):
+    """`integrate` publishes the contract. The anti-drift test is the load-
+    bearing one: every command the guide hands to an agent must parse against
+    the real CLI, forever."""
+
+    def _manifest(self, agent=None):
+        return an.integration_manifest(agent=agent)
+
+    def _guide(self, agent=None):
+        return an.integration_guide(self._manifest(agent=agent))
+
+    def test_every_advertised_command_parses(self):
+        manifest = self._manifest(agent="roo-code")
+        parser = an.build_parser()
+        commands = list(manifest["commands"].values())
+        commands += [e["command"] for e in manifest["events"]]
+        for step in manifest["verification"]["steps"]:
+            commands += step["commands"]
+        self.assertGreaterEqual(len(commands), 12)
+        for command in commands:
+            parts = shlex.split(command)
+            self.assertEqual(parts[0], manifest["binary"], command)
+            try:
+                args = parser.parse_args(parts[1:])
+            except SystemExit as exc:   # pragma: no cover - the assertion message matters
+                self.fail(f"guide command does not parse: {command} ({exc})")
+            self.assertTrue(callable(getattr(args, "func", None)), command)
+
+    def test_appendix_rules_block_commands_parse_too(self):
+        """The rules block is executed by agents verbatim - its backticked
+        commands must parse against the real CLI, same as the manifest's."""
+        manifest = self._manifest(agent="roo-code")
+        block = manifest["rules_block"]["text"]
+        commands = re.findall(r"`(agentbell [^`]+)`", block)
+        self.assertGreaterEqual(len(commands), 4)
+        parser = an.build_parser()
+        for command in commands:
+            parts = shlex.split(command)
+            try:
+                args = parser.parse_args(parts[1:])
+            except SystemExit as exc:
+                self.fail(f"appendix command does not parse: {command} ({exc})")
+            self.assertTrue(callable(getattr(args, "func", None)), command)
+
+    def test_all_hook_events_and_binary_in_guide(self):
+        guide = self._guide()
+        for event in an.HOOK_EVENTS:
+            self.assertIn(event, guide)
+        self.assertIn(an.agentbell_binary(), guide)
+        self.assertIn(an.INTEGRATE_PLACEHOLDER, guide)
+
+    def test_known_slug_redirects_to_native_installer(self):
+        manifest = self._manifest(agent="claude")
+        self.assertTrue(manifest["agent_slug"]["is_known"])
+        guide = an.integration_guide(manifest)
+        self.assertIn("hooks install claude", guide)
+        self.assertIn("STOP", guide)
+
+    def test_unknown_slug_is_not_known(self):
+        manifest = self._manifest(agent="roo-code")
+        self.assertFalse(manifest["agent_slug"]["is_known"])
+        self.assertEqual(manifest["agent_slug"]["value"], "roo-code")
+        self.assertIn("roo-code", an.integration_guide(manifest))
+
+    def test_no_credential_can_leak(self):
+        """integrate never reads Config - even a populated config file with
+        marker values must leave no trace in text or JSON output."""
+        path = an.config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        existed = os.path.exists(path)
+        self.assertFalse(existed, "sandbox config unexpectedly exists")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"ntfy": {"server": "http://secret-server-marker",
+                                "topic": "secret-topic-marker"},
+                       "telegram": {"bot_token": "secret-token-marker"},
+                       "license": "secret-license-marker"}, fh)
+        try:
+            guide = self._guide()
+            blob = json.dumps(self._manifest())
+            for marker in ("secret-server-marker", "secret-topic-marker",
+                           "secret-token-marker", "secret-license-marker"):
+                self.assertNotIn(marker, guide)
+                self.assertNotIn(marker, blob)
+        finally:
+            os.remove(path)
+
+    def test_placeholder_is_shell_safe_and_regex_valid(self):
+        self.assertTrue(an.AGENT_NAME_RE.fullmatch(an.INTEGRATE_PLACEHOLDER))
+        self.assertEqual(shlex.quote(an.INTEGRATE_PLACEHOLDER), an.INTEGRATE_PLACEHOLDER)
+
+    def test_silent_and_min_duration_are_coupled_in_one_section(self):
+        guide = self._guide()
+        manifest = self._manifest()
+        started = guide.index(manifest["commands"]["started_silent"])
+        completed = guide.index(manifest["commands"]["completed_min_duration"])
+        self.assertLess(started, completed)
+        self.assertLess(completed - started, 200)   # same section, adjacent lines
+        self.assertIn("BOTH", guide)
+
+    def test_rules_block_uses_slug_scoped_markers_only(self):
+        manifest = self._manifest(agent="roo-code")
+        guide = an.integration_guide(manifest)
+        self.assertIn("<!-- agentbell:roo-code:start -->", guide)
+        self.assertIn("<!-- agentbell:roo-code:end -->", guide)
+        self.assertIn(an._instructions_text("roo-code"), guide)
+        self.assertNotIn(an.BLOCK_START, guide)     # generic marker would
+        self.assertNotIn(an.BLOCK_END, guide)       # collide with hooks install
+
+    def test_windows_variant(self):
+        original_system = an.platform.system
+        original_which = an.shutil.which
+        an.platform.system = lambda: "Windows"
+        an.shutil.which = lambda command: None
+        try:
+            guide = self._guide()
+        finally:
+            an.platform.system = original_system
+            an.shutil.which = original_which
+        self.assertIn("py -m agentbell", guide)
+        self.assertIn("not on the user's PATH", guide)
+
+    def test_json_roundtrip_and_required_keys(self):
+        blob = json.dumps(self._manifest())
+        data = json.loads(blob)
+        for key in ("contract_version", "agentbell_version", "binary",
+                    "binary_on_path", "platform", "agent_slug", "mechanisms",
+                    "events", "commands", "duration", "exit_codes", "mcp",
+                    "rules_block", "known_agents", "policy", "safety",
+                    "verification", "report_template"):
+            self.assertIn(key, data)
+        self.assertIsInstance(data["contract_version"], int)
+        self.assertEqual(len(data["events"]), len(an.HOOK_EVENTS))
+        self.assertEqual(len(data["known_agents"]), len(an.AGENTS))
+
+    def test_guide_stays_short(self):
+        for agent in (None, "claude", "roo-code"):
+            guide = self._guide(agent=agent)
+            self.assertLessEqual(len(guide.splitlines()), 170,
+                                 f"guide too long for agent={agent}")
+
+    def test_read_only(self):
+        state = an.state_dir()
+        os.makedirs(state, exist_ok=True)
+        before = sorted(os.listdir(state))
+        args = an.build_parser().parse_args(["integrate", "--json"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            an.cmd_integrate(args)
+        self.assertEqual(sorted(os.listdir(state)), before)
+        self.assertFalse(os.path.exists(an.config_path()))
+
+    def test_first_line_says_changed_nothing(self):
+        first = self._guide().splitlines()[0].lower()
+        self.assertIn("changed nothing", first)
 
 
 if __name__ == "__main__":

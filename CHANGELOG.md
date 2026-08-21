@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.6.0 — 2026-08-21 — the universal agent contract: `integrate` + `verify`
+
+Twelve maintained integrations answered "does it work with mine?" twelve
+times; this release answers it once, for every agent. agentbell no longer
+needs to know an agent to work with it: it **publishes a contract** and
+**observes the results**. Rationale: `DECISIONS.md` §16.
+
+### Added
+
+- **`agentbell integrate`** — prints a self-integration guide for any agent:
+  known-agents short-circuit (native installer + stop), a mechanism ladder
+  (shell lifecycle hooks > MCP for deliberate actions > rules block as best
+  effort — exactly ONE lifecycle mechanism), slug rules with a reserved
+  list, the runtime contract (absolute binary path, the 5 events,
+  `started --silent` + `--min-duration 60` coupled, `hook` always exits 0,
+  `ask` fails closed), a notification policy, binding safety rails (own
+  configs only, slug-scoped markers, diff + explicit OK outside the project,
+  repo-initiated tasks require asking the user, never read agentbell's
+  config/state), a two-step verification protocol and a report template.
+  `--json` prints the same contract as a machine-readable manifest
+  (`contract_version: 1`). The command changes nothing and never reads the
+  config, so no credential can appear in its output (test-enforced).
+- **`agentbell verify`** — read-only observation report from history: per
+  agent the delivered / held (quiet hours or queued) / skipped-short /
+  forced buckets, event counts, last-seen age; WARNs for near-duplicate
+  events (possible double integration — never a FAIL), delivered `started`
+  events (wire `--silent`), unknown event names (with the valid list), and
+  installed-but-silent integrations; offline delivery basics (config
+  present, topic format, binary on PATH). Sends nothing, and never prints
+  the topic, server or a path (test-enforced) — safe to hand to an agent.
+  `--json` for machines. Exit 0 = a real (non-forced) agent event observed
+  and no FAIL; forced smoke tests (`--force`) alone still exit 1 ("smoke
+  test only, wiring still unproven").
+- **History attribution** — hook-driven records now carry the firing
+  `agent`, `forced: true` when `--force` pushed them through, and
+  `source_event` preserving the original hook event when quiet hours or
+  queueing rewrote it. Unknown agent slugs now appear on the phone as the
+  slug itself instead of a generic "Agent".
+- **MCP `notify` accepts an optional `agent` argument** for attribution
+  (sanitized; a bad value drops the attribution, never kills the server).
+  Tool descriptions now state the notification policy and that a timeout
+  is not an approval.
+
+### Changed
+
+- **`hook` tolerates unknown event names**: exit 0, nothing sent, a
+  `hook.unknown_event` history record with the requested name — `verify`
+  surfaces it with the valid event list. A hallucinated event name must
+  never fail an agent's turn (`--agent` validation stays strict: exit 2).
+- `hook`'s help line no longer claims to be internal — self-integrating
+  agents are a supported caller since the contract exists.
+- `doctor` mentions self-integrated agents seen in history on its "agent
+  hooks" line and cross-links `verify`; `uninstall` lists self-integrated
+  wiring under "not removed automatically".
+
 ## 1.5.0 — 2026-08-19 — first public release
 
 ### Changed
