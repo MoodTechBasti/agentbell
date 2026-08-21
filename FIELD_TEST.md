@@ -3,6 +3,13 @@
 Goal: use the tool like a real user for two weeks and tick off every path below.
 Budget: ~20 minutes for the first pass, then just use it.
 
+## Prerequisites and evidence
+
+- Record the OS, Python version (`python3 --version` or `py --version`), AgentBell version, ntfy server, and agent/editor version before starting.
+- Use a real ntfy app subscription for the configured main and `-responses` topics; automated tests do not prove phone delivery.
+- Treat Telegram, MCP desktop clients, agent hooks, and network recovery as separate integration tests. Do not mark one as passed because another worked.
+- For every completed row, retain the command, exit code, relevant `agentbell history --limit 10` record, and either the received phone notification or an app/editor screenshot. Redact topics, tokens, and message content before sharing evidence.
+
 **Start here:**
 
 ```bash
@@ -11,6 +18,8 @@ agentbell init            # wizard: topic, quiet hours, agent hooks, test push
 agentbell doctor          # should be all OK
 agentbell test            # real delivery check
 ```
+
+On Windows PowerShell, replace `./install.sh` with `py -m pip install --user .` from the checkout, and use `py -m ...` for Python commands.
 
 If anything is ever unclear: **`agentbell doctor`** prints the problem *and* the command that fixes it.
 
@@ -37,7 +46,7 @@ If anything is ever unclear: **`agentbell doctor`** prints the problem *and* the
 | 16 | Offline queue | point the server at a dead port, `agentbell notify "offline"` | Exit 0 + stderr warning; `queue list` shows it; after fixing, `queue flush` delivers |
 | 17 | history | `agentbell history --limit 20` | sent / suppressed / deferred / queued / ask results all visible |
 | 18 | secrets | `agentbell config show` | license, bot token, ntfy password, webhook token all redacted; `ls -l` on config.json shows `-rw-------` |
-| 19 | Full purge + re-init | `agentbell uninstall`, then `--yes`, then `./install.sh && agentbell init` | Dry run lists everything; purge removes binary/config/state/hooks/MCP and keeps foreign config |
+| 19 | Full purge + re-init | `agentbell uninstall`, then `--yes`, then reinstall (`./install.sh` on macOS/Linux; `py -m pip install --user .` on Windows) and `agentbell init` | Dry run lists everything; purge removes binary/config/state/hooks/MCP and keeps foreign config |
 | 20 | License status | `agentbell license status` | Correct premium state |
 | 21 | Change one setting | `agentbell config set ntfy.topic <long-random>` | Written + re-subscribe hint; `doctor` turns the topic WARN into OK; no wizard needed |
 | 22 | Setup survives a hiccup | in `init`, paste a bot token while offline | Says "could not reach Telegram", offers to keep it — the license key and topic entered before are **not** lost |
@@ -51,11 +60,20 @@ not "known good".**
 Install with `agentbell hooks install <agent>` (or `hooks install all`), then
 finish one real turn in the agent and see whether the push arrives.
 
+**Status legend:**
+- `[x]` = manually tested with a real agent end-to-end
+- `[ci]` = covered by automated tests (hooks install/uninstall, plugin parsing)
+- `[ ]` = not yet tested in either form
+
+Reliability class (shown by `agentbell hooks status`):
+- **hook** = deterministic lifecycle hook/plugin (Claude, Codex, Gemini, Kimi, Qwen, OpenCode)
+- **rule** = instruction in a rule file the agent is asked to follow — best-effort by construction (Cursor, Windsurf, Cline, Continue, Zed, Aider)
+
 | Agent | Mechanism | Scope | Expected when a turn ends | Status |
 |---|---|---|---|---|
-| Claude Code | `~/.claude/settings.json` hooks | global | finished (with duration), failed, needs-input | covered by #9, #9b |
-| Codex | `~/.codex/config.toml` `[[hooks.…]]` | global | finished (with duration) | covered by #10 |
-| OpenCode | plugin in `~/.config/opencode/plugin/` | global | finished, failed, permission asked — exactly one push per turn | covered by #11 |
+| Claude Code | `~/.claude/settings.json` hooks | global | finished (with duration), failed, needs-input | `[ ]` run #9, #9b |
+| Codex | `~/.codex/config.toml` `[[hooks.…]]` | global | finished (with duration) | `[ ]` run #10 |
+| OpenCode | plugin in `~/.config/opencode/plugin/` | global | finished, failed, permission asked — exactly one push per turn | `[ ]` run #11 |
 | Gemini CLI | `~/.gemini/settings.json` `AfterAgent` | global | finished only — Gemini exposes no failure event | [ ] |
 | Kimi Code | `~/.kimi-code/config.toml` `[[hooks]]` | global | finished (with duration), failed | [ ] |
 | Qwen Code | `~/.qwen/settings.json` hooks | global | finished (with duration), failed; hooks are async, so the end of a turn never waits on the network | [ ] |

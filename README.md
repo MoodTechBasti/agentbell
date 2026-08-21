@@ -31,20 +31,40 @@ One stdlib-only Python file, one command to install. Works with **Claude Code, C
 
 ## 60-second setup
 
+**No dev experience needed.** On macOS or Linux, open a terminal and run:
+
 ```bash
-# 1. get it (pipx → pip --user → plain copy; zero dependencies)
 git clone https://github.com/MoodTechBasti/agentbell && cd agentbell
-./install.sh
-
-# 2. wizard: topic, quiet hours, agent hooks, test push
-agentbell init
-
-# 3. on your phone: ntfy app (iOS/Android) → "+" → subscribe to the two topics
-#    the wizard printed. Then:
-agentbell test
+./install.sh       # picks pipx, pip --user or a plain copy — whichever works
+agentbell init     # wizard: topic name, quiet hours, agent hooks, test push
 ```
 
-`init` prints a copy-paste "next steps" block, and `agentbell doctor` re-prints exactly what's still missing at any point.
+That's it. `agentbell init` prints the next steps; `agentbell doctor` tells you exactly what's wrong and how to fix it at any point.
+
+**Windows (PowerShell):** install from the same checkout without `install.sh`:
+
+```powershell
+git clone https://github.com/MoodTechBasti/agentbell
+Set-Location agentbell
+py -m pip install --user .
+py -m agentbell init  # works even before the Scripts folder is on PATH
+```
+
+To make `agentbell` available to future terminals, hooks, and desktop MCP clients, run this once in PowerShell, then close and reopen PowerShell:
+
+```powershell
+$scripts = py -c "import sysconfig; print(sysconfig.get_path('scripts', scheme='nt_user'))"
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+[Environment]::SetEnvironmentVariable("Path", "$userPath;$scripts", "User")
+```
+
+After reopening PowerShell, `agentbell doctor` confirms the installation.
+
+> **New to the terminal?** You need Python 3.9+. On macOS: `brew install python3`. On Debian/Ubuntu: `sudo apt install python3`. On Windows, install Python from [python.org](https://www.python.org/downloads/) and use `py --version`. If `agentbell` is not found after installation, run `py -m agentbell doctor` for a copy-pasteable PATH fix.
+
+### Developer path — full reference below
+
+If you know your way around hooks, MCP and config files, jump straight to [Agents: what gets wired up](#agents-what-gets-wired-up), the [Quick reference](#quick-reference), or [MCP](#desktop-apps-and-editors-mcp).
 
 ---
 
@@ -311,6 +331,8 @@ What this tool actually protects, and what it doesn't. Read this before you gate
 
 **Your topic name is the only credential in the free setup.** Anyone who learns it can read every notification, publish fake ones, and approve or deny any open `ask`. Treat it like a password — that's ntfy's own wording in their terms. `init` generates a long random topic for exactly this reason, so don't shorten it, and **don't paste `doctor` or `config show` output into public issues.**
 
+**Sensitive approvals get a runtime warning when ntfy authentication is absent.** AgentBell recognizes only a narrow set of high-impact requests (for example, production deployments, production database deletion, credential rotation, money transfers, and firewall changes). This is a reminder, not a security decision: it cannot understand every action's real impact. Use self-hosted ntfy with auth before relying on phone approval for a sensitive action.
+
 **ntfy.sh is a third-party relay.** Your message text passes through servers you don't control and can be read there — including the working directory that hook notifications carry. If that matters for your work, self-host ntfy and point `ntfy.server` at it.
 
 **Action buttons carry their credential inside the message.** On a protected server, every subscriber to the topic can see a button's `Authorization` header. Set `ntfy.action_auth` to a token that may only publish to the `-responses` topic instead of reusing your account password.
@@ -337,7 +359,7 @@ What this tool actually protects, and what it doesn't. Read this before you gate
 | Topic too guessable | `agentbell config set ntfy.topic <long-random>`, then re-subscribe in the app |
 | "webhook is active" | another process holds a Telegram webhook: `curl -s "https://api.telegram.org/bot<TOKEN>/deleteWebhook"`, then restart the bot |
 | Hooks don't fire | `agentbell hooks status`; for Codex check `/hooks` inside Codex |
-| Start over | `agentbell uninstall` → `--yes` → `./install.sh && agentbell init` |
+| Start over | macOS/Linux: `agentbell uninstall` → `--yes` → `./install.sh && agentbell init`; Windows: `py -m pip install --user .` → `agentbell init` |
 
 ---
 
@@ -374,7 +396,8 @@ Only its own markers are removed — your other hooks and MCP servers stay. Not 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v   # no external deps
+python3 -m unittest discover -s tests -v   # macOS/Linux, no external deps
+py -m unittest discover -s tests -v        # Windows
 ```
 
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to propose a change, and what gets merged

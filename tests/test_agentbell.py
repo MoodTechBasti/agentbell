@@ -702,7 +702,7 @@ class TestHooks(unittest.TestCase):
         os.makedirs(os.path.dirname(legacy), exist_ok=True)
         with open(legacy, "w") as fh:
             fh.write(an.WINDSURF_LEGACY_RULE)
-        status = {agent: s for agent, s, _ in an.hooks_status(project=project)}
+        status = {agent: s for agent, s, _, _ in an.hooks_status(project=project)}
         self.assertEqual(status["windsurf"], "installed")
 
     def test_windsurf_uninstall_skips_foreign_files(self):
@@ -759,9 +759,16 @@ class TestHooks(unittest.TestCase):
         self.assertIn("qwen-code", found)
 
     def test_hooks_status_lists_all_agents(self):
-        agents = [a for a, status, path in an.hooks_status()]
+        agents = [a for a, status, path, _ in an.hooks_status()]
         self.assertEqual(agents, an.AGENTS)
         self.assertEqual(len(agents), 12)
+
+    def test_hooks_status_labels_hook_and_rule_reliability(self):
+        reliability = {agent: kind for agent, _, _, kind in an.hooks_status()}
+        for agent in ("claude", "codex", "gemini", "kimi", "qwen-code", "opencode"):
+            self.assertEqual(reliability[agent], "hook")
+        for agent in ("cursor", "windsurf", "cline", "continue", "zed", "aider"):
+            self.assertEqual(reliability[agent], "rule")
 
     def test_unknown_agent_rejected(self):
         with self.assertRaises(SystemExit):
@@ -774,7 +781,7 @@ class TestHooks(unittest.TestCase):
         agents_md = os.path.join(project, "AGENTS.md")
         with open(agents_md, "w") as fh:
             fh.write(an.BLOCK_START + "\n--agent opencode\n" + an.BLOCK_END + "\n")
-        status = {a: s for a, s, _ in an.hooks_status(project=project)}
+        status = {a: s for a, s, _, _ in an.hooks_status(project=project)}
         self.assertEqual(status["aider"], "not installed")
         self.assertEqual(status["opencode"], "not installed")
 
@@ -1917,7 +1924,8 @@ class TestApprovalHardening(unittest.TestCase):
             an.claim_consumed("claimtest", f"id-{i}")
         path = an._consumed_path("claimtest")
         self.assertLessEqual(len(an._read_consumed("claimtest")), an.CONSUMED_KEEP_LINES)
-        self.assertEqual(os.stat(path).st_mode & 0o077, 0)
+        if os.name != "nt":
+            self.assertEqual(os.stat(path).st_mode & 0o077, 0)
         newest = f"id-{an.CONSUMED_KEEP_LINES + 19}"
         self.assertFalse(an.claim_consumed("claimtest", newest))   # newest kept
         os.remove(path)
@@ -2258,6 +2266,7 @@ class TestSecrets(unittest.TestCase):
         self.assertIn("bob:", safe)          # enough context to recognise it
         self.assertIn("0.0.0.0", safe)       # non-secrets stay visible
 
+    @unittest.skipIf(os.name == "nt", "Unix file permissions not applicable on Windows")
     def test_config_file_is_owner_only(self):
         tmp = tempfile.mkdtemp()
         cfg = an.Config(dict(an.default_config()), path=os.path.join(tmp, "sub", "config.json"))
@@ -2311,6 +2320,23 @@ class _Args:
 
 
 class TestDoctor(unittest.TestCase):
+    def test_doctor_gives_a_powershell_path_fix_on_windows(self):
+        cfg = an.Config(an.default_config(), path=os.path.join(tempfile.mkdtemp(), "config.json"))
+        original_system = an.platform.system
+        original_which = an.shutil.which
+        an.platform.system = lambda: "Windows"
+        an.shutil.which = lambda command: None
+        try:
+            install = next(c for c in an.doctor_checks(cfg) if c["name"] == "install")
+        finally:
+            an.platform.system = original_system
+            an.shutil.which = original_which
+        self.assertIn("sysconfig.get_path('scripts', scheme='nt_user')", install["fix"])
+        self.assertIn("SetEnvironmentVariable", install["fix"])
+        self.assertIn('SetEnvironmentVariable("Path", "$userPath;$scripts", "User")', install["fix"])
+        self.assertIn("restart PowerShell", install["fix"])
+        self.assertNotIn(".bashrc", install["fix"])
+
     def test_doctor_flags_missing_config_with_a_fix(self):
         tmp = tempfile.mkdtemp()
         cfg = an.Config(an.default_config(), path=os.path.join(tmp, "config.json"))
@@ -3171,11 +3197,13 @@ class TestSecurityAuditRegressions(unittest.TestCase):
         safe = an.redacted_config({"webhook": {"token": "abcd1234-token"}})
         self.assertNotIn("abcd", json.dumps(safe))
 
+    @unittest.skipIf(os.name == "nt", "Unix file permissions not applicable on Windows")
     def test_state_dir_and_history_are_owner_only(self):
         an.write_history({"event": "permission-probe", "message": "secret body"})
         self.assertEqual(os.stat(an.state_dir()).st_mode & 0o077, 0)
         self.assertEqual(os.stat(an.history_path()).st_mode & 0o077, 0)
 
+    @unittest.skipIf(os.name == "nt", "os.symlink requires admin or developer mode on Windows")
     def test_a_rule_file_that_is_a_symlink_is_not_written_through(self):
         # a hostile repo can ship .rules as a symlink to ~/.bashrc
         tmp = tempfile.mkdtemp()
@@ -3232,6 +3260,7 @@ class TestSecurityAuditRegressions(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 an.normalize_server(bad)
 
+    @unittest.skipIf(os.name == "nt", "Unix file permissions not applicable on Windows")
     def test_a_config_we_own_is_never_briefly_world_readable(self):
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, "config.json")
@@ -3269,6 +3298,78 @@ class TestSecurityAuditRegressions(unittest.TestCase):
         finally:
             an.codex_config_path = original
             shutil.rmtree(tmp)
+
+
+class TestInsecureAskWarning(unittest.TestCase):
+    def test_sensitive_approval_heuristic_is_narrow(self):
+        self.assertTrue(an.is_sensitive_approval("Deploy to production?"))
+        self.assertTrue(an.is_sensitive_approval("Rotate the API credentials?"))
+        self.assertTrue(an.is_sensitive_approval("Delete the production database?"))
+        self.assertFalse(an.is_sensitive_approval("Deploy to staging?"))
+        self.assertFalse(an.is_sensitive_approval("Delete the temporary build file?"))
+        self.assertFalse(an.is_sensitive_approval("Update the README heading?"))
+
+    def test_warns_on_public_ntfy_without_auth(self):
+        cfg = an.Config({
+            "ntfy": {"server": "https://ntfy.sh", "topic": "test-topic-long-enough"},
+        })
+        # reset the per-process fired flag so the test runs cleanly
+        an._warn_insecure_ask._fired = False
+        buf = io.StringIO()
+        stderr, sys.stderr = sys.stderr, buf
+        try:
+            an._warn_insecure_ask(cfg, "Deploy to production?")
+        finally:
+            sys.stderr = stderr
+        self.assertIn("does not have ntfy authentication", buf.getvalue())
+        self.assertIn("self-hosted ntfy", buf.getvalue())
+
+    def test_silent_for_routine_or_authenticated_approval(self):
+        cfg = an.Config({
+            "ntfy": {"server": "https://ntfy.example.com", "topic": "test-topic",
+                     "auth": "user:pass"},
+        })
+        an._warn_insecure_ask._fired = False
+        buf = io.StringIO()
+        stderr, sys.stderr = sys.stderr, buf
+        try:
+            an._warn_insecure_ask(cfg, "Deploy to production?")
+            an._warn_insecure_ask(an.Config({
+                "ntfy": {"server": "https://ntfy.sh", "topic": "test-topic"},
+            }), "Update the README heading?")
+        finally:
+            sys.stderr = stderr
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_warns_for_self_hosted_server_without_auth(self):
+        cfg = an.Config({
+            "ntfy": {"server": "https://ntfy.example.com", "topic": "test-topic"},
+        })
+        an._warn_insecure_ask._fired = False
+        buf = io.StringIO()
+        stderr, sys.stderr = sys.stderr, buf
+        try:
+            an._warn_insecure_ask(cfg, "Delete the production database?")
+        finally:
+            sys.stderr = stderr
+        self.assertIn("does not have ntfy authentication", buf.getvalue())
+
+    def test_warns_only_once_per_process(self):
+        cfg = an.Config({
+            "ntfy": {"server": "https://ntfy.sh", "topic": "test-topic-long-enough"},
+        })
+        an._warn_insecure_ask._fired = False
+        buf = io.StringIO()
+        stderr, sys.stderr = sys.stderr, buf
+        try:
+            an._warn_insecure_ask(cfg, "Deploy to production?")
+            buf.truncate(0)
+            buf.seek(0)
+            an._warn_insecure_ask(cfg, "Deploy to production?")
+        finally:
+            sys.stderr = stderr
+        # second call must be silent: the flag prevents duplicates
+        self.assertEqual(buf.getvalue(), "")
 
 
 if __name__ == "__main__":

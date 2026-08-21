@@ -122,6 +122,27 @@ All installers merge JSON (preserving user keys), append marked TOML/markdown bl
 7. **A background auto-drainer for free users.** Queue/defer delivery is opportunistic (next notify/hook/`queue flush`), never a hidden daemon. The known opt-in `bot` daemon drains when it runs.
 8. **Retry delivery guarantees beyond best-effort.** Retries are bounded and the queue is local; there is no at-most-once guarantee (a timed-out POST may still have been delivered, so a rare duplicate is possible on retry — the request id stays the same, so approval answers are deduplicated).
 
+## 7b. Single-file architecture: current state and migration strategy
+
+**Current state:** `agentbell.py` (~5900 lines, ~243 KB) plus `tests/test_agentbell.py` (~3300 lines, ~149 KB). The build step is `py_compile`, nothing else. Single-file distribution is the product identity — a user copies one file and runs it.
+
+**When to split:** when the file size actively harms development velocity: navigation takes multiple searches, parallel work collides on the same file, code review diffs are unbounded by component, or new contributors spend more time scrolling than reasoning.
+
+**Migration strategy (documented, not implemented):**
+
+1. **Source layout** — move components to `src/agentbell/` modules matching logical boundaries already visible in the code (config, ntfy, telegram, approvals, hooks, mcp, queue, doctor, cli), keeping `agentbell.py` as a thin re-export shim during the transition.
+
+2. **Build step** — a deterministic concatenator (`tools/build.py` or equivalent, stdlib-only) produces the single-file distribution from the module sources. The concatenator runs as part of the release workflow; the distributed artifact is byte-for-byte identical to what CI validates.
+
+3. **Compat guarantee** — the single-file output must be drop-in compatible with every existing hook command, MCP registration, `install.sh` path, `pipx install`, and standalone copy. The module structure is a development convenience, never a runtime requirement.
+
+4. **When to trigger:** not now. The file is maintainable today. Trigger when:
+   - 2+ contributors collide on the same file in every sprint
+   - Navigation/search overhead demonstrably slows bug fixes
+   - A new integration (agent #13+) would add >200 lines of hook logic
+
+5. **Rollback:** the concatenator is the safety net — if module structure proves more overhead than benefit, delete `src/` and keep the concatenated file as the canonical source. No data loss.
+
 ## 8. What I'd do next (prioritized)
 
 v1.5.0 is the first public release; the 2-week field test (started on v1.3.1) continues against it. In order:

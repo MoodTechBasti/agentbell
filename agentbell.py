@@ -115,6 +115,17 @@ MAX_TOPIC_LEN = 64 - len(RESPONSE_SUFFIX)
 
 TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# An approval warning must be narrow: routine questions should retain the
+# lightweight free ntfy flow. These patterns cover high-impact actions where a
+# forged answer could cause irreversible operational or financial damage.
+SENSITIVE_APPROVAL_PATTERNS = (
+    re.compile(r"\bdeploy(?:ment)?\b.*\b(?:production|prod)\b|\b(?:production|prod)\b.*\bdeploy(?:ment)?\b", re.I),
+    re.compile(r"\b(?:delete|drop|destroy)\b.*\b(?:database|db|production|prod|cluster|bucket)\b", re.I),
+    re.compile(r"\b(?:rotate|revoke|expose|change)\b.*\b(?:credential|credentials|secret|password|token|api key|access key)\b", re.I),
+    re.compile(r"\b(?:transfer|send|pay)\b.*\b(?:money|funds|payment)\b", re.I),
+    re.compile(r"\b(?:change|open|disable)\b.*\b(?:firewall|security group|access control)\b", re.I),
+)
+
 # name -> ntfy priority number (1=min .. 5=urgent)
 PRIORITIES = {"min": 1, "low": 2, "normal": 3, "high": 4, "urgent": 5}
 
@@ -2342,6 +2353,27 @@ def resolve_ask_channels(cfg, channels=None):
     return chosen
 
 
+def is_sensitive_approval(message):
+    """Whether an approval message describes a narrowly defined high-impact action."""
+    return any(pattern.search(str(message or "")) for pattern in SENSITIVE_APPROVAL_PATTERNS)
+
+
+def _warn_insecure_ask(cfg, message):
+    """Warn once for a sensitive ntfy approval without configured authentication."""
+    if getattr(_warn_insecure_ask, "_fired", False) or not is_sensitive_approval(message):
+        return
+    ntfy = cfg.data.get("ntfy", {})
+    if not ntfy.get("auth"):
+        _warn_insecure_ask._fired = True
+        sys.stderr.write(
+            f"\n{PROG}: Sensitive approval detected, but this ntfy setup does not have ntfy authentication.\n"
+            f"{PROG}: Anyone who can access the topic can answer this question. Do not rely on\n"
+            f"{PROG}: this approval for a sensitive action until you use self-hosted ntfy with auth.\n"
+            f"{PROG}: Topic names are not a security boundary; see the README trust model.\n\n"
+        )
+        sys.stderr.flush()
+
+
 def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="Deny",
             buttons=True, print_status=True, channels=None):
     """Ask a question on one or more channels and wait for the first answer.
@@ -2362,6 +2394,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
             raise RuntimeError("ntfy is not configured. Run 'agentbell init' first.")
         resp_topic = f"{ntfy.get('topic')}-responses"
         validate_topic(resp_topic)
+        _warn_insecure_ask(cfg, message)
     if "telegram" in channels:
         if not premium_enabled(cfg):
             raise RuntimeError(LICENSE_PREMIUM_MSG)
@@ -3176,7 +3209,7 @@ AGENTS = ["claude", "codex", "gemini", "kimi", "qwen-code",
 # the repo, "both" = opencode (plugin works in both, installed globally).
 AGENT_SPECS = {
     "claude": {
-        "scope": "global", "kind": "file",
+        "scope": "global", "kind": "file", "reliability": "hook",
         "detect": lambda: _detect_bins_paths(
             ("claude",),
             (os.path.join(_home(), ".claude"), os.path.join(_home(), ".claude.json"))),
@@ -3186,14 +3219,14 @@ AGENT_SPECS = {
         "status": lambda project: _file_contains(claude_settings_path(), f"{PROG} hook"),
     },
     "codex": {
-        "scope": "global", "kind": "file",
+        "scope": "global", "kind": "file", "reliability": "hook",
         "detect": lambda: _detect_bins_paths(("codex",), (os.path.join(_home(), ".codex"),)),
         "path": lambda project: codex_config_path(),
         "install": lambda project, add: _codex_install(add),
         "status": lambda project: _file_contains(codex_config_path(), TOML_START),
     },
     "gemini": {
-        "scope": "global", "kind": "file",
+        "scope": "global", "kind": "file", "reliability": "hook",
         "detect": lambda: _detect_bins_paths(("gemini",), (os.path.join(_home(), ".gemini"),)),
         "path": lambda project: gemini_settings_path(),
         "install": lambda project, add: _json_hooks_install(
@@ -3201,14 +3234,14 @@ AGENT_SPECS = {
         "status": lambda project: _file_contains(gemini_settings_path(), f"{PROG} hook"),
     },
     "kimi": {
-        "scope": "global", "kind": "file",
+        "scope": "global", "kind": "file", "reliability": "hook",
         "detect": lambda: _detect_bins_paths(("kimi",), (os.path.join(_home(), ".kimi-code"),)),
         "path": lambda project: kimi_config_path(),
         "install": lambda project, add: _kimi_install(add),
         "status": lambda project: _file_contains(kimi_config_path(), TOML_START),
     },
     "qwen-code": {
-        "scope": "global", "kind": "file",
+        "scope": "global", "kind": "file", "reliability": "hook",
         "detect": lambda: _detect_bins_paths(
             ("qwen-code", "qwen"), (os.path.join(_home(), ".qwen"),)),
         "path": lambda project: qwen_settings_path(),
@@ -3216,7 +3249,7 @@ AGENT_SPECS = {
         "status": lambda project: _file_contains(qwen_settings_path(), f"{PROG} hook"),
     },
     "opencode": {
-        "scope": "both", "kind": "file",
+        "scope": "both", "kind": "file", "reliability": "hook",
         "detect": lambda: _detect_bins_paths(
             ("opencode",),
             (os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(_home(), ".config"),
@@ -3226,7 +3259,7 @@ AGENT_SPECS = {
         "status": lambda project: os.path.exists(opencode_plugin_paths(project)[0]),
     },
     "cursor": {
-        "scope": "project", "kind": "file",
+        "scope": "project", "kind": "file", "reliability": "rule",
         "detect": lambda: _detect_bins_paths(
             ("cursor",),
             (os.path.join(_home(), ".cursor"), os.path.join(".", ".cursor"))),
@@ -3237,7 +3270,7 @@ AGENT_SPECS = {
             _project_dir(project), ".cursor", "rules", "agentbell.mdc")),
     },
     "windsurf": {
-        "scope": "project", "kind": "file",
+        "scope": "project", "kind": "file", "reliability": "rule",
         "detect": lambda: _detect_bins_paths(
             ("windsurf",),
             (os.path.join(_home(), ".windsurf"), os.path.join(_home(), ".devin"),
@@ -3252,7 +3285,7 @@ AGENT_SPECS = {
                 _project_dir(project), ".windsurf", "rules", "agentbell.mdc"))),
     },
     "cline": {
-        "scope": "project", "kind": "block",
+        "scope": "project", "kind": "block", "reliability": "rule",
         "detect": lambda: _detect_bins_paths(
             ("cline",),
             (os.path.join(_home(), ".cline"), os.path.join(_home(), ".clinerules"),
@@ -3265,7 +3298,7 @@ AGENT_SPECS = {
         "status": lambda project: _block_file_status(".clinerules/agentbell.md", project),
     },
     "continue": {
-        "scope": "project", "kind": "block",
+        "scope": "project", "kind": "block", "reliability": "rule",
         "detect": lambda: _detect_bins_paths(
             ("continue", "cn"),
             (os.path.join(_home(), ".continue"), os.path.join(".", ".continue"))),
@@ -3277,7 +3310,7 @@ AGENT_SPECS = {
         "status": lambda project: _block_file_status(".continue/rules/agentbell.md", project),
     },
     "zed": {
-        "scope": "project", "kind": "block",
+        "scope": "project", "kind": "block", "reliability": "rule",
         "detect": lambda: _detect_bins_paths(
             ("zed",),
             (os.path.join(_home(), ".config", "zed"), os.path.join(".", ".zed"))),
@@ -3287,7 +3320,7 @@ AGENT_SPECS = {
         "status": lambda project: _block_file_status(".rules", project),
     },
     "aider": {
-        "scope": "project", "kind": "block",
+        "scope": "project", "kind": "block", "reliability": "rule",
         "detect": lambda: _detect_bins_paths(
             ("aider",),
             (os.path.join(_home(), ".aider.conf.yml"), os.path.join(".", ".aider.conf.yml"))),
@@ -3353,7 +3386,12 @@ def install_hooks(agent, project=None, add=True):
 
 
 def hooks_status(project=None):
-    """(agent, status, path) for each supported agent."""
+    """(agent, status, path, reliability) for each supported agent.
+
+    reliability: "hook" = deterministic lifecycle hook/plugin,
+                 "rule" = instruction in a rule file the agent is asked to follow
+                         (best-effort by construction).
+    """
     rows = []
     for agent in AGENTS:
         spec = AGENT_SPECS[agent]
@@ -3362,7 +3400,8 @@ def hooks_status(project=None):
             installed = spec["status"](project)
         except OSError:
             installed = False
-        rows.append((agent, "installed" if installed else "not installed", path))
+        rows.append((agent, "installed" if installed else "not installed", path,
+                     spec.get("reliability", "unknown")))
     return rows
 
 
@@ -4619,19 +4658,28 @@ def doctor_checks(cfg, send=False):
     if binary:
         checks.append(_check(OK, "install", f"{PROG} {VERSION} on PATH ({binary})"))
     else:
-        bin_dir = os.environ.get("XDG_BIN_HOME") or \
-            os.path.join(os.path.expanduser("~"), ".local", "bin")
+        if platform.system() == "Windows":
+            path_fix = (
+                '$scripts = py -c "import sysconfig; print(sysconfig.get_path(\'scripts\', scheme=\'nt_user\'))"; '
+                '$userPath = [Environment]::GetEnvironmentVariable("Path", "User"); '
+                '[Environment]::SetEnvironmentVariable("Path", "$userPath;$scripts", "User") '
+                '# restart PowerShell, then: py -m agentbell doctor'
+            )
+        else:
+            bin_dir = os.environ.get("XDG_BIN_HOME") or \
+                os.path.join(os.path.expanduser("~"), ".local", "bin")
+            path_fix = f'export PATH="{bin_dir}:$PATH"   # add this line to ~/.bashrc or ~/.zshrc'
         checks.append(_check(
             WARN, "install",
             f"{PROG} {VERSION} is not on your PATH - agent hooks and MCP clients "
             "may not find it",
-            f'export PATH="{bin_dir}:$PATH"   # add this line to ~/.bashrc or ~/.zshrc'))
+            path_fix))
 
     if not os.path.exists(cfg.path):
         checks.append(_check(FAIL, "config", f"no config yet ({cfg.path})", "agentbell init"))
     else:
         mode = oct(os.stat(cfg.path).st_mode & 0o777)[2:]
-        if mode != "600":
+        if platform.system() != "Windows" and mode != "600":
             checks.append(_check(
                 WARN, "config", f"{cfg.path} is mode {mode}; it holds your license key, "
                 "Telegram token and ntfy password", f"chmod 600 {shlex.quote(cfg.path)}"))
@@ -4710,7 +4758,7 @@ def doctor_checks(cfg, send=False):
                 "answer daemon not running - Telegram questions arrive without buttons",
                 "agentbell bot install-service   # runs in the background from now on"))
 
-    installed_hooks = [agent for agent, status, _ in hooks_status() if status == "installed"]
+    installed_hooks = [agent for agent, status, _, _ in hooks_status() if status == "installed"]
     missing = [a for a in find_agents() if a not in installed_hooks]
     if installed_hooks:
         checks.append(_check(OK, "agent hooks", "installed for " + ", ".join(installed_hooks)))
@@ -4874,7 +4922,7 @@ def print_next_steps(cfg):
     topic = (cfg.data.get("ntfy") or {}).get("topic") or "<topic>"
     server = NtfyChannel(cfg).server()
     missing = [agent for agent in find_agents()
-               if agent not in [a for a, status, _ in hooks_status() if status == "installed"]]
+               if agent not in [a for a, status, _, _ in hooks_status() if status == "installed"]]
     print()
     print("-" * 62)
     print("NEXT STEPS (copy & paste)")
@@ -5429,8 +5477,14 @@ def cmd_hooks(args):
     # None = default scope (OpenCode global, Cursor in the current dir)
     project = getattr(args, "project", None)
     if args.sub is None or args.sub == "status":
-        for agent, status, path in hooks_status(project=project):
-            print(f"{agent:10s} {status:14s} {path}")
+        print(f"{'agent':10s} {'status':14s} {'reliability':12s} path")
+        print("-" * 62)
+        for agent, status, path, reliability in hooks_status(project=project):
+            rel = "hook" if reliability == "hook" else "~ rule"
+            print(f"{agent:10s} {status:14s} {rel:12s} {path}")
+        print()
+        print("  hook  = deterministic lifecycle hook/plugin")
+        print("  rule  = instruction in a rule file (best-effort by construction)")
         return
     agents = AGENTS if "all" in args.agent else args.agent
     for agent in agents:
