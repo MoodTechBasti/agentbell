@@ -51,7 +51,8 @@ If anything is ever unclear: **`agentbell doctor`** prints the problem *and* the
 | 21 | Change one setting | `agentbell config set ntfy.topic <long-random>` | Written + re-subscribe hint; `doctor` turns the topic WARN into OK; no wizard needed |
 | 22 | Setup survives a hiccup | in `init`, paste a bot token while offline | Says "could not reach Telegram", offers to keep it — the license key and topic entered before are **not** lost |
 | 23 | Self-integration (unknown agent) | hand `agentbell integrate` output to an agent NOT in the table (e.g. GitHub Copilot CLI), let it wire itself, finish one real turn | `verify --agent <slug> --since 10m` exit 0, event shown as real (not forced); push arrived with the slug as its label — **passed 2026-08-21** with GitHub Copilot CLI 1.0.80, see Tier-1 result below |
-| 24 | Double integration is detected | wire the same agent via hooks AND the Appendix A rules block on purpose, finish a turn **of at least 60 s** (a shorter turn hits `--min-duration` on the hook side, leaves only one `run_completed` record and defeats the check) | Two pushes; `agentbell verify` WARNs "possible double integration"; after removing one mechanism, a fresh window is clean (`verify --since 10m`) — the default 7-day window keeps warning until the old duplicate records age out |
+| 24 | Double integration is detected | wire the same agent via hooks AND the Appendix A rules block on purpose, finish a turn **of at least 60 s** (a shorter turn hits `--min-duration` on the hook side, leaves only one `run_completed` record and defeats the check) | Two pushes; `agentbell verify` WARNs "possible double integration"; after removing one mechanism, a fresh window is clean (`verify --since 10m`) — **passed 2026-08-21** with GitHub Copilot CLI 1.0.80; the default 7-day window keeps warning until the old duplicate records age out |
+| 25 | Old Aider block migration | put a pre-scope agentbell block containing `--agent aider` in an `AGENTS.md` that also has user sections; run `agentbell hooks status`, `agentbell verify --json`, then `agentbell hooks install aider` | status/text verify show the bordered ACTION REQUIRED banner; JSON has `repair_notices[0].code == "aider_agents_block_outdated"`; reinstall preserves user sections and the next status says `installed` with no banner |
 
 ## Agent wiring — all 12
 
@@ -134,8 +135,12 @@ per the rules above:
   changed nothing — no second hook file, no second lifecycle mechanism.
 - Removal via its own documented steps left no agentbell wiring behind.
 
-Row 24 (deliberate double integration via hooks AND rules block) was **not**
-exercised in this run and stays open.
+Row 24 was exercised separately with an isolated Copilot user hook plus a
+slug-scoped `AGENTS.md` block. One real turn produced two delivered
+`run_completed` records two seconds apart; `verify --since 10m` stayed exit 0
+and emitted exactly one "possible double integration" warning. A new turn
+with an empty `COPILOT_HOME` (rules block only) produced one record and a
+clean verify result. No persistent Copilot configuration was changed.
 
 The same run exposed two false alarms in agentbell's own diagnostics, both
 root-caused and fixed on this branch (DECISIONS §16i, CHANGELOG 1.6.0
@@ -144,18 +149,27 @@ root-caused and fixed on this branch (DECISIONS §16i, CHANGELOG 1.6.0
 drift, poll errors swallowed), and `verify` warned "possible double
 integration" for several real `permission_required` prompts inside one
 second (the near-duplicate heuristic now only covers per-turn events).
-- **Tier 2 — MCP-only agent.** Candidates: Crush (Charm), Amp, Warp Agent
-  CLI. Expect: `mcpServers` entry in the host's own config, `ask_approval`
-  answerable from the phone, `notify` with `agent` attributed in history.
-- **Tier 3 — rules-file-only agent.** Expect the Appendix A block with
-  slug-scoped markers. Record the follow-rate over several turns — a rule
-  the model obeyed once is not "verified", it is "observed once".
-- **Tier 4 — failure modes.** (a) agentbell not on PATH → guide must show
-  the absolute path and the PATH hint; (b) quiet hours active during the
-  integration → `verify` must show the event as held, not missing;
-  (c) two parallel sessions, same slug → duplicate WARN but exit 0;
-  (d) rules-based agent forgets the rule → nothing arrives, and that is a
-  result to write down, not a bug to hunt.
+- **Tier 2 — MCP-only mechanism: PASSED 2026-08-21.** GitHub Copilot CLI
+  1.0.80 received an ephemeral stdio MCP config with custom instructions,
+  built-in MCPs and shell use excluded from the test. It called AgentBell's
+  `notify` tool once with `agent: "github-copilot-mcp"`; history recorded one
+  delivered, attributed event and `verify` exited 0. This proves the MCP-only
+  mechanism on a real host, not yet one of the MCP-only products originally
+  proposed (Crush, Amp or Warp Agent CLI).
+- **Tier 3 — rules-only mechanism: PASSED 2026-08-21 (3/3 turns).** A
+  committed slug-scoped `AGENTS.md` was the only AgentBell integration in
+  three independent GitHub Copilot CLI sessions. All three produced exactly
+  one delivered, attributed event; `verify` exited 0 with no duplicates.
+  This measures rules-only behavior on a hook-capable host, not yet a product
+  whose only integration surface is a rules file.
+- **Tier 4 — failure modes: PASSED 2026-08-21.** (a) with AgentBell absent
+  from `PATH`, the JSON guide used the absolute checkout path and returned a
+  concrete `path_fix`; (b) all-day quiet hours recorded one event as held and
+  `verify` exited 0; (c) two concurrent same-slug sessions produced two held
+  records plus a duplicate WARN while verify stayed exit 0; (d) an empty
+  state for a forgotten rule returned exit 1, "nothing known", and the
+  `agentbell integrate --agent tier4-forgotten` fix. All Tier-4 checks used
+  isolated config/state directories.
 
 ## Things worth trying on purpose
 
