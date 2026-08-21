@@ -124,15 +124,29 @@ class MockNtfy:
                     if "=" in pair:
                         key, _, value = pair.partition("=")
                         params[key] = value
+                since = params.get("since", "")
+                window = re.fullmatch(r"(\d+)([smhd])", since)
+                if since and since != "latest" and not since.isdigit() and not window:
+                    # real ntfy rejects a malformed `since` outright
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"code":40008,"error":"invalid since"}')
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-ndjson")
                 self.end_headers()
                 self.wfile.write(b'{"event":"open"}\n')
                 self.wfile.flush()
                 if params.get("poll") == "1":
-                    since = params.get("since", "")
                     if since == "latest":
                         records = server.posts.get(topic, [])[-1:]
+                    elif window:
+                        # duration windows resolve against the *server* clock
+                        unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}[window.group(2)]
+                        cutoff = time.time() - int(window.group(1)) * unit
+                        records = [r for r in server.posts.get(topic, [])
+                                   if r["ts"] >= cutoff]
                     elif since.isdigit():
                         records = [r for r in server.posts.get(topic, []) if r["ts"] >= int(since)]
                     else:
@@ -1094,6 +1108,35 @@ class TestApprovalPollFallback(unittest.TestCase):
             self.assertFalse(holder["result"]["timeout"])
         finally:
             mock.stop()
+
+    def test_prime_and_poller_use_server_side_windows(self):
+        """Regression (clock drift, DECISIONS §16i): the ask receiver's prime
+        and poll requests must use server-relative duration windows, never a
+        local epoch cursor - a local clock ahead of the server's blinded the
+        poll fallback exactly when the stream was down."""
+        mock = MockNtfy(stream_enabled=False)
+        seen = []
+        original = an.NtfyChannel.poll
+
+        def spy(self, topic, since, timeout=10.0):
+            seen.append(since)
+            return original(self, topic, since, timeout=timeout)
+
+        an.NtfyChannel.poll = spy
+        try:
+            cfg = make_config(mock.url, topic="driftwin")
+            waiter = an.ApprovalWaiter(cfg, "driftwin-responses", 5, poll_interval=0.05)
+            waiter.start()
+            time.sleep(0.3)
+        finally:
+            waiter.stop_event.set()
+            an.NtfyChannel.poll = original
+            mock.stop()
+        self.assertGreaterEqual(len(seen), 2)   # prime + at least one poll
+        for since in seen:
+            self.assertIsInstance(since, str)
+            self.assertRegex(since, r"^\d+s$")
+        self.assertGreaterEqual(int(seen[0][:-1]), 90)
 
 
 class MockTelegram:
@@ -2321,6 +2364,167 @@ class TestCliWiring(unittest.TestCase):
 class _Args:
     def __init__(self, **kw):
         self.__dict__.update(kw)
+
+
+class TestRunTestConfirmation(unittest.TestCase):
+    """`agentbell test` semantics. Field-test regression: publish success and
+    confirmation are different facts - a message the server accepted must
+    never be reported as 'NOT delivered' just because the read-back failed."""
+
+    def test_confirmed_when_message_is_readable(self):
+        server = MockNtfy()
+        try:
+            cfg = make_config(server.url)
+            outcome = an.run_test(cfg, confirm_seconds=6, poll_interval=0.1)
+        finally:
+            server.stop()
+        self.assertEqual(outcome["sent"], ["ntfy"])
+        self.assertTrue(outcome["confirmed"])
+        self.assertIsNone(outcome["reason"])
+
+    def test_poll_window_is_a_server_side_duration(self):
+        """Regression (WSL2 clock drift): the confirmation poll must use a
+        server-relative duration window ('90s'), never an epoch cursor from
+        the local clock - a clock ahead of the server's filtered out
+        messages that were delivered fine."""
+        server = MockNtfy()
+        seen = []
+        original = an.NtfyChannel.poll
+
+        def spy(self, topic, since, timeout=10.0):
+            seen.append(since)
+            return original(self, topic, since, timeout=timeout)
+
+        an.NtfyChannel.poll = spy
+        try:
+            cfg = make_config(server.url)
+            outcome = an.run_test(cfg, confirm_seconds=6, poll_interval=0.1)
+        finally:
+            an.NtfyChannel.poll = original
+            server.stop()
+        self.assertTrue(outcome["confirmed"])
+        self.assertTrue(seen)
+        for since in seen:
+            self.assertIsInstance(since, str)
+            self.assertRegex(since, r"^\d+[smhd]$")
+
+    def test_poll_error_becomes_the_reason(self):
+        """A failing confirmation poll (e.g. HTTP 429) must surface its error
+        instead of being silently swallowed."""
+        server = MockNtfy()
+        original = an.NtfyChannel.poll
+
+        def boom(self, topic, since, timeout=10.0):
+            raise an.TransientError("HTTP 429 from server: limit reached")
+
+        an.NtfyChannel.poll = boom
+        try:
+            cfg = make_config(server.url)
+            outcome = an.run_test(cfg, confirm_seconds=0.3, poll_interval=0.1)
+        finally:
+            an.NtfyChannel.poll = original
+            server.stop()
+        self.assertEqual(outcome["sent"], ["ntfy"])
+        self.assertFalse(outcome["confirmed"])
+        self.assertIn("429", outcome["reason"])
+
+    def test_unconfirmed_when_message_never_readable(self):
+        server = MockNtfy()
+        original = an.NtfyChannel.poll
+        an.NtfyChannel.poll = lambda self, topic, since, timeout=10.0: []
+        try:
+            cfg = make_config(server.url)
+            outcome = an.run_test(cfg, confirm_seconds=0.3, poll_interval=0.1)
+        finally:
+            an.NtfyChannel.poll = original
+            server.stop()
+        self.assertEqual(outcome["sent"], ["ntfy"])
+        self.assertFalse(outcome["confirmed"])
+        self.assertIn("read back", outcome["reason"])
+
+    def test_send_failure_reports_nothing_sent(self):
+        cfg = make_config("http://127.0.0.1:1")   # nothing listening
+        outcome = an.run_test(cfg, wait=False)
+        self.assertEqual(outcome["sent"], [])
+        self.assertIs(outcome["confirmed"], False)
+        self.assertTrue(outcome["reason"])
+
+    def test_no_wait_reports_unchecked(self):
+        server = MockNtfy()
+        try:
+            cfg = make_config(server.url)
+            outcome = an.run_test(cfg, wait=False)
+        finally:
+            server.stop()
+        self.assertEqual(outcome["sent"], ["ntfy"])
+        self.assertIsNone(outcome["confirmed"])
+
+    def test_poll_rejects_malformed_duration(self):
+        cfg = make_config("http://127.0.0.1:1")
+        with self.assertRaises(ValueError):
+            an.NtfyChannel(cfg).poll("testtopic", "90s&x=1")
+
+    def _cmd_test_with(self, outcome):
+        cfg = make_config("http://server.invalid")
+        original_config, original_run = an.Config, an.run_test
+        an.Config = lambda *a, **kw: cfg
+        an.run_test = lambda *a, **kw: outcome
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = an.cmd_test(_Args(no_wait=False))
+        finally:
+            an.Config, an.run_test = original_config, original_run
+        return code, out.getvalue(), err.getvalue()
+
+    def test_cmd_test_confirmed_exits_zero(self):
+        code, out, _ = self._cmd_test_with(
+            {"sent": ["ntfy"], "confirmed": True, "reason": None})
+        self.assertEqual(code, 0)
+        self.assertIn("confirmed", out)
+
+    def test_cmd_test_accepted_but_unconfirmed_is_not_called_not_delivered(self):
+        code, _, err = self._cmd_test_with(
+            {"sent": ["ntfy"], "confirmed": False, "reason": "HTTP 429 from x"})
+        self.assertEqual(code, 1)          # fail-closed: unconfirmed != proven
+        self.assertIn("NOT confirmed", err)
+        self.assertIn("HTTP 429", err)
+        self.assertNotIn("NOT delivered", err)
+
+    def test_cmd_test_nothing_sent_says_not_delivered(self):
+        code, _, err = self._cmd_test_with(
+            {"sent": [], "confirmed": False, "reason": "ntfy publish failed"})
+        self.assertEqual(code, 1)
+        self.assertIn("NOT delivered", err)
+
+    def _doctor_delivery_with(self, outcome):
+        cfg = make_config("http://server.invalid")
+        original_run = an.run_test
+        an.run_test = lambda *a, **kw: outcome
+        try:
+            checks = an.doctor_checks(cfg, send=True)
+        finally:
+            an.run_test = original_run
+        return [c for c in checks if c["name"] == "delivery"][-1]
+
+    def test_doctor_send_confirmed_is_ok(self):
+        check = self._doctor_delivery_with(
+            {"sent": ["ntfy"], "confirmed": True, "reason": None})
+        self.assertEqual(check["status"], an.OK)
+
+    def test_doctor_send_accepted_but_unconfirmed_is_warn_not_fail(self):
+        """Field-test regression: 'server accepted, read-back failed' must not
+        be reported as 'did NOT arrive'."""
+        check = self._doctor_delivery_with(
+            {"sent": ["ntfy"], "confirmed": False, "reason": "HTTP 429 from x"})
+        self.assertEqual(check["status"], an.WARN)
+        self.assertIn("429", check["detail"])
+        self.assertNotIn("NOT arrive", check["detail"])
+
+    def test_doctor_send_nothing_sent_is_fail(self):
+        check = self._doctor_delivery_with(
+            {"sent": [], "confirmed": False, "reason": "connection refused"})
+        self.assertEqual(check["status"], an.FAIL)
 
 
 class TestDoctor(unittest.TestCase):
@@ -3640,6 +3844,62 @@ class TestVerifyPrimitives(unittest.TestCase):
         ]
         obs = an.hook_observations(records, 3600, now=now)
         self.assertEqual(obs["vp-s"]["duplicates"], [])
+
+    def test_permission_burst_is_not_a_duplicate(self):
+        """Field-test regression (GitHub Copilot CLI): several real permission
+        prompts within seconds - even the same second - are legitimate
+        interaction events, not a double integration."""
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 12 + i), "agent": "vp-p",
+             "event": "hook.permission_required", "delivered": ["ntfy"]}
+            for i in (0, 0, 1, 1, 3)
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(obs["vp-p"]["duplicates"], [])
+        self.assertEqual(obs["vp-p"]["events"]["permission_required"], 5)
+
+    def test_input_required_burst_is_not_a_duplicate(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 10), "agent": "vp-i", "event": "hook.input_required",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 9), "agent": "vp-i", "event": "hook.input_required",
+             "delivered": ["ntfy"]},
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(obs["vp-i"]["duplicates"], [])
+
+    def test_interleaved_turn_duplicate_still_detected(self):
+        """An interaction event between two rapid run_completed records must
+        not reset the tracking - detection is per event label."""
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 10), "agent": "vp-x", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 9), "agent": "vp-x", "event": "hook.permission_required",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 8), "agent": "vp-x", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(len(obs["vp-x"]["duplicates"]), 1)
+        self.assertEqual(obs["vp-x"]["duplicates"][0]["event"], "run_completed")
+
+    def test_forced_records_never_pair_as_duplicates(self):
+        """A --force smoke test next to a real event is a human re-running a
+        command, not a second integration."""
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 10), "agent": "vp-fd", "event": "hook.run_completed",
+             "delivered": ["ntfy"], "forced": True},
+            {"ts": _iso(now - 8), "agent": "vp-fd", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 7), "agent": "vp-fd", "event": "hook.run_completed",
+             "delivered": ["ntfy"], "forced": True},
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(obs["vp-fd"]["duplicates"], [])
 
     def test_forced_and_started_and_unknown_are_tracked(self):
         now = time.time()

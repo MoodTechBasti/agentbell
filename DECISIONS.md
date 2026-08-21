@@ -583,8 +583,12 @@ event. So:
   `suppressed`/`deferred`/`queued`; the new `source_event` field preserves
   the original hook event. Without it, "arrived but held" reads as "never
   fired" and users would double-install during quiet hours.
-- Duplicates (same slug, same event, ≤5 s apart) are a **WARN, never a
-  FAIL**: two parallel sessions are legitimate; `history` disambiguates.
+- Duplicates (same slug, same **turn** event — `started`/`run_completed`/
+  `run_failed` — ≤5 s apart, `--force` records excluded) are a **WARN,
+  never a FAIL**: two parallel sessions are legitimate; `history`
+  disambiguates. Interaction events (`permission_required`,
+  `input_required`) never count: a turn starts and ends once, but an agent
+  legitimately raises several permission prompts within seconds (§16i).
   A runtime dedupe was rejected — it could swallow wanted notifications.
 - **`verify` never prints the topic, server or any path** (test-enforced).
   It is the one status command designed to be handed to an agent; the guide
@@ -661,3 +665,43 @@ end-to-end by a real user.
   across already-installed copies. Separate decision, taken deliberately
   later; the guide embeds the template verbatim so there is exactly one
   text to evolve.
+
+### 16i. What the Tier-1 field test taught (GitHub Copilot CLI, 2026-08-21)
+
+The gate from §16g closed: GitHub Copilot CLI 1.0.80, given only the
+`integrate` output, wired its own hooks, produced real attributed lifecycle
+events, passed `verify`, was idempotent on a second run and removed itself
+cleanly (evidence rows in `FIELD_TEST.md`). The same run exposed two false
+alarms in agentbell's own diagnostics — both were the tool making a claim
+its evidence did not support:
+
+- **`test` said "NOT delivered" for messages that were on the phone.** Root
+  cause: the confirmation poll's `since` cursor came from the *local* clock,
+  but ntfy filters by *server* time — a local clock running ahead (WSL2
+  clock drift) hid the delivered message, and poll errors were swallowed, so
+  the failure had no visible reason. Decision: the poll window is now a
+  server-relative duration (`since=90s`), the last poll error becomes the
+  reported reason, and the output states exactly what was proven: publish
+  failure ("NOT delivered"), accepted-but-unread ("sent, but NOT confirmed",
+  still exit 1 — fail-closed, unconfirmed is not proven), or read back from
+  the server ("delivered and confirmed"). "Confirmed" deliberately claims
+  the server, not the phone: only the subscription proves the final hop.
+  `doctor --send` reports accepted-but-unread as a WARN (exit 0): doctor
+  diagnoses health, and that state includes structurally healthy configs
+  (cache-disabled servers, write-only publish tokens) where a FAIL would be
+  permanently wrong — `test` stays the delivery *proof* command with its
+  strict exit code. The same local-vs-server-clock class was also fixed in
+  the ask receiver: prime/stream/poll windows are monotonic-elapsed
+  duration strings now, deduplicated by message id.
+- **`verify` warned "possible double integration" on real permission
+  prompts.** Root cause: the near-duplicate heuristic treated *any*
+  same-label pair ≤5 s apart as suspicious; Copilot raised several distinct
+  `permission_required` prompts within one second. Hook messages are
+  templates (same agent + cwd ⇒ identical text), so content cannot
+  disambiguate — the event *class* can: a turn starts and ends once, so
+  duplicate detection now covers `started`/`run_completed`/`run_failed`
+  only, tracks per event label (an interleaved permission prompt no longer
+  resets the pair detection — strictly stronger on turn events), and skips
+  `--force` records. The residual gap — a double integration that only
+  wires interaction events — also double-fires turn events in practice,
+  which is where the detection now looks.

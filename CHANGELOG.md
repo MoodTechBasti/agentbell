@@ -55,6 +55,44 @@ needs to know an agent to work with it: it **publishes a contract** and
   hooks" line and cross-links `verify`; `uninstall` lists self-integrated
   wiring under "not removed automatically".
 
+### Fixed (found by the Tier-1 field test, see below)
+
+- **`agentbell test` no longer reports "NOT delivered" for delivered
+  messages.** The confirmation poll used an epoch cursor from the *local*
+  clock; with the local clock ahead of the server's (WSL2 clock drift), the
+  server-side `since` filter hid the delivered message, and poll errors were
+  silently swallowed. The poll now uses a server-relative duration window
+  (`since=90s`), the last poll error is reported as the failure reason, and
+  the output separates three honest states: "NOT delivered" (publish
+  failed), "sent, but NOT confirmed" (server accepted the message, read-back
+  failed — still exit 1, unconfirmed is not proven), and "delivered and
+  confirmed" (published *and* read back from the server; only your phone's
+  subscription proves the final hop). `doctor --send` reports the middle
+  state as a WARN instead of a false "did NOT arrive" FAIL. The same
+  local-clock bug class was fixed in the `ask` receiver: its prime/stream/
+  poll replay windows are now server-relative duration strings (deduplicated
+  by message id), so clock drift can no longer blind the poll fallback that
+  exists precisely for servers with unreliable streams.
+- **`verify` no longer flags rapid real permission prompts as a "possible
+  double integration".** The near-duplicate heuristic counted *any*
+  same-label events ≤5 s apart; GitHub Copilot CLI legitimately raised
+  several `permission_required` prompts within one second. Duplicate
+  detection now covers per-turn lifecycle events only (`started`,
+  `run_completed`, `run_failed`), tracks per event label (an interleaved
+  interaction event no longer hides a real turn duplicate — detection got
+  *stronger* there), and skips `--force` smoke tests (a re-run command is a
+  human, not a second integration).
+
+### Field-verified
+
+- **Tier 1 passed (2026-08-21): GitHub Copilot CLI 1.0.80** self-integrated
+  against the printed contract alone — chose its own slug and native hooks,
+  wired all 5 events with the paired anti-spam flags, produced a real
+  (non-forced) `run_completed` after an ~8-minute turn, passed
+  `verify --agent github-copilot-cli --since 10m`, was idempotent on a
+  second `integrate` run, and removed itself cleanly. Details in
+  `FIELD_TEST.md`.
+
 ## 1.5.0 — 2026-08-19 — first public release
 
 ### Changed

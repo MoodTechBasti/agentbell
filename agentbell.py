@@ -804,6 +804,11 @@ class NtfyChannel:
         validate_topic(topic)
         if since is None:
             since = int(time.time())
+        if isinstance(since, str):
+            if not re.fullmatch(r"\d+[smhd]", since):
+                raise ValueError(f"invalid since window {since!r} (use e.g. '90s')")
+        else:
+            since = int(since)
         url = f"{self.server()}/{topic}/json?since={since}"
         request = urllib.request.Request(url)
         for key, value in self._headers().items():
@@ -814,14 +819,26 @@ class NtfyChannel:
             raise RuntimeError(f"cannot subscribe to {url}: {exc}") from exc
 
     def poll(self, topic, since, timeout=10.0):
-        """One-shot fetch of messages since `since` (epoch seconds).
+        """One-shot fetch of messages since `since`.
+
+        `since` is either epoch seconds or an ntfy duration string like
+        "90s", which the *server* resolves against its own clock. `test`
+        uses the duration form: an epoch cursor from the local clock can sit
+        *ahead* of the server's clock (WSL2 drift, VMs after sleep) and then
+        filters out a message that was delivered fine.
 
         Carries the same auth header as publish/subscribe - without it the
         approval poller and `test` silently fail against a protected
         self-hosted ntfy.
         """
         validate_topic(topic)
-        url = f"{self.server()}/{topic}/json?poll=1&since={int(since)}"
+        if isinstance(since, str):
+            if not re.fullmatch(r"\d+[smhd]", since):
+                raise ValueError(f"invalid poll window {since!r} (use e.g. '90s')")
+            cursor = since
+        else:
+            cursor = str(int(since))
+        url = f"{self.server()}/{topic}/json?poll=1&since={cursor}"
         status, raw = http_request(url, headers=self._headers(), timeout=timeout)
         events = []
         for line in raw.decode("utf-8", "replace").strip().splitlines():
@@ -2142,9 +2159,18 @@ class ApprovalWaiter:
         self.stop_event = threading.Event()
         self.errors = []
         self._threads = []
-        # `since` has 1-second granularity on ntfy, so the window we open can
-        # still contain the tail of a previous conversation.
-        self.since = int(time.time())
+        # The replay window is a *server-side* duration, never a local epoch
+        # cursor: ntfy filters `since` by server time, and a local clock ahead
+        # of the server's (WSL2 drift) would blind the poll fallback exactly
+        # when the stream is down - the same root cause as the `test` false
+        # negative (DECISIONS §16i). Monotonic elapsed time plus a fixed
+        # margin is drift-proof; the id-based dedupe (`seen`, primed below)
+        # absorbs the replay a wide window causes.
+        self._started_monotonic = time.monotonic()
+
+    def _window(self):
+        """ntfy `since` duration reaching back to shortly before start()."""
+        return f"{int(time.monotonic() - self._started_monotonic) + 90}s"
 
     def _prime(self):
         """Mark everything already on the response topic as seen.
@@ -2155,7 +2181,7 @@ class ApprovalWaiter:
         message id is exact and costs one request before we start waiting.
         """
         try:
-            events = NtfyChannel(self.cfg).poll(self.resp_topic, self.since, timeout=8.0)
+            events = NtfyChannel(self.cfg).poll(self.resp_topic, self._window(), timeout=8.0)
         except RuntimeError as exc:
             self._record_error(str(exc))
             return
@@ -2223,7 +2249,7 @@ class ApprovalWaiter:
         while not self.stop_event.is_set():
             try:
                 stream = NtfyChannel(self.cfg).subscribe(
-                    self.resp_topic, since=self.since, timeout=STREAM_READ_TIMEOUT)
+                    self.resp_topic, since=self._window(), timeout=STREAM_READ_TIMEOUT)
             except RuntimeError as exc:
                 self._record_error(str(exc))
                 self.stop_event.wait(2.0)   # transient: try again, do not spin
@@ -2252,7 +2278,7 @@ class ApprovalWaiter:
     def _poller(self):
         while not self.stop_event.wait(self.poll_interval):
             try:
-                for event in NtfyChannel(self.cfg).poll(self.resp_topic, self.since, timeout=10.0):
+                for event in NtfyChannel(self.cfg).poll(self.resp_topic, self._window(), timeout=10.0):
                     if event.get("event") == "message":
                         self._offer(event.get("id"), event.get("message") or "")
             except RuntimeError as exc:
@@ -5194,11 +5220,22 @@ def doctor_checks(cfg, send=False):
         if not cfg.ntfy_ready():
             checks.append(_check(FAIL, "delivery", "cannot test delivery without a topic",
                                  "agentbell init"))
-        elif run_test(cfg):
-            checks.append(_check(OK, "delivery", "test notification confirmed on the server"))
         else:
-            checks.append(_check(FAIL, "delivery", "test notification did NOT arrive",
-                                 "agentbell history --limit 5   # see what happened"))
+            outcome = run_test(cfg)
+            if outcome["confirmed"]:
+                checks.append(_check(OK, "delivery",
+                                     "test notification confirmed on the server"))
+            elif "ntfy" in outcome["sent"]:
+                checks.append(_check(WARN, "delivery",
+                                     "test notification sent (server accepted it) but not "
+                                     "confirmed" + (f": {outcome['reason']}"
+                                                    if outcome["reason"] else ""),
+                                     "agentbell test   # retry the confirmed check"))
+            else:
+                checks.append(_check(FAIL, "delivery",
+                                     "test notification was NOT sent"
+                                     + (f": {outcome['reason']}" if outcome["reason"] else ""),
+                                     "agentbell history --limit 5   # see what happened"))
     return checks
 
 
@@ -5264,9 +5301,16 @@ def cmd_doctor(args):
 # ---------------------------------------------------------------------------
 
 VERIFY_WINDOW_DEFAULT = "7d"
-# Two same-label events within this window look like a double integration
-# (hooks AND a rules block both firing for one turn).
+# Two same-label *turn* events within this window look like a double
+# integration (hooks AND a rules block both reporting the same turn).
 DUPLICATE_WINDOW_SECONDS = 5.0
+# Only per-turn lifecycle events participate: a turn starts/ends once, so a
+# rapid same-label pair is suspicious. Interaction events
+# (permission_required, input_required) are excluded - an agent legitimately
+# raises several permission prompts within seconds (GitHub Copilot CLI did,
+# in the v1.6.0 field test), and hook messages are templates, so such bursts
+# are indistinguishable from duplicates by content.
+DUPLICATE_EVENTS = ("started", "run_completed", "run_failed")
 
 
 def _parse_since(value):
@@ -5316,7 +5360,7 @@ def hook_observations(records, since_seconds, now=None):
             "count": 0, "delivered": 0, "held": 0, "skipped_short": 0,
             "failed": 0, "forced": 0, "events": {},
             "last_ts": ts, "started_delivered": 0, "duplicates": [],
-            "unknown_events": {}, "_last": None,
+            "unknown_events": {}, "_last": {},
         })
         obs["last_ts"] = max(obs["last_ts"], ts)
         event = str(rec.get("event") or "")
@@ -5349,11 +5393,15 @@ def hook_observations(records, since_seconds, now=None):
             obs["forced"] += 1
         if delivered and short == "started":
             obs["started_delivered"] += 1
-        last = obs["_last"]
-        if last and last[0] == short and 0 <= ts - last[1] <= DUPLICATE_WINDOW_SECONDS:
-            obs["duplicates"].append({"event": short, "ts": ts,
-                                      "gap_seconds": round(ts - last[1], 1)})
-        obs["_last"] = (short, ts)
+        # Near-duplicate tracking is per event label (an interleaved event in
+        # between must not reset it) and skips forced records - a manually
+        # re-run smoke test is a human, not a second integration.
+        if short in DUPLICATE_EVENTS and not rec.get("forced"):
+            last_ts = obs["_last"].get(short)
+            if last_ts is not None and 0 <= ts - last_ts <= DUPLICATE_WINDOW_SECONDS:
+                obs["duplicates"].append({"event": short, "ts": ts,
+                                          "gap_seconds": round(ts - last_ts, 1)})
+            obs["_last"][short] = ts
     for obs in agents.values():
         del obs["_last"]
     return agents
@@ -5459,7 +5507,7 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
             if obs["duplicates"]:
                 checks.append(_check(
                     WARN, name,
-                    f"{len(obs['duplicates'])} near-duplicate event(s) within "
+                    f"{len(obs['duplicates'])} near-duplicate turn event(s) within "
                     f"{DUPLICATE_WINDOW_SECONDS:.0f}s - possible double integration "
                     "(or two parallel sessions, which is fine)",
                     "keep ONE lifecycle mechanism (hooks OR a rules block); "
@@ -5778,25 +5826,37 @@ def cmd_init(args):
     if not args.no_test:
         print(f"\nSending a test notification to '{ntfy['topic']}'...")
         outcome = run_test(cfg, wait=not args.no_wait)
-        if outcome:
+        if outcome["confirmed"]:
             print("Test notification delivered. Check your phone!")
+        elif outcome["confirmed"] is None:
+            print("Test notification sent. Check your phone!")
+        elif "ntfy" in outcome["sent"]:
+            print("Test notification sent (server accepted it), but it could not "
+                  "be confirmed. If it arrived on your phone, all is well; "
+                  "otherwise retry: agentbell test")
         else:
-            print("Test notification not confirmed. Check the topic and your network, "
-                  "then retry: agentbell test")
+            print("Test notification not delivered. Check the topic and your "
+                  "network, then retry: agentbell test")
 
     print_next_steps(cfg)
 
 
-def run_test(cfg, wait=True):
-    """Send a real notification and confirm it actually reached the server."""
+def run_test(cfg, wait=True, confirm_seconds=15, poll_interval=2):
+    """Send a real notification and confirm it reached the ntfy server.
+
+    Returns {"sent": [channels], "confirmed": True|False|None, "reason": str|None}.
+    `confirmed` means: the message was published AND could be read back from
+    the topic - server-side proof, one step short of "the phone showed it"
+    (only the subscription proves that). None = not checked (wait=False).
+    The three states exist because the field test showed "NOT delivered" for
+    messages that *were* delivered: publish success and confirmation failure
+    are different facts and must never be collapsed into one.
+    """
     topic = cfg.data["ntfy"]["topic"]
     if not topic:
-        return False
+        return {"sent": [], "confirmed": False, "reason": "no ntfy topic configured"}
     stamp = secrets.token_hex(4)
     message = f"Test notification from {PROG} ({stamp})"
-    # take the poll cursor *before* publishing: ntfy's `since` has 1s
-    # granularity, so a cursor taken afterwards can miss our own message
-    start = int(time.time()) - 1
     try:
         result = send_notification(
             cfg, message,
@@ -5805,23 +5865,37 @@ def run_test(cfg, wait=True):
             tags=["test", "bell"],
             force=True,
         )
-    except RuntimeError:
-        return False
-    if not result.get("results"):
-        return False
+    except RuntimeError as exc:
+        return {"sent": [], "confirmed": False, "reason": str(exc)}
+    sent = [r.get("channel") for r in result.get("results") or []]
+    if "ntfy" not in sent:
+        if "ntfy" in (result.get("queued") or []):
+            reason = ("ntfy is unreachable right now - the test notification "
+                      "was queued for later delivery")
+        else:
+            reason = "; ".join(result.get("errors") or []) or "ntfy publish failed"
+        return {"sent": sent, "confirmed": False, "reason": reason}
     if not wait:
-        return True
-    deadline = time.monotonic() + 15
+        return {"sent": sent, "confirmed": None, "reason": None}
+    # Confirm by reading the message back. The poll window is a *server-side*
+    # duration ("90s"), never a local epoch cursor: a local clock running
+    # ahead of the server's (WSL2 drift) made the old cursor filter out
+    # delivered messages, and the swallowed poll errors hid the real cause.
+    reason = None
+    deadline = time.monotonic() + confirm_seconds
     while time.monotonic() < deadline:
-        time.sleep(2)
+        time.sleep(poll_interval)
         try:
-            events = NtfyChannel(cfg).poll(topic, start, timeout=8.0)
-        except RuntimeError:
+            events = NtfyChannel(cfg).poll(topic, "90s", timeout=8.0)
+        except RuntimeError as exc:
+            reason = str(exc)
             continue
         for event in events:
             if event.get("event") == "message" and stamp in (event.get("message") or ""):
-                return True
-    return False
+                return {"sent": sent, "confirmed": True, "reason": None}
+    return {"sent": sent, "confirmed": False,
+            "reason": reason or ("the message could not be read back from the "
+                                 f"topic within {confirm_seconds}s")}
 
 
 def cmd_test(args):
@@ -5833,13 +5907,32 @@ def cmd_test(args):
         return 1
     topic = cfg.data["ntfy"]["topic"]
     print(f"Sending a test notification to '{topic}'...")
-    if run_test(cfg, wait=not args.no_wait):
-        if args.no_wait:
-            print("sent. Check your phone (ntfy app, topic subscribed?).")
-        else:
-            print("delivered and confirmed on the server. Check your phone now.")
+    outcome = run_test(cfg, wait=not args.no_wait)
+    if outcome["confirmed"]:
+        print("delivered and confirmed: published and read back from the ntfy "
+              "server. Check your phone now.")
         return 0
+    if outcome["confirmed"] is None:
+        print("sent. Check your phone (ntfy app, topic subscribed?).")
+        return 0
+    if "ntfy" in outcome["sent"]:
+        # The server accepted the publish; only the confirmation read failed.
+        # Fail-closed (exit 1: unconfirmed is not proven) - but never claim
+        # "NOT delivered" for a message the server took (field-test lesson).
+        print("sent, but NOT confirmed: the ntfy server accepted the message, "
+              "yet it could not be read back for confirmation.", file=sys.stderr)
+        if outcome["reason"]:
+            print(f"  reason: {outcome['reason']}", file=sys.stderr)
+        print("  If the push arrived on your phone, delivery works - only the "
+              "confirmation read failed (retry: agentbell test).", file=sys.stderr)
+        print("  If not:                                       agentbell doctor", file=sys.stderr)
+        return 1
     print("NOT delivered.", file=sys.stderr)
+    if outcome["sent"]:
+        print(f"  (delivered on: {', '.join(outcome['sent'])} - ntfy was not)",
+              file=sys.stderr)
+    if outcome["reason"]:
+        print(f"  reason: {outcome['reason']}", file=sys.stderr)
     print("  1. is the topic subscribed in the ntfy app?   topic: " + topic, file=sys.stderr)
     print("  2. what went wrong?                           agentbell history --limit 5", file=sys.stderr)
     print("  3. full diagnosis + fixes                     agentbell doctor", file=sys.stderr)
