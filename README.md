@@ -1,6 +1,6 @@
 # agentbell
 
-**Phone notifications and Approve/Deny approvals for AI coding agents — one stdlib-only Python file, zero dependencies.**
+**One place for all your AI agent notifications — phone push + Approve/Deny from your pocket.**
 
 [![CI](https://github.com/MoodTechBasti/agentbell/actions/workflows/ci.yml/badge.svg)](https://github.com/MoodTechBasti/agentbell/actions) [![License](https://img.shields.io/github/license/MoodTechBasti/agentbell)](LICENSE) ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg) ![Dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen.svg)
 
@@ -8,16 +8,17 @@
 
 ---
 
-**Your agent finished 20 minutes ago. You didn't notice.**
+Be honest — how many times have you already checked your screen today while your AI agent still wasn’t done?
 
-Or worse: it stopped after 30 seconds because it needed one "yes" from you — and then just sat there.
+You jump between ChatGPT, Claude, Gemini, Cursor, DeepSeek… Desktop apps, CLI, browser windows. Always checking. Always a bit on edge.
 
-`agentbell` fixes both:
+`agentbell` is the single place that tells you when something actually needs you.
 
-- **Your phone buzzes** the moment an agent finishes, fails, or needs you.
-- **You answer from your phone.** The agent asks *"Deploy to prod?"*, you tap **Approve** — the agent continues. No public endpoint to expose, no port forwarding, no account for the free core (premium needs your own Telegram bot).
+- **Push notification** straight to your phone the moment an agent finishes, fails, or waits for input
+- When it really needs a decision, you tap **Approve** or **Deny** from your phone — no running back to the keyboard
+- One stdlib-only Python file, zero dependencies, free, no account, no server
 
-One stdlib-only Python file, one command to install. Works with **Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Kimi Code, Qwen Code, Windsurf, Cline, Continue, Zed, Aider**, the **ChatGPT and Claude desktop apps** (via MCP), CI jobs, and any shell script.
+Works with **Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Kimi Code, Qwen Code, Windsurf, Cline, Continue, Zed, Aider**, the **ChatGPT and Claude desktop apps** (via MCP), CI jobs, and any shell script.
 
 > **Status:** first public release (v1.5.0) — feedback wanted.
 
