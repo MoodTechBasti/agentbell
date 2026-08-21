@@ -103,6 +103,18 @@ needs to know an agent to work with it: it **publishes a contract** and
   The matcher now parses the command and compares the first token's
   basename stem against `agentbell`; a wrapped command (`bash -c '…'`) is
   deliberately not touched — it is the user's, not ours.
+- **Contract commands now embed the binary shell-quoted.** The manifest and
+  guide built commands as `f"{binary} hook …"` with the raw path; a Windows
+  path (backslashes) or any path with spaces did not survive the shell
+  split the host applies before executing — the same quoting the native
+  hook installers already used everywhere else.
+- **The Windows test jobs were red before this branch and are repaired
+  with it:** on Windows `os.path.expanduser` ignores `HOME` and reads
+  `USERPROFILE`, so tests that only moved `HOME` read and wrote the real
+  runner profile (state leaked between tests; installs landed where
+  assertions never looked). Test homes now move both variables; the bot
+  service test is skipped on Windows (no installer there by design); the
+  remaining assertions are binary-shape-independent.
 
 ### Field-verified
 

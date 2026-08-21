@@ -3908,6 +3908,10 @@ def mcp_snippet(binary):
 
 def integration_manifest(agent=None, project=None):
     binary = agentbell_binary()
+    # every advertised command embeds the shell-quoted binary: a Windows
+    # path (backslashes) or a path with spaces would otherwise not survive
+    # the shell split the host applies before executing it
+    qbinary = shlex.quote(binary)
     slug = agent or INTEGRATE_PLACEHOLDER
     status_rows = hooks_status(project=project)
     detected = set(find_agents())
@@ -3916,7 +3920,7 @@ def integration_manifest(agent=None, project=None):
                     for name, status, _, reliability in status_rows]
     events = []
     for name, spec in HOOK_EVENTS.items():
-        command = f"{binary} hook {name} --agent {slug}"
+        command = f"{qbinary} hook {name} --agent {slug}"
         if name == "started":
             command += " --silent"
             when = "a turn started - only ever wire it with --silent (start marker only)"
@@ -3931,16 +3935,16 @@ def integration_manifest(agent=None, project=None):
         events.append({"name": name, "when": when, "priority": spec["prio"],
                        "command": command})
     commands = {
-        "smoke": f"{binary} hook run_completed --agent {slug} --force",
-        "verify_agent": f"{binary} verify --agent {slug} --since 10m",
-        "verify_all": f"{binary} verify",
-        "started_silent": f"{binary} hook started --agent {slug} --silent",
-        "completed_min_duration": (f"{binary} hook run_completed --agent {slug} "
+        "smoke": f"{qbinary} hook run_completed --agent {slug} --force",
+        "verify_agent": f"{qbinary} verify --agent {slug} --since 10m",
+        "verify_all": f"{qbinary} verify",
+        "started_silent": f"{qbinary} hook started --agent {slug} --silent",
+        "completed_min_duration": (f"{qbinary} hook run_completed --agent {slug} "
                                    f"--min-duration {HOOK_MIN_DURATION}"),
-        "notify": f'{binary} notify "the message" --title "the title"',
-        "ask": f'{binary} ask "May I <do the action>?"',
-        "mcp_snippets": f"{binary} mcp add --print",
-        "native_install_example": f"{binary} hooks install claude",
+        "notify": f'{qbinary} notify "the message" --title "the title"',
+        "ask": f'{qbinary} ask "May I <do the action>?"',
+        "mcp_snippets": f"{qbinary} mcp add --print",
+        "native_install_example": f"{qbinary} hooks install claude",
     }
     marker_start = f"<!-- agentbell:{slug}:start -->"
     marker_end = f"<!-- agentbell:{slug}:end -->"
@@ -4164,7 +4168,7 @@ def integration_guide(manifest):
     out("   (sole exception: an invalid --agent slug is a usage error, exit 2):")
     for event in m["events"]:
         out(f"     {event['name']:20s} when {event['when']}")
-    out(f"     command: {binary} hook <event> --agent {slug}")
+    out(f"     command: {shlex.quote(binary)} hook <event> --agent {slug}")
     out("   Anti-spam (wire BOTH lines or NEITHER):")
     out(f"     turn start: {m['commands']['started_silent']}")
     out(f"     turn end:   {m['commands']['completed_min_duration']}")

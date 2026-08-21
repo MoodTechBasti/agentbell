@@ -31,6 +31,24 @@ os.environ["AGENTBELL_CONFIG_DIR"] = os.path.join(_TEST_ROOT, "config")
 HAS_TOMLLIB = sys.version_info >= (3, 11)
 
 
+def _set_home(home):
+    """Point every home-dir mechanism at `home`. Windows expanduser ignores
+    HOME and reads USERPROFILE, so tests must move both - otherwise they
+    read and write the real profile of the machine running the tests."""
+    old = {key: os.environ.get(key) for key in ("HOME", "USERPROFILE")}
+    os.environ["HOME"] = home
+    os.environ["USERPROFILE"] = home
+    return old
+
+
+def _restore_home(old):
+    for key, value in old.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
 def _fake_launcher(tmpdir, name="agentbell"):
     """A stand-in installed launcher for sys.argv[0]: agentbell_binary()
     only trusts an argv[0] that actually exists on disk."""
@@ -412,16 +430,12 @@ class TestHooks(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.home = tempfile.mkdtemp()
-        self.old_home = os.environ.get("HOME")
-        os.environ["HOME"] = self.home
+        self.old_home = _set_home(self.home)
         self.old_argv0 = sys.argv[0]
         sys.argv[0] = _fake_launcher(self.tmp)
 
     def tearDown(self):
-        if self.old_home:
-            os.environ["HOME"] = self.old_home
-        else:
-            os.environ.pop("HOME", None)
+        _restore_home(self.old_home)
         sys.argv[0] = self.old_argv0
         shutil.rmtree(self.tmp, ignore_errors=True)
         shutil.rmtree(self.home, ignore_errors=True)
@@ -444,10 +458,11 @@ class TestHooks(unittest.TestCase):
         self.assertIn("Stop", data["hooks"])
         self.assertIn("StopFailure", data["hooks"])
         self.assertIn("Notification", data["hooks"])
-        commands = " ".join(
-            h["command"] for g in data["hooks"]["Stop"] for h in g["hooks"]
-        )
-        self.assertIn("agentbell hook run_completed --agent claude", commands)
+        stop_hooks = [h for g in data["hooks"]["Stop"] for h in g["hooks"]]
+        # shape-independent: on Windows the binary is quoted ('C:\...\agentbell')
+        self.assertTrue(any(an._contains_our_hook(h)
+                            and "hook run_completed --agent claude" in h["command"]
+                            for h in stop_hooks), stop_hooks)
         # idempotent
         result2 = an.install_hooks("claude")
         self.assertFalse(result2["changed"])
@@ -510,7 +525,8 @@ class TestHooks(unittest.TestCase):
             data = json.load(fh)
         self.assertIn("AfterAgent", data["hooks"])
         hook = data["hooks"]["AfterAgent"][0]["hooks"][0]
-        self.assertIn("agentbell hook run_completed --agent gemini", hook["command"])
+        self.assertTrue(an._contains_our_hook(hook), hook)
+        self.assertIn("hook run_completed --agent gemini", hook["command"])
         an.install_hooks("gemini", add=False)
         with open(path) as fh:
             data = json.load(fh)
@@ -642,7 +658,9 @@ class TestHooks(unittest.TestCase):
         with open(path) as fh:
             text = fh.read()
         self.assertNotIn("/old/path", text)
-        self.assertIn(an.agentbell_binary(), text)
+        # the healed block is the current one verbatim (TOML-escapes the
+        # binary on Windows, so a raw-path assertIn would never match there)
+        self.assertIn(an.kimi_hooks_block(), text)
         self.assertFalse(an.install_hooks("kimi")["changed"])
         an.install_hooks("kimi", add=False)
 
@@ -676,10 +694,10 @@ class TestHooks(unittest.TestCase):
             for group in data["hooks"][event]:
                 for hook in group["hooks"]:
                     self.assertTrue(hook.get("async"), f"{event} hook must be async")
-        commands = " ".join(
-            h["command"] for g in data["hooks"]["Stop"] for h in g["hooks"]
-        )
-        self.assertIn("agentbell hook run_completed --agent qwen-code", commands)
+        stop_hooks = [h for g in data["hooks"]["Stop"] for h in g["hooks"]]
+        self.assertTrue(any(an._contains_our_hook(h)
+                            and "hook run_completed --agent qwen-code" in h["command"]
+                            for h in stop_hooks), stop_hooks)
         self.assertFalse(an.install_hooks("qwen-code")["changed"])
         self.assertTrue(an.install_hooks("qwen-code", add=False)["changed"])
         with open(path) as fh:
@@ -2128,16 +2146,12 @@ class TestPurge(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
         self.project = tempfile.mkdtemp()
-        self.old_home = os.environ.get("HOME")
-        os.environ["HOME"] = self.home
+        self.old_home = _set_home(self.home)
         self.old_argv0 = sys.argv[0]
         sys.argv[0] = _fake_launcher(self.home)
 
     def tearDown(self):
-        if self.old_home:
-            os.environ["HOME"] = self.old_home
-        else:
-            os.environ.pop("HOME", None)
+        _restore_home(self.old_home)
         sys.argv[0] = self.old_argv0
         shutil.rmtree(self.home, ignore_errors=True)
         shutil.rmtree(self.project, ignore_errors=True)
@@ -3181,6 +3195,8 @@ class TestFieldTestRegressions(unittest.TestCase):
         self.assertGreaterEqual(len(suggested), an.MIN_GUESSABLE_TOPIC_LEN)
         an.validate_topic(suggested)
 
+    @unittest.skipIf(sys.platform.startswith("win"),
+                     "no bot service installer on Windows (by design, SystemExit)")
     def test_bot_service_file_uses_an_absolute_binary_path(self):
         # 'cp examples/agentbell-bot.service ...' only worked from a
         # checkout, and a %h-relative ExecStart missed pipx/venv installs.

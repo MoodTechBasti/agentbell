@@ -734,3 +734,14 @@ the command and compares the first token's stem — and deliberately leaves
 wrapped commands (`bash -c '…'`) alone: a wrapper is the user's construction,
 and "only entries whose command is ours are ever touched" outranks
 completeness of removal.
+
+Follow-up from the same CI pass: the advertised *commands* must embed the
+binary shell-quoted (`shlex.quote`) — a Windows path or a path with spaces
+otherwise dies at the host's shell split; the manifest's `binary` field
+stays the raw path, and the two are reconciled by the contract test
+(`shlex.split(command)[0] == binary`). The Windows CI jobs had been red all
+along for a test-environment reason worth recording: Windows `expanduser`
+reads `USERPROFILE` and ignores `HOME`, so tests that only moved `HOME`
+operated on the real runner profile — cross-test contamination that looked
+like product bugs (broken idempotence, purge misses). Test homes move both
+variables now.
