@@ -22,9 +22,12 @@ Works with **Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Kimi Code, Qwen C
 
 > **Status:** v1.6.0 — feedback wanted.
 
-<!-- demo: docs/demo.gif — 20s: watch build → phone push → ask blocks → phone Approve → terminal continues -->
+**The loop:**
 
-*(demo GIF coming — record with VHS)*
+```text
+agent finishes or blocks  ->  agentbell  ->  phone
+agent receives decision   <-  agentbell  <-  Approve / Deny
+```
 
 **Requirements:** Python 3.9+ · the free [ntfy](https://ntfy.sh) app (iOS/Android) · no account and no server of your own for the free core.
 
