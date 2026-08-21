@@ -26,6 +26,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import urllib.error
@@ -194,6 +195,11 @@ HOOK_MIN_DURATION = 60
 
 BLOCK_START = "<!-- agentbell:start -->"
 BLOCK_END = "<!-- agentbell:end -->"
+AIDER_SCOPE_NOTICE = (
+    "This agentbell block applies only to Aider. If you are not Aider, ignore "
+    "this entire block and do not run these commands."
+)
+AIDER_REPAIR_COMMAND = "agentbell hooks install aider"
 TOML_START = "# --- agentbell:start ---"
 TOML_END = "# --- agentbell:end ---"
 # Stamped on the single `features.hooks = true` line we add to Codex's config,
@@ -2962,10 +2968,12 @@ def _instructions_text(agent):
     Wrapped in <!-- agentbell --> comment markers by _install_block_file,
     so uninstalling never touches the user's own rules.
     """
+    scope = (AIDER_SCOPE_NOTICE + "\n\n") if agent == "aider" else ""
     return (
         "## Notifications (agentbell)\n"
         "\n"
-        "Send phone notifications with the `agentbell` CLI at the right moments:\n"
+        + scope
+        + "Send phone notifications with the `agentbell` CLI at the right moments:\n"
         "\n"
         f"- When you finish a task or request, run: `agentbell hook run_completed --agent {agent}`\n"
         f"- If you need user input before you can continue, run: `agentbell hook input_required --agent {agent}`\n"
@@ -3045,7 +3053,7 @@ def _open_nofollow(path, mode="w"):
     return os.fdopen(os.open(path, flags, 0o644), mode, encoding="utf-8")
 
 
-def _install_block_file(path, content, add=True):
+def _install_block_file(path, content, add=True, replace_stale=False):
     exists = os.path.exists(path)
     if os.path.lexists(path) and _is_symlink_refused(path):
         return False
@@ -3071,10 +3079,27 @@ def _install_block_file(path, content, add=True):
         with open(path, "r", encoding="utf-8") as fh:
             text = fh.read()
         if BLOCK_START in text:
-            return False
+            if not replace_stale:
+                return False
+            pattern = re.compile(
+                re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END), re.S
+            )
+            matches = list(pattern.finditer(text))
+            # An unmatched or duplicated marker is ambiguous. Never guess which
+            # surrounding user text belongs to agentbell.
+            if len(matches) != 1:
+                return False
+            replacement = f"{BLOCK_START}\n{content.rstrip()}\n{BLOCK_END}"
+            match = matches[0]
+            if match.group(0) == replacement:
+                return False
+            new_text = text[:match.start()] + replacement + text[match.end():]
+            with _open_nofollow(path, "w") as fh:
+                fh.write(new_text)
+            return True
     else:
         text = ""
-    block = f"{BLOCK_START}\n{content}\n{BLOCK_END}\n"
+    block = f"{BLOCK_START}\n{content.rstrip()}\n{BLOCK_END}\n"
     with _open_nofollow(path, "a") as fh:
         if text and not text.endswith("\n"):
             fh.write("\n")
@@ -3144,14 +3169,67 @@ def _windsurf_rule_result(project, add):
     return {"agent": "windsurf", "changed": changed, "path": current}
 
 
-def _block_file_result(agent, project, relpath, content, add):
+def _block_file_result(agent, project, relpath, content, add, replace_stale=False):
     path = os.path.join(_project_dir(project), relpath)
-    return {"agent": agent, "changed": _install_block_file(path, content, add=add),
+    return {"agent": agent,
+            "changed": _install_block_file(path, content, add=add,
+                                             replace_stale=replace_stale),
             "path": path}
 
 
 def _block_file_status(relpath, project):
     return _file_contains(os.path.join(_project_dir(project), relpath), BLOCK_START)
+
+
+def aider_block_state(project=None):
+    """Return absent/current/outdated for agentbell's Aider AGENTS.md block."""
+    path = os.path.join(_project_dir(project), "AGENTS.md")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except (FileNotFoundError, OSError):
+        return "absent"
+    pattern = re.compile(
+        re.escape(BLOCK_START) + r"(.*?)" + re.escape(BLOCK_END), re.S
+    )
+    matches = pattern.findall(text)
+    if len(matches) != 1:
+        return "absent"
+    aider_marked = [body for body in matches if "--agent aider" in body]
+    if not aider_marked:
+        return "absent"
+    expected = _instructions_text("aider").strip()
+    if aider_marked[0].strip() == expected:
+        return "current"
+    return "outdated"
+
+
+def aider_repair_notice(project=None):
+    if aider_block_state(project) != "outdated":
+        return None
+    return {
+        "code": "aider_agents_block_outdated",
+        "title": "ACTION REQUIRED: outdated AGENTS.md integration",
+        "detail": ("The old Aider block can be followed by other agents, causing "
+                   "duplicate or wrongly attributed notifications."),
+        "instruction": ("Run this from the project directory. Only the "
+                        "agentbell-owned marker block is updated; your other "
+                        "AGENTS.md sections stay unchanged."),
+        "command": AIDER_REPAIR_COMMAND,
+    }
+
+
+def print_action_banner(notice):
+    width = 70
+    lines = [notice["title"], ""]
+    lines.extend(textwrap.wrap(notice["detail"], width=width))
+    lines.extend(textwrap.wrap(notice["instruction"], width=width))
+    lines.extend(["", "  " + notice["command"]])
+    border = "+" + "=" * (width + 2) + "+"
+    print(border)
+    for line in lines:
+        print("| " + line.ljust(width) + " |")
+    print(border)
 
 
 def kimi_home_dir():
@@ -3428,11 +3506,9 @@ AGENT_SPECS = {
             (os.path.join(_home(), ".aider.conf.yml"), os.path.join(".", ".aider.conf.yml"))),
         "path": lambda project: os.path.join(_project_dir(project), "AGENTS.md"),
         "install": lambda project, add: _block_file_result(
-            "aider", project, "AGENTS.md", _instructions_text("aider"), add),
-        "status": lambda project: (
-            _file_contains(os.path.join(_project_dir(project), "AGENTS.md"), BLOCK_START)
-            and _file_contains(os.path.join(_project_dir(project), "AGENTS.md"),
-                               "--agent aider")),
+            "aider", project, "AGENTS.md", _instructions_text("aider"), add,
+            replace_stale=True),
+        "status": lambda project: aider_block_state(project) == "current",
     },
 }
 
@@ -3502,7 +3578,10 @@ def hooks_status(project=None):
             installed = spec["status"](project)
         except OSError:
             installed = False
-        rows.append((agent, "installed" if installed else "not installed", path,
+        status = "installed" if installed else "not installed"
+        if agent == "aider" and aider_block_state(project) == "outdated":
+            status = "update needed"
+        rows.append((agent, status, path,
                      spec.get("reliability", "unknown")))
     return rows
 
@@ -5507,12 +5586,16 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                              "agentbell doctor   # prints the exact PATH fix command"))
 
     observations = hook_observations(read_history(limit=0), since_seconds, now=now)
-    installed = {name for name, status, _, _ in hooks_status(project=project)
+    status_rows = hooks_status(project=project)
+    installed = {name for name, status, _, _ in status_rows
                  if status == "installed"}
+    repair_notices = [notice for notice in [aider_repair_notice(project)] if notice]
+    needs_update = {name for name, status, _, _ in status_rows
+                    if status == "update needed"}
     if agent:
         targets = [agent]
     else:
-        targets = sorted(set(observations) | installed)
+        targets = sorted(set(observations) | installed | needs_update)
     agents_data = []
     observed_any = False
     for slug in targets:
@@ -5595,7 +5678,7 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
     verified = observed_any and not any(c["status"] == FAIL for c in checks)
     return {"verified": verified, "agent": agent,
             "window_seconds": since_seconds, "checks": checks,
-            "agents": agents_data}
+            "agents": agents_data, "repair_notices": repair_notices}
 
 
 def cmd_verify(args):
@@ -5612,7 +5695,9 @@ def cmd_verify(args):
                   "checks": [_check(FAIL, "delivery",
                                     "the config file exists but cannot be parsed",
                                     "agentbell doctor   # run as the human")],
-                  "agents": []}
+                  "agents": [],
+                  "repair_notices": [notice for notice in
+                                     [aider_repair_notice(args.project)] if notice]}
     else:
         report = verify_report(cfg, agent=args.agent, since_seconds=since_seconds,
                                project=args.project)
@@ -5620,6 +5705,9 @@ def cmd_verify(args):
     if args.json:
         print(json.dumps(report, indent=2))
         return 0 if report["verified"] else 1
+    for notice in report.get("repair_notices", []):
+        print_action_banner(notice)
+        print()
     scope = f"agent '{args.agent}'" if args.agent else "agent integrations"
     print(f"{PROG} {VERSION} - observation report for {scope} "
           f"(last {args.since}, read-only)")
@@ -6315,9 +6403,14 @@ def cmd_hooks(args):
     # None = default scope (OpenCode global, Cursor in the current dir)
     project = getattr(args, "project", None)
     if args.sub is None or args.sub == "status":
+        rows = hooks_status(project=project)
+        notice = aider_repair_notice(project)
+        if notice:
+            print_action_banner(notice)
+            print()
         print(f"{'agent':10s} {'status':14s} {'reliability':12s} path")
         print("-" * 62)
-        for agent, status, path, reliability in hooks_status(project=project):
+        for agent, status, path, reliability in rows:
             rel = "hook" if reliability == "hook" else "~ rule"
             print(f"{agent:10s} {status:14s} {rel:12s} {path}")
         print()

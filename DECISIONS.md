@@ -745,3 +745,25 @@ reads `USERPROFILE` and ignores `HOME`, so tests that only moved `HOME`
 operated on the real runner profile — cross-test contamination that looked
 like product bugs (broken idempotence, purge misses). Test homes move both
 variables now.
+
+### 16k. Shared `AGENTS.md` needs an Aider-only scope and explicit migration
+
+The Aider rules integration writes a marker-owned block to project
+`AGENTS.md`. That filename is shared across agent ecosystems: Codex and other
+agents read it too. The pre-scope block contained literal `--agent aider`
+commands without saying that only Aider may follow them, so another agent
+could send a duplicate notification falsely attributed to Aider.
+
+Silent repair during `status` or `verify` was rejected: both are observation
+commands, and rewriting a user-visible instruction file while diagnosing it
+would violate their contract. They now classify a single, bounded legacy
+Aider block as `update needed`. Human-readable output puts a bordered ACTION
+REQUIRED banner before the normal report; JSON stays machine-readable and
+uses a structured `repair_notices` entry.
+
+Repair is explicit: `agentbell hooks install aider`. Only this Aider install
+path may replace stale content between agentbell's existing start/end markers.
+Text before and after the markers is retained byte-for-byte, ambiguous marker
+layouts are never guessed at, and a second install is idempotent. The current
+block begins with an Aider-only scope instruction so other `AGENTS.md` readers
+are told to ignore the whole block.

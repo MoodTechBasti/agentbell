@@ -121,9 +121,15 @@ Exit 0 means "approved **or** answered" — so if you chain `agentbell ask "Depl
 | **Cline** | `.clinerules/agentbell.md` | project | finished, needs-input, failed |
 | **Continue** | `.continue/rules/agentbell.md` | project | finished, needs-input, failed |
 | **Zed** | `.rules` block | project | finished, needs-input, failed |
-| **Aider** | `AGENTS.md` block | project | finished, needs-input, failed |
+| **Aider** | Aider-scoped `AGENTS.md` block | project | finished, needs-input, failed |
 
 Claude Code, Codex, OpenCode, Gemini CLI, Kimi Code and Qwen Code have real hook/plugin systems — the wiring is exact and deterministic. The editors (Cursor, Windsurf, Cline, Continue, Zed, Aider) have no lifecycle hooks, so they get a clearly marked rule file that tells the agent when to call the CLI. That's best-effort by construction: it's an instruction the model can skip. Existing configs are merged, never overwritten; `uninstall` removes only what was added.
+
+Older Aider installs used a shared `AGENTS.md` instruction that other agents
+could follow too. `agentbell hooks status` and `agentbell verify` display an
+ACTION REQUIRED banner when they find one. Run `agentbell hooks install aider`
+from that project to update only agentbell's marked block; all other
+`AGENTS.md` content is preserved.
 
 `agentbell init` lists every agent it detects on your system (CLI on `PATH` or config dir) and offers to wire it up; `agentbell hooks install all` wires every supported agent at once.
 

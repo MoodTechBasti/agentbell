@@ -810,6 +810,55 @@ class TestHooks(unittest.TestCase):
     def test_aider_rule(self):
         self._project_rule_roundtrip("aider", "AGENTS.md")
 
+    def test_aider_stale_block_self_heals_without_touching_foreign_content(self):
+        project = os.path.join(self.tmp, "proj_aider_stale")
+        os.makedirs(project)
+        path = os.path.join(project, "AGENTS.md")
+        old = (
+            "# Project rules\n\n"
+            + an.BLOCK_START + "\n"
+            + "## Notifications (agentbell)\n\n"
+            + "- run `agentbell hook run_completed --agent aider`\n"
+            + an.BLOCK_END + "\n\n"
+            + "# Keep this section\n"
+        )
+        with open(path, "w") as fh:
+            fh.write(old)
+
+        status = {agent: state for agent, state, _, _ in
+                  an.hooks_status(project=project)}
+        self.assertEqual(status["aider"], "update needed")
+
+        result = an.install_hooks("aider", project=project)
+        self.assertTrue(result["changed"])
+        with open(path) as fh:
+            healed = fh.read()
+        self.assertIn("# Project rules", healed)
+        self.assertIn("# Keep this section", healed)
+        self.assertIn(an.AIDER_SCOPE_NOTICE, healed)
+        self.assertEqual(healed.count(an.BLOCK_START), 1)
+        self.assertEqual(healed.count(an.BLOCK_END), 1)
+        self.assertNotIn("- run `agentbell hook", healed)
+
+        status = {agent: state for agent, state, _, _ in
+                  an.hooks_status(project=project)}
+        self.assertEqual(status["aider"], "installed")
+        self.assertFalse(an.install_hooks("aider", project=project)["changed"])
+
+    def test_hooks_status_prints_prominent_aider_update_banner(self):
+        project = os.path.join(self.tmp, "proj_aider_banner")
+        os.makedirs(project)
+        with open(os.path.join(project, "AGENTS.md"), "w") as fh:
+            fh.write(an.BLOCK_START + "\n--agent aider\n" + an.BLOCK_END + "\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            an.cmd_hooks(_Args(sub="status", project=project))
+        out = buf.getvalue()
+        self.assertIn("ACTION REQUIRED", out)
+        self.assertIn("AGENTS.md", out)
+        self.assertIn("agentbell hooks install aider", out)
+        self.assertIn("+", out)
+
     def test_block_rule_keeps_foreign_content(self):
         project = os.path.join(self.tmp, "proj_keep")
         os.makedirs(project)
@@ -4114,6 +4163,35 @@ class TestVerify(unittest.TestCase):
             self.assertIn(key, row)
         self.assertEqual(row["reliability"], "self-integrated")
         self.assertIs(row["known"], False)
+
+    def test_outdated_aider_block_is_banner_in_text_and_structured_in_json(self):
+        project = tempfile.mkdtemp()
+        with open(os.path.join(project, "AGENTS.md"), "w") as fh:
+            fh.write(an.BLOCK_START + "\n--agent aider\n" + an.BLOCK_END + "\n")
+
+        code, out = self._run(self._cfg(),
+                              ["--agent", "aider", "--project", project])
+        self.assertEqual(code, 1)
+        self.assertIn("ACTION REQUIRED", out)
+        self.assertIn("agentbell hooks install aider", out)
+
+        code, out = self._run(
+            self._cfg(), ["--agent", "aider", "--project", project, "--json"])
+        self.assertEqual(code, 1)
+        data = json.loads(out)
+        self.assertNotIn("+====", out)  # JSON stays machine-readable; no text banner
+        self.assertEqual(data["repair_notices"][0]["code"],
+                         "aider_agents_block_outdated")
+        self.assertEqual(data["repair_notices"][0]["command"],
+                         "agentbell hooks install aider")
+
+        an.install_hooks("aider", project=project)
+        _, out = self._run(self._cfg(),
+                           ["--agent", "aider", "--project", project])
+        self.assertNotIn("ACTION REQUIRED", out)
+        _, out = self._run(
+            self._cfg(), ["--agent", "aider", "--project", project, "--json"])
+        self.assertEqual(json.loads(out)["repair_notices"], [])
 
     def test_delivered_started_warns_about_silent(self):
         an.write_history({"event": "hook.started", "agent": "vf-started",

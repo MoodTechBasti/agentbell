@@ -54,6 +54,13 @@ needs to know an agent to work with it: it **publishes a contract** and
 - `doctor` mentions self-integrated agents seen in history on its "agent
   hooks" line and cross-links `verify`; `uninstall` lists self-integrated
   wiring under "not removed automatically".
+- **Outdated Aider blocks are visible instead of silently left in place.**
+  Older `AGENTS.md` blocks told every agent that reads the shared file to
+  emit hooks attributed as `aider`. `hooks status` and text-mode `verify`
+  now show a bordered ACTION REQUIRED banner; `verify --json` reports the
+  same condition in `repair_notices`. Running `agentbell hooks install
+  aider` manually replaces only the marker-owned block with an Aider-only
+  instruction and preserves every user section outside it.
 
 ### Fixed (found by the Tier-1 field test, see below)
 
