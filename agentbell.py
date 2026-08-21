@@ -2581,8 +2581,21 @@ def agentbell_binary():
 
     GUI clients (Claude Desktop, Cursor) and agent hooks do not inherit the
     shell PATH, so a bare 'agentbell' would not be found.
+
+    sys.argv[0] is only trusted when it actually names an agentbell entry
+    point (the installed launcher or the script itself): test runners and
+    embedders point it elsewhere - `python -m unittest` rewrites it to the
+    literal string "python -m unittest" - and a published contract must
+    never carry that calling context as the executable.
     """
-    return shutil.which(PROG) or os.path.abspath(sys.argv[0])
+    path = shutil.which(PROG)
+    if path:
+        return os.path.abspath(path)
+    argv0 = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+    stem = os.path.splitext(os.path.basename(argv0))[0].lower()
+    if stem == PROG and os.path.isfile(argv0):
+        return argv0
+    return os.path.abspath(__file__)
 
 
 def _hook_command(event, agent):
@@ -2590,8 +2603,39 @@ def _hook_command(event, agent):
 
 
 def _contains_our_hook(entry):
-    command = entry.get("command") or ""
-    return f"{PROG} hook" in command
+    return _is_our_hook_command(entry.get("command") or "")
+
+
+def _is_our_hook_command(command):
+    """The command is ours, whatever shape agentbell_binary() had at install
+    time - launcher on PATH, standalone copy, agentbell.py from a checkout,
+    agentbell.exe on Windows, quoted or not. The old substring test
+    ('agentbell hook') recognized only the bare launcher shape, so uninstall
+    and self-heal were blind to hooks installed from the other shapes."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if len(parts) < 2 or parts[1] != "hook":
+        return False
+    stem = os.path.splitext(os.path.basename(parts[0].replace("\\", "/")))[0]
+    return stem.lower() == PROG
+
+
+# Status probe over raw settings text. Deliberately looser than
+# _is_our_hook_command: a user-wrapped command (bash -c '... hook ...') is a
+# working integration and should read as installed - uninstall still leaves
+# it alone, because removal is gated on the strict parser above.
+_OUR_HOOK_RE = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(PROG)
+                          + r"(\.[A-Za-z0-9]+)?['\"]? hook ")
+
+
+def _file_contains_our_hook(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return bool(_OUR_HOOK_RE.search(fh.read()))
+    except OSError:
+        return False
 
 
 def _hook_key(hook):
@@ -3274,7 +3318,7 @@ AGENT_SPECS = {
         "path": lambda project: claude_settings_path(),
         "install": lambda project, add: _json_hooks_install(
             "claude", claude_settings_path(), claude_event_hooks(), add),
-        "status": lambda project: _file_contains(claude_settings_path(), f"{PROG} hook"),
+        "status": lambda project: _file_contains_our_hook(claude_settings_path()),
     },
     "codex": {
         "scope": "global", "kind": "file", "reliability": "hook",
@@ -3289,7 +3333,7 @@ AGENT_SPECS = {
         "path": lambda project: gemini_settings_path(),
         "install": lambda project, add: _json_hooks_install(
             "gemini", gemini_settings_path(), gemini_event_hooks(), add),
-        "status": lambda project: _file_contains(gemini_settings_path(), f"{PROG} hook"),
+        "status": lambda project: _file_contains_our_hook(gemini_settings_path()),
     },
     "kimi": {
         "scope": "global", "kind": "file", "reliability": "hook",
@@ -3304,7 +3348,7 @@ AGENT_SPECS = {
             ("qwen-code", "qwen"), (os.path.join(_home(), ".qwen"),)),
         "path": lambda project: qwen_settings_path(),
         "install": lambda project, add: _qwen_result(project, add),
-        "status": lambda project: _file_contains(qwen_settings_path(), f"{PROG} hook"),
+        "status": lambda project: _file_contains_our_hook(qwen_settings_path()),
     },
     "opencode": {
         "scope": "both", "kind": "file", "reliability": "hook",

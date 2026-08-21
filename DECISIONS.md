@@ -705,3 +705,32 @@ its evidence did not support:
   `--force` records. The residual gap — a double integration that only
   wires interaction events — also double-fires turn events in practice,
   which is where the detection now looks.
+
+### 16j. The advertised binary is a claim about execution, not a mirror of argv (CI, 2026-08-21)
+
+CI failed on every matrix job with the contract advertising
+`<workspace>/python -m unittest hook run_completed …` as a runnable command.
+Root cause: `agentbell_binary()` fell back to `os.path.abspath(sys.argv[0])`,
+and the stdlib's `unittest/__main__.py` rewrites `sys.argv[0]` to the literal
+string `"python -m unittest"` for nicer help text. Locally the bug was
+invisible because an installed launcher on PATH short-circuited the fallback
+— which is exactly why the fallback path needs its own tests.
+
+Decision: the binary in a published contract is a *claim* — "this single
+token executes agentbell" — so every candidate must be checked against that
+claim, not taken from context. Order: (1) `shutil.which("agentbell")`;
+(2) `sys.argv[0]`, but only when it names a real agentbell entry point on
+disk (basename stem `agentbell`, case-insensitive — covers the launcher,
+`agentbell.py`, `agentbell.exe`); (3) the module file itself. Test runners,
+embedders, and a relative argv[0] invalidated by `chdir` all fail check (2)
+and land on (3), which is always agentbell by construction.
+
+The same claim-vs-shape confusion existed on the read side: uninstall,
+self-heal and `hooks status` matched the substring `agentbell hook`, which
+only the bare-launcher shape produces. Checkout (`…/agentbell.py hook`) and
+Windows (`'…\agentbell.exe' hook`, always quoted by `shlex.quote`) hooks
+were installable but invisible to removal and repair. The matcher now parses
+the command and compares the first token's stem — and deliberately leaves
+wrapped commands (`bash -c '…'`) alone: a wrapper is the user's construction,
+and "only entries whose command is ours are ever touched" outranks
+completeness of removal.

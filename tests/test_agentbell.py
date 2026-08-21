@@ -31,6 +31,15 @@ os.environ["AGENTBELL_CONFIG_DIR"] = os.path.join(_TEST_ROOT, "config")
 HAS_TOMLLIB = sys.version_info >= (3, 11)
 
 
+def _fake_launcher(tmpdir, name="agentbell"):
+    """A stand-in installed launcher for sys.argv[0]: agentbell_binary()
+    only trusts an argv[0] that actually exists on disk."""
+    path = os.path.join(tmpdir, name)
+    with open(path, "w") as fh:
+        fh.write("#!/bin/sh\n")
+    return path
+
+
 # One throwaway key pair for the whole suite: deriving one costs a few ms and
 # every test that needs a *valid* license signs with this instead of the real
 # private seed (which only the author's machine has).
@@ -406,7 +415,7 @@ class TestHooks(unittest.TestCase):
         self.old_home = os.environ.get("HOME")
         os.environ["HOME"] = self.home
         self.old_argv0 = sys.argv[0]
-        sys.argv[0] = "/usr/local/bin/agentbell"
+        sys.argv[0] = _fake_launcher(self.tmp)
 
     def tearDown(self):
         if self.old_home:
@@ -451,6 +460,44 @@ class TestHooks(unittest.TestCase):
             data = json.load(fh)
         for event in ("Stop", "StopFailure", "Notification"):
             self.assertNotIn(event, data.get("hooks", {}))
+
+    def test_checkout_py_binary_uninstalls_cleanly(self):
+        # dev checkout / test-runner fallback: the binary is agentbell.py.
+        # uninstall and self-heal must still recognize the hook as ours
+        # (regression: the substring matcher knew only the launcher shape).
+        old_argv0, old_which = sys.argv[0], an.shutil.which
+        sys.argv[0] = _fake_launcher(self.tmp, "agentbell.py")
+        an.shutil.which = lambda prog: None
+        try:
+            an.install_hooks("claude")
+            self.assertTrue(an._file_contains_our_hook(self._settings("claude")))
+            result = an.install_hooks("claude", add=False)
+        finally:
+            sys.argv[0], an.shutil.which = old_argv0, old_which
+        self.assertTrue(result["changed"])
+        with open(self._settings("claude")) as fh:
+            data = json.load(fh)
+        for event in ("Stop", "StopFailure", "Notification"):
+            self.assertNotIn(event, data.get("hooks", {}))
+
+    def test_our_hook_command_shapes(self):
+        ours = [
+            "/usr/local/bin/agentbell hook run_completed --agent x",
+            "/repo/agentbell.py hook started --agent x --silent",
+            "'C:\\Users\\Jo Do\\agentbell.exe' hook run_completed --agent x",
+            "'/opt/a b/agentbell' hook input_required --agent x",
+        ]
+        foreign = [
+            "lint.sh",
+            "otherbell hook run_completed --agent x",
+            "/usr/local/bin/agentbell-helper hook run_completed --agent x",
+            "/usr/local/bin/agentbell notify hi",
+            "bash -c 'agentbell hook run_completed --agent x'",
+        ]
+        for command in ours:
+            self.assertTrue(an._is_our_hook_command(command), command)
+        for command in foreign:
+            self.assertFalse(an._is_our_hook_command(command), command)
 
     def test_gemini_install(self):
         path = self._settings("gemini")
@@ -2084,7 +2131,7 @@ class TestPurge(unittest.TestCase):
         self.old_home = os.environ.get("HOME")
         os.environ["HOME"] = self.home
         self.old_argv0 = sys.argv[0]
-        sys.argv[0] = "/usr/local/bin/agentbell"
+        sys.argv[0] = _fake_launcher(self.home)
 
     def tearDown(self):
         if self.old_home:
@@ -4200,6 +4247,64 @@ class TestVerify(unittest.TestCase):
         finally:
             an.hooks_status = original
         self.assertIn("finish one real agent turn", out)
+
+
+class TestAgentbellBinary(unittest.TestCase):
+    """agentbell_binary() feeds every published contract, hook command and
+    service file. Regression: `python -m unittest` rewrites sys.argv[0] to
+    the literal string "python -m unittest" (stdlib unittest/__main__.py);
+    with agentbell not on PATH the old argv[0] fallback published
+    "<cwd>/python -m unittest" as the executable - every CI job, and any
+    embedder with a foreign argv[0]."""
+
+    def _binary(self, argv0, which=None):
+        original_argv, original_which = sys.argv, an.shutil.which
+        sys.argv = [argv0] + sys.argv[1:]
+        an.shutil.which = lambda prog: which
+        try:
+            return an.agentbell_binary()
+        finally:
+            sys.argv, an.shutil.which = original_argv, original_which
+
+    def test_path_install_wins(self):
+        installed = os.path.abspath(os.path.join(os.sep, "somewhere", "agentbell"))
+        self.assertEqual(self._binary("python -m unittest", which=installed), installed)
+
+    def test_test_runner_argv_never_leaks(self):
+        binary = self._binary("python -m unittest")
+        self.assertEqual(binary, os.path.abspath(an.__file__))
+        self.assertNotIn("unittest", binary)
+
+    def test_foreign_existing_script_rejected(self):
+        # a test runner's own script exists on disk but is not agentbell
+        binary = self._binary(os.path.abspath(__file__))
+        self.assertEqual(binary, os.path.abspath(an.__file__))
+
+    def test_launcher_off_path_accepted(self):
+        # installed launcher invoked by absolute path, its dir not on PATH
+        tmp = tempfile.mkdtemp()
+        for name in ("agentbell", "agentbell.exe", "agentbell.py"):
+            launcher = os.path.join(tmp, name)
+            with open(launcher, "w") as fh:
+                fh.write("#!/bin/sh\n")
+            self.assertEqual(self._binary(launcher), launcher, name)
+
+    def test_empty_argv_falls_back_to_module(self):
+        # embedded interpreters can leave argv[0] empty
+        self.assertEqual(self._binary(""), os.path.abspath(an.__file__))
+
+    def test_contract_binary_survives_test_runner(self):
+        # the exact CI failure: manifest built under `python -m unittest`
+        original_argv, original_which = sys.argv, an.shutil.which
+        sys.argv = ["python -m unittest"] + sys.argv[1:]
+        an.shutil.which = lambda prog: None
+        try:
+            manifest = an.integration_manifest(agent="roo-code")
+        finally:
+            sys.argv, an.shutil.which = original_argv, original_which
+        self.assertEqual(manifest["binary"], os.path.abspath(an.__file__))
+        smoke = shlex.split(manifest["commands"]["smoke"])
+        self.assertEqual(smoke[0], manifest["binary"])
 
 
 class TestIntegrationGuide(unittest.TestCase):

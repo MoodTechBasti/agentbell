@@ -83,6 +83,27 @@ needs to know an agent to work with it: it **publishes a contract** and
   *stronger* there), and skips `--force` smoke tests (a re-run command is a
   human, not a second integration).
 
+### Fixed (found by CI)
+
+- **A published contract can no longer carry the calling context as its
+  executable.** `agentbell_binary()` fell back to `sys.argv[0]` verbatim;
+  under `python -m unittest` the stdlib rewrites argv[0] to the literal
+  string `"python -m unittest"`, so with agentbell not on PATH the contract
+  advertised `<cwd>/python -m unittest hook …` as a runnable command (every
+  CI job; same class for any embedder with a foreign argv[0]). argv[0] is
+  now only trusted when it names a real agentbell entry point on disk
+  (launcher, `agentbell.py`, `agentbell.exe` — case-insensitive stem);
+  otherwise the fallback is the module file itself. A relative argv[0] after
+  a `chdir` is rejected by the same existence check.
+- **Uninstall, self-heal and `hooks status` now recognize every binary
+  shape.** The "is this hook ours?" test was the substring `agentbell hook`,
+  which only matches the bare-launcher shape — hooks installed from a
+  checkout (`…/agentbell.py hook …`) or on Windows (`'…\agentbell.exe'
+  hook …`, always quoted) were invisible to uninstall, repair and status.
+  The matcher now parses the command and compares the first token's
+  basename stem against `agentbell`; a wrapped command (`bash -c '…'`) is
+  deliberately not touched — it is the user's, not ours.
+
 ### Field-verified
 
 - **Tier 1 passed (2026-08-21): GitHub Copilot CLI 1.0.80** self-integrated
