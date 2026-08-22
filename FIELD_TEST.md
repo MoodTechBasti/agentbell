@@ -33,10 +33,12 @@ reviewed checkout rather than an older copy carrying the same `1.6.0` version
 number.
 
 - `agentbell hooks install aider` migrated the project block; the following
-  `hooks status` reported Aider as installed with no repair banner.
-- `agentbell doctor` returned all checks OK: delivery configuration, ntfy,
-  parallel ntfy/Telegram channels, Telegram answer daemon, all 12 native
-  integrations, MCP registrations, and the state directory.
+  `agentbell hooks status` reported Aider as installed with no repair banner.
+- `agentbell doctor` returned all checks OK for delivery configuration, ntfy,
+  parallel ntfy/Telegram channels, the Telegram answer daemon, MCP
+  registrations, and the state directory. Its agent-hooks check listed all 12
+  native integrations as installed; this records detected installation status,
+  not manual end-to-end proof for every agent in the table below.
 - `agentbell test` published the notification and read it back from the ntfy
   server successfully.
 - `agentbell ask "Does this reach my phone?" --timeout 60` was answered within
