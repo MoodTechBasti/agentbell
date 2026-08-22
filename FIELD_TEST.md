@@ -23,6 +23,28 @@ On Windows PowerShell, replace `./install.sh` with `py -m pip install --user .` 
 
 If anything is ever unclear: **`agentbell doctor`** prints the problem *and* the command that fixes it.
 
+### Current-checkout installation result (2026-08-22)
+
+The post-merge Linux/WSL2 installation was refreshed from `main` at commit
+`b1aa21e`. `install.sh` selected its standalone-copy fallback and installed
+to the user `PATH`. The checkout's `agentbell.py` and the installed executable
+had the same SHA-256 digest, proving that the command on `PATH` used the exact
+reviewed checkout rather than an older copy carrying the same `1.6.0` version
+number.
+
+- `agentbell hooks install aider` migrated the project block; the following
+  `hooks status` reported Aider as installed with no repair banner.
+- `agentbell doctor` returned all checks OK: delivery configuration, ntfy,
+  parallel ntfy/Telegram channels, Telegram answer daemon, all 12 native
+  integrations, MCP registrations, and the state directory.
+- `agentbell test` published the notification and read it back from the ntfy
+  server successfully.
+- `agentbell ask "Does this reach my phone?" --timeout 60` was answered within
+  the timeout and returned `approved` through the parallel ntfy/Telegram flow.
+
+Topic names and other credential-like values are deliberately omitted from
+this retained evidence.
+
 ## Core checklist
 
 | # | What | Command / setup | Expected |
