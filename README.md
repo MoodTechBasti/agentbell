@@ -20,7 +20,7 @@ You jump between ChatGPT, Claude, Gemini, Cursor, DeepSeek… Desktop apps, CLI,
 
 Works with **Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Kimi Code, Qwen Code, Windsurf, Cline, Continue, Zed, Aider**, the **ChatGPT and Claude desktop apps** (via MCP), CI jobs, any shell script — and [any other agent](#any-other-agent), via `agentbell integrate`.
 
-> **Status:** v1.6.0 — feedback wanted.
+> **Status:** v1.6.3 — feedback wanted.
 
 **The loop:**
 

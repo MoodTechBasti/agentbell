@@ -827,3 +827,68 @@ assumption that any block between our markers is the caller's. The rule from
 agent (`--agent <slug>`) is touched. A block that names no owner is left
 alone rather than guessed at - the cost is a stale, harmless block; the
 alternative was a deleted user file.
+
+## 18. v1.6.3: disposition of the 2026-08-22 review (2026-09-03)
+
+Every finding was checked again against v1.6.2 before edits. Twelve remained
+fully present. The Windows parser finding was partial: current quoted commands
+parsed correctly, but a legacy bare Windows path lost its backslashes and was
+therefore invisible to ownership/self-heal logic. It is hardened as well.
+
+| # | Verified result | Decision |
+|---|---|---|
+| 1 | two processes could claim one reply | atomic cross-process lock; failed claims are history + doctor WARN |
+| 2 | outdated Aider was `installed: false` plus repair notice | existing stale wiring is installed and update-needed |
+| 3 | Windows config permissions always read OK | WARN that ACL is unverified; show `icacls` inspection |
+| 4 | insecure-ask warning was process-global once-only | warn for every sensitive ask |
+| 5 | deploying/deleting/publishing were missed | extend the narrow grammar |
+| 6 | quoted Windows paths worked; bare paths did not | preserve backslashes with a non-POSIX parse fallback |
+| 7 | `--project` still aggregated global history | record normalized hook project and filter observations |
+| 8 | wrapper read installed but install added four owned hooks | label/warn wrapper and refuse the second mechanism |
+| 9 | manifest omitted ask exit 3 | add the runtime-error exit |
+| 10 | two verify tests reused suite-global `claude` history | mock empty history in both tests |
+| 11–12 | two ntfy readers expressed the 90 s margin separately | one named constant |
+| 13 | verify parsed `AGENTS.md` three times | one status read reused by the repair notice |
+
+### 18a. A reply claim is correctness state, not best-effort bookkeeping
+
+The answer claim differs from hook-push dedupe in §17a. A duplicate push is
+noise; one approval reply authorizing two concurrent asks can trigger two
+actions. `mkdir` is the portable stdlib atomic primitive used as a short-lived
+per-log lock. A stale empty lock can be reclaimed after 30 seconds. The
+existing bounded append log remains the durable record, so the change is
+small and compatible with existing state.
+
+If locking, appending or trimming fails, that reply is not offered to the
+waiting ask. The waiter records `answer_claim_failed`, retains an in-process
+answer-channel error for stderr, and `doctor` reports recent failures. This is
+the required visibility rule: fault tolerance must not turn an uncertain
+claim into an approval.
+
+### 18b. Project history is explicit and conservative
+
+Hook records from v1.6.3 carry a normalized absolute `project` derived from
+`--cwd` or the hook process working directory. A project report includes that
+directory and descendants. Legacy history has no unambiguous structured
+project field; parsing the human message would couple diagnostics to display
+text and could misattribute records. Therefore `verify --project` excludes
+legacy unscoped records, while a verify without `--project` remains global.
+
+### 18c. Wrappers remain user-owned, but no longer invisible
+
+Section 16j's ownership boundary stands: `bash -c '... agentbell hook ...'`
+is not an entry agentbell may rewrite or remove. Treating it as simply
+installed hid an important distinction, while treating it as absent made
+self-heal add a second mechanism. The new `user wrapper` state is installed
+for truthfulness, WARNed in status/doctor/verify, and causes `hooks install`
+to stop with a note until the user removes or updates it. No shell wrapper is
+parsed deeply or claimed as agentbell-owned.
+
+### 18d. Windows config ACLs are not inferred from POSIX mode bits
+
+Python's portable `st_mode` view does not prove which Windows principals can
+read a file. A universal OK was therefore a false security claim. Adding a
+platform-specific ACL implementation would exceed the stdlib-only thin CLI
+for this patch; `doctor` now emits a visible WARN and an `icacls` inspection
+command. This is deliberately an honest unknown, not a claim that the ACL is
+unsafe or safe.
