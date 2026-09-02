@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.6.3 — 2026-09-03 — review hardening
+
+The thirteen findings from the 2026-08-22 review were re-verified against
+v1.6.2 before changing code. All confirmed or partially confirmed cases are
+fixed here; the disposition and rejected alternatives are in
+`DECISIONS.md` §18.
+
+### Fixed
+
+- **Concurrent `ask` processes cannot consume the same ntfy reply.** The
+  consumed-answer log now has a cross-process atomic lock in addition to its
+  thread lock. A claim-storage failure rejects the reply, writes an
+  `answer_claim_failed` history record and appears as an `approval answers`
+  WARN in `doctor`; it is never silently accepted.
+- **Sensitive unauthenticated ntfy asks warn every time**, including repeated
+  MCP calls in one server process. The narrow heuristic now recognizes
+  deploying, deleting and publishing forms as well as the previous base
+  forms.
+- **`verify` is internally consistent and project-scoped.** An outdated Aider
+  block is reported as installed wiring that needs repair, not simultaneously
+  absent and repairable. New hook records carry their normalized project;
+  `verify --project` counts only that directory (including descendants), and
+  deliberately does not guess a project for legacy records that lack the
+  field.
+- **Windows and wrapped hooks stay visible.** `doctor` now WARNs that portable
+  stdlib checks cannot verify a Windows config ACL and points to `icacls`.
+  The hook parser preserves bare Windows-path backslashes. A user-owned shell
+  wrapper is labeled `user wrapper` by status/doctor/verify, is never removed,
+  and blocks automatic installation of a second lifecycle hook.
+- **The self-integration manifest documents `ask` exit 3** for configuration,
+  publication and answer-channel errors.
+- **One ntfy lookback constant feeds both read paths.** Ask streaming/polling
+  and `agentbell test` now share the same 90-second server-relative margin.
+- **`verify` reads `AGENTS.md` once per report**, reusing the Aider state for
+  both status and the structured repair notice.
+- **The order-dependent verify tests no longer share `claude` observations.**
+  Their history input is isolated; the full 316-test suite passed in normal
+  order and in two randomized class orders locally.
+
 ## 1.6.2 — 2026-09-03 — removal is owner-scoped
 
 ### Fixed
