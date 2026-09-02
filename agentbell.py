@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 PROG = "agentbell"
 
 # The self-integration contract printed by `agentbell integrate` (bumped only
@@ -67,6 +67,10 @@ BOT_DRAIN_BUDGET_SECONDS = 20.0
 # Socket read timeout for the approval stream. Must stay above ntfy's ~45s
 # keepalive, or every keepalive gap looks like a dead connection.
 STREAM_READ_TIMEOUT = 90.0
+
+# Every ntfy read reaches this far behind the operation's start.  A
+# server-relative window avoids local/server clock drift (DECISIONS §16i).
+NTFY_LOOKBACK_MARGIN_SECONDS = 90
 
 # Reliability (v1.2): transient publish failures are retried with backoff;
 # if they still fail, the notification is queued in the state dir and replayed
@@ -127,8 +131,8 @@ TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # lightweight free ntfy flow. These patterns cover high-impact actions where a
 # forged answer could cause irreversible operational or financial damage.
 SENSITIVE_APPROVAL_PATTERNS = (
-    re.compile(r"\bdeploy(?:ment)?\b.*\b(?:production|prod)\b|\b(?:production|prod)\b.*\bdeploy(?:ment)?\b", re.I),
-    re.compile(r"\b(?:delete|drop|destroy)\b.*\b(?:database|db|production|prod|cluster|bucket)\b", re.I),
+    re.compile(r"\b(?:deploy(?:ing|ment)?|publish(?:ing)?)\b.*\b(?:production|prod|release|package|pypi|npm)\b|\b(?:production|prod|release|package|pypi|npm)\b.*\b(?:deploy(?:ing|ment)?|publish(?:ing)?)\b", re.I),
+    re.compile(r"\b(?:delet(?:e|ing)|drop(?:ping)?|destroy(?:ing)?)\b.*\b(?:database|db|production|prod|cluster|bucket)\b", re.I),
     re.compile(r"\b(?:rotate|revoke|expose|change)\b.*\b(?:credential|credentials|secret|password|token|api key|access key)\b", re.I),
     re.compile(r"\b(?:transfer|send|pay)\b.*\b(?:money|funds|payment)\b", re.I),
     re.compile(r"\b(?:change|open|disable)\b.*\b(?:firewall|security group|access control)\b", re.I),
@@ -1438,6 +1442,8 @@ def newest_ntfy_pending():
 # question itself - still sees the claim and leaves the reply alone. Bounded
 # like history.jsonl: only replies from the recent past can still be offered.
 CONSUMED_KEEP_LINES = 200
+CONSUMED_LOCK_TIMEOUT_SECONDS = 2.0
+CONSUMED_LOCK_STALE_SECONDS = 30.0
 
 _CONSUMED_LOCK = threading.Lock()
 
@@ -1446,12 +1452,45 @@ def _consumed_path(name):
     return os.path.join(state_dir(), f"{name}-consumed")
 
 
-def _read_consumed(name):
+def _read_consumed(name, strict=False):
     try:
         with open(_consumed_path(name), "r", encoding="utf-8", errors="replace") as fh:
             return [line.strip() for line in fh if line.strip()]
-    except OSError:
+    except FileNotFoundError:
         return []
+    except OSError:
+        if strict:
+            raise
+        return []
+
+
+def _consumed_lock_path(name):
+    return _consumed_path(name) + ".lock"
+
+
+def _acquire_consumed_lock(name):
+    """Acquire an atomic cross-process lock for one consumed-answer log."""
+    ensure_state_dir()
+    path = _consumed_lock_path(name)
+    deadline = time.monotonic() + CONSUMED_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            os.mkdir(path, 0o700)
+            return path
+        except FileExistsError:
+            try:
+                stale = time.time() - os.stat(path).st_mtime > CONSUMED_LOCK_STALE_SECONDS
+            except FileNotFoundError:
+                continue
+            if stale:
+                try:
+                    os.rmdir(path)
+                except FileNotFoundError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise OSError("timed out locking the consumed-answer log")
+            time.sleep(0.01)
 
 
 def claim_consumed(name, message_id):
@@ -1460,29 +1499,32 @@ def claim_consumed(name, message_id):
         return True          # nothing to key on: keep the pre-existing behavior
     key = str(message_id)
     with _CONSUMED_LOCK:
-        claimed = _read_consumed(name)
-        if key in claimed:
-            return False
-        ensure_state_dir()
-        path = _consumed_path(name)
-        with open_private(path, "a") as fh:
-            fh.write(key + "\n")
-        if len(claimed) + 1 > CONSUMED_KEEP_LINES:
-            _trim_consumed(path)
+        lock_path = _acquire_consumed_lock(name)
+        try:
+            claimed = _read_consumed(name, strict=True)
+            if key in claimed:
+                return False
+            path = _consumed_path(name)
+            with open_private(path, "a") as fh:
+                fh.write(key + "\n")
+            if len(claimed) + 1 > CONSUMED_KEEP_LINES:
+                _trim_consumed(path)
+        finally:
+            try:
+                os.rmdir(lock_path)
+            except FileNotFoundError:
+                pass
     return True
 
 
 def _trim_consumed(path):
     """Keep the claim log at CONSUMED_KEEP_LINES; the oldest ids are dead."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()[-CONSUMED_KEEP_LINES:]
-        tmp = path + ".tmp"
-        with open_private(tmp, "w") as fh:
-            fh.writelines(lines)
-        os.replace(tmp, path)
-    except OSError:
-        pass  # a claim log we cannot rewrite must not fail the answer
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()[-CONSUMED_KEEP_LINES:]
+    tmp = path + ".tmp"
+    with open_private(tmp, "w") as fh:
+        fh.writelines(lines)
+    os.replace(tmp, path)
 
 
 def claim_ntfy_message(message_id):
@@ -2035,7 +2077,7 @@ def auto_drain(cfg):
 
 def send_notification(cfg, message, title=None, priority="normal", tags=None,
                       channels=None, force=False, timeout=10.0, event="notify",
-                      defer=None, agent=None):
+                      defer=None, agent=None, project=None):
     def _hist(entry):
         # Attribution for `verify`: which agent fired this, what the original
         # hook event was when quiet hours / queueing rewrote it, and whether
@@ -2045,6 +2087,8 @@ def send_notification(cfg, message, title=None, priority="normal", tags=None,
             entry["agent"] = agent
             if force:
                 entry["forced"] = True
+        if project:
+            entry["project"] = project
         if entry.get("event") != event:
             entry["source_event"] = event
         write_history(entry)
@@ -2232,7 +2276,9 @@ class ApprovalWaiter:
 
     def _window(self):
         """ntfy `since` duration reaching back to shortly before start()."""
-        return f"{int(time.monotonic() - self._started_monotonic) + 90}s"
+        seconds = (int(time.monotonic() - self._started_monotonic)
+                   + NTFY_LOOKBACK_MARGIN_SECONDS)
+        return f"{seconds}s"
 
     def _prime(self):
         """Mark everything already on the response topic as seen.
@@ -2291,7 +2337,21 @@ class ApprovalWaiter:
                 # poll that reaches the check late - slow runner, buffered
                 # stream - promotes itself to newest and answers the same
                 # reply a second time.
-                if not claim_ntfy_message(message_id):
+                try:
+                    claimed = claim_ntfy_message(message_id)
+                except OSError as exc:
+                    detail = f"cannot claim approval answer ({type(exc).__name__})"
+                    self._record_error(detail)
+                    try:
+                        write_history({"event": "answer_claim_failed",
+                                       "approval_id": self.approval_id,
+                                       "error": type(exc).__name__})
+                    except OSError as history_exc:
+                        self._record_error(
+                            "cannot record approval claim failure "
+                            f"({type(history_exc).__name__})")
+                    return
+                if not claimed:
                     self._log_stale(text)
                     return
         self.messages.put(text)
@@ -2479,12 +2539,11 @@ def is_sensitive_approval(message):
 
 
 def _warn_insecure_ask(cfg, message):
-    """Warn once for a sensitive ntfy approval without configured authentication."""
-    if getattr(_warn_insecure_ask, "_fired", False) or not is_sensitive_approval(message):
+    """Warn for every sensitive ntfy approval without configured authentication."""
+    if not is_sensitive_approval(message):
         return
     ntfy = cfg.data.get("ntfy", {})
     if not ntfy.get("auth"):
-        _warn_insecure_ask._fired = True
         sys.stderr.write(
             f"\n{PROG}: Sensitive approval detected, but this ntfy setup does not have ntfy authentication.\n"
             f"{PROG}: Anyone who can access the topic can answer this question. Do not rely on\n"
@@ -2674,14 +2733,21 @@ def _is_our_hook_command(command):
     agentbell.exe on Windows, quoted or not. The old substring test
     ('agentbell hook') recognized only the bare launcher shape, so uninstall
     and self-heal were blind to hooks installed from the other shapes."""
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return False
-    if len(parts) < 2 or parts[1] != "hook":
-        return False
-    stem = os.path.splitext(os.path.basename(parts[0].replace("\\", "/")))[0]
-    return stem.lower() == PROG
+    # POSIX parsing handles the single-quoted paths written by shlex.quote;
+    # the non-POSIX fallback preserves backslashes in legacy bare Windows
+    # paths. Trying both also supports Windows config fixtures on other hosts.
+    for posix in (True, False):
+        try:
+            parts = shlex.split(command, posix=posix)
+        except ValueError:
+            continue
+        if len(parts) < 2 or parts[1].strip("'\"") != "hook":
+            continue
+        executable = parts[0].strip("'\"")
+        stem = os.path.splitext(os.path.basename(executable.replace("\\", "/")))[0]
+        if stem.lower() == PROG:
+            return True
+    return False
 
 
 # Status probe over raw settings text. Deliberately looser than
@@ -2698,6 +2764,40 @@ def _file_contains_our_hook(path):
             return bool(_OUR_HOOK_RE.search(fh.read()))
     except OSError:
         return False
+
+
+def _json_hook_commands(path):
+    """Command strings in a JSON hook file, without interpreting wrappers."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    commands = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            command = value.get("command")
+            if isinstance(command, str):
+                commands.append(command)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(data.get("hooks") if isinstance(data, dict) else None)
+    return commands
+
+
+def _has_user_wrapped_hook(path):
+    """A wrapper mentions our hook but is not an entry agentbell owns."""
+    return any(_OUR_HOOK_RE.search(command) and not _is_our_hook_command(command)
+               for command in _json_hook_commands(path))
+
+
+def _has_owned_json_hook(path):
+    return any(_is_our_hook_command(command) for command in _json_hook_commands(path))
 
 
 def _hook_key(hook):
@@ -3310,8 +3410,8 @@ def aider_block_state(project=None):
     return "outdated"
 
 
-def aider_repair_notice(project=None):
-    if aider_block_state(project) != "outdated":
+def aider_repair_notice(project=None, state=None):
+    if (aider_block_state(project) if state is None else state) != "outdated":
         return None
     return {
         "code": "aider_agents_block_outdated",
@@ -3447,6 +3547,9 @@ def qwen_event_hooks():
 
 def _qwen_result(project, add):
     path = qwen_settings_path()
+    if add and _has_user_wrapped_hook(path) and not _has_owned_json_hook(path):
+        return {"agent": "qwen-code", "changed": False, "path": path,
+                "notes": [_wrapped_hook_note("qwen-code")]}
     changed = _merge_json_hooks(path, qwen_event_hooks(), add=add)
     notes = []
     if add and changed:
@@ -3456,8 +3559,17 @@ def _qwen_result(project, add):
 
 
 def _json_hooks_install(agent, path, event_hooks, add):
+    if add and _has_user_wrapped_hook(path) and not _has_owned_json_hook(path):
+        return {"agent": agent, "changed": False, "path": path,
+                "notes": [_wrapped_hook_note(agent)]}
     return {"agent": agent, "changed": _merge_json_hooks(path, event_hooks, add=add),
             "path": path}
+
+
+def _wrapped_hook_note(agent):
+    return (f"{agent}: found a user-owned shell wrapper around an agentbell hook; "
+            "left it unchanged and did not add a second lifecycle hook. Remove or "
+            "update the wrapper yourself before running hooks install again")
 
 
 def _codex_install(add):
@@ -3702,12 +3814,20 @@ def hooks_status(project=None):
     for agent in AGENTS:
         spec = AGENT_SPECS[agent]
         path = spec["path"](project)
-        try:
-            installed = spec["status"](project)
-        except OSError:
-            installed = False
+        aider_state = None
+        if agent == "aider":
+            aider_state = aider_block_state(project)
+            installed = aider_state == "current"
+        else:
+            try:
+                installed = spec["status"](project)
+            except OSError:
+                installed = False
         status = "installed" if installed else "not installed"
-        if agent == "aider" and aider_block_state(project) == "outdated":
+        if (agent in ("claude", "gemini", "qwen-code")
+                and _has_user_wrapped_hook(path)):
+            status = "user wrapper"
+        if agent == "aider" and aider_state == "outdated":
             status = "update needed"
         if agent == "opencode" and installed and opencode_plugin_stale(project):
             status = "update needed"
@@ -4125,7 +4245,7 @@ def integration_manifest(agent=None, project=None):
     status_rows = hooks_status(project=project)
     detected = set(find_agents())
     known_agents = [{"name": name, "reliability": reliability,
-                     "installed": status in ("installed", "update needed"),
+                     "installed": status in ("installed", "update needed", "user wrapper"),
                      "detected": name in detected}
                     for name, status, _, reliability in status_rows]
     events = []
@@ -4218,6 +4338,7 @@ def integration_manifest(agent=None, project=None):
                     "slug is a usage error (exit 2)",
             "ask": {"0": "approved / answered (answer text on stdout)",
                     "1": "denied", "2": "timeout",
+                    "3": "configuration, publication or answer-channel error",
                     "rule": "treat any non-zero exit as NO (fail closed)"},
         },
         "mcp": {
@@ -5337,7 +5458,13 @@ def doctor_checks(cfg, send=False):
         checks.append(_check(FAIL, "config", f"no config yet ({cfg.path})", "agentbell init"))
     else:
         mode = oct(os.stat(cfg.path).st_mode & 0o777)[2:]
-        if platform.system() != "Windows" and mode != "600":
+        if platform.system() == "Windows":
+            checks.append(_check(
+                WARN, "config",
+                "config exists, but this stdlib-only check cannot verify its Windows ACL; "
+                "it may contain a license key, Telegram token and ntfy password",
+                f'check access with: icacls "{cfg.path}"'))
+        elif mode != "600":
             checks.append(_check(
                 WARN, "config", f"{cfg.path} is mode {mode}; it holds your license key, "
                 "Telegram token and ntfy password", f"chmod 600 {shlex.quote(cfg.path)}"))
@@ -5417,17 +5544,32 @@ def doctor_checks(cfg, send=False):
                 "agentbell bot install-service   # runs in the background from now on"))
 
     status_rows = hooks_status()
-    installed_hooks = [agent for agent, status, _, _ in status_rows if status == "installed"]
+    installed_hooks = [agent for agent, status, _, _ in status_rows
+                       if status in ("installed", "user wrapper")]
     outdated_hooks = [agent for agent, status, _, _ in status_rows if status == "update needed"]
+    wrapped_hooks = [agent for agent, status, _, _ in status_rows if status == "user wrapper"]
     missing = [a for a in find_agents() if a not in installed_hooks and a not in outdated_hooks]
     # self-integrated agents (via `agentbell integrate`) have no config we
     # check, but their history records make them visible here - text only,
     # `verify` is the command that actually assesses them
     try:
-        observed = hook_observations(read_history(limit=0),
+        history_records = read_history(limit=0)
+        observed = hook_observations(history_records,
                                      _parse_since(VERIFY_WINDOW_DEFAULT))
+        cutoff = time.time() - _parse_since(VERIFY_WINDOW_DEFAULT)
+        claim_failures = [rec for rec in history_records
+                          if isinstance(rec, dict)
+                          and rec.get("event") == "answer_claim_failed"
+                          and (_history_ts(rec) or 0) >= cutoff]
     except Exception:  # noqa: BLE001 - doctor must not die on a bad history
         observed = {}
+        claim_failures = []
+    if claim_failures:
+        checks.append(_check(
+            WARN, "approval answers",
+            f"{len(claim_failures)} answer(s) could not be claimed safely in the last "
+            f"{VERIFY_WINDOW_DEFAULT}",
+            "check that the agentbell state directory is writable, then retry the ask"))
     self_integrated = sorted(slug for slug in observed if slug not in AGENT_SPECS)
     if installed_hooks:
         detail = "installed for " + ", ".join(installed_hooks)
@@ -5439,6 +5581,12 @@ def doctor_checks(cfg, send=False):
                              "update needed for " + ", ".join(outdated_hooks)
                              + " (wiring on disk is not this version's)",
                              "agentbell hooks install " + " ".join(outdated_hooks)))
+    if wrapped_hooks:
+        checks.append(_check(
+            WARN, "agent hooks",
+            "user-owned shell wrapper found for " + ", ".join(wrapped_hooks)
+            + "; agentbell will not replace it or install a second hook",
+            "inspect and update or remove the wrapper manually"))
     if missing:
         checks.append(_check(WARN, "agent hooks",
                              ("found but not wired up: " if installed_hooks
@@ -5602,7 +5750,22 @@ def _history_ts(rec):
         return None
 
 
-def hook_observations(records, since_seconds, now=None):
+def _normalized_project(project=None):
+    return os.path.normcase(os.path.realpath(os.path.abspath(project or os.getcwd())))
+
+
+def _project_matches(recorded, requested):
+    if not recorded:
+        return False
+    recorded = _normalized_project(recorded)
+    requested = _normalized_project(requested)
+    try:
+        return os.path.commonpath([recorded, requested]) == requested
+    except ValueError:  # different Windows drives
+        return False
+
+
+def hook_observations(records, since_seconds, now=None, project=None):
     """Per-agent delivery observations from history records.
 
     Only records carrying an `agent` field count. `source_event` preserves
@@ -5621,6 +5784,8 @@ def hook_observations(records, since_seconds, now=None):
         # Only slugs our own writers can produce: a hand-forged history line
         # with a hostile agent value must not become a report heading.
         if not agent or not AGENT_NAME_RE.fullmatch(str(agent)):
+            continue
+        if project is not None and not _project_matches(rec.get("project"), project):
             continue
         ts = _history_ts(rec)
         if ts is None or ts < cutoff or ts > now:
@@ -5743,13 +5908,19 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                              "by absolute path",
                              "agentbell doctor   # prints the exact PATH fix command"))
 
-    observations = hook_observations(read_history(limit=0), since_seconds, now=now)
+    observations = hook_observations(
+        read_history(limit=0), since_seconds, now=now, project=project)
     status_rows = hooks_status(project=project)
     installed = {name for name, status, _, _ in status_rows
-                 if status == "installed"}
-    repair_notices = [notice for notice in [aider_repair_notice(project)] if notice]
+                 if status in ("installed", "update needed", "user wrapper")}
+    aider_needs_update = any(name == "aider" and status == "update needed"
+                             for name, status, _, _ in status_rows)
+    repair_notices = ([aider_repair_notice(project, state="outdated")]
+                      if aider_needs_update else [])
     needs_update = {name for name, status, _, _ in status_rows
                     if status == "update needed"}
+    wrapped = {name for name, status, _, _ in status_rows
+               if status == "user wrapper"}
     if agent:
         targets = [agent]
     else:
@@ -5832,6 +6003,12 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                                  "nothing known: not installed, no events in the window",
                                  fix))
         agents_data.append(row)
+        if slug in wrapped:
+            checks.append(_check(
+                WARN, name,
+                "a user-owned shell wrapper invokes agentbell; it is left untouched "
+                "and no second lifecycle hook will be installed",
+                "inspect and update or remove the wrapper manually"))
     if not targets:
         checks.append(_check(
             WARN, "agents",
@@ -5954,7 +6131,7 @@ def print_next_steps(cfg):
     server = NtfyChannel(cfg).server()
     missing = [agent for agent in find_agents()
                if agent not in [a for a, status, _, _ in hooks_status()
-                                if status in ("installed", "update needed")]]
+                                if status in ("installed", "update needed", "user wrapper")]]
     print()
     print("-" * 62)
     print("NEXT STEPS (copy & paste)")
@@ -6186,7 +6363,8 @@ def run_test(cfg, wait=True, confirm_seconds=15, poll_interval=2):
     while time.monotonic() < deadline:
         time.sleep(poll_interval)
         try:
-            events = NtfyChannel(cfg).poll(topic, "90s", timeout=8.0)
+            events = NtfyChannel(cfg).poll(
+                topic, f"{NTFY_LOOKBACK_MARGIN_SECONDS}s", timeout=8.0)
         except RuntimeError as exc:
             reason = str(exc)
             continue
@@ -6276,6 +6454,7 @@ def run_hook(cfg, event, agent, cwd=None, duration=None, force=False, silent=Fal
              min_duration=None):
     spec = HOOK_EVENTS[event]
     validate_agent_name(agent)
+    project = _normalized_project(cwd)
     if event == "started":
         write_start_marker(agent)
         if silent:
@@ -6296,6 +6475,7 @@ def run_hook(cfg, event, agent, cwd=None, duration=None, force=False, silent=Fal
     if (event == "run_completed" and min_duration and duration is not None
             and duration < float(min_duration) and not force):
         write_history({"event": "hook.skipped_short", "agent": agent,
+                       "project": project,
                        "duration": round(float(duration), 1),
                        "min_duration": float(min_duration)})
         return {"ok": True, "skipped": "shorter than min-duration"}
@@ -6305,6 +6485,7 @@ def run_hook(cfg, event, agent, cwd=None, duration=None, force=False, silent=Fal
     # silent: `verify` counts these and still flags a double integration.
     if not force and not claim_hook_send(agent, f"hook.{event}", message):
         write_history({"event": "hook.skipped_duplicate", "agent": agent,
+                       "project": project,
                        "source_event": f"hook.{event}", "message": message,
                        "window": HOOK_DEDUPE_WINDOW_SECONDS})
         return {"ok": True, "skipped": "identical push within dedupe window"}
@@ -6316,6 +6497,7 @@ def run_hook(cfg, event, agent, cwd=None, duration=None, force=False, silent=Fal
         timeout=5.0,
         event=f"hook.{event}",
         agent=agent,
+        project=project,
     )
 
 
@@ -6330,7 +6512,8 @@ def cmd_hook(args):
         # either: the record lets `verify` warn with the valid event list.
         try:
             write_history({"event": "hook.unknown_event",
-                           "requested": str(args.event), "agent": args.agent})
+                           "requested": str(args.event), "agent": args.agent,
+                           "project": _normalized_project(args.cwd)})
         except Exception:  # noqa: BLE001
             pass
         raise SystemExit(0)
@@ -6577,7 +6760,10 @@ def cmd_hooks(args):
     project = getattr(args, "project", None)
     if args.sub is None or args.sub == "status":
         rows = hooks_status(project=project)
-        notice = aider_repair_notice(project)
+        aider_outdated = any(agent == "aider" and status == "update needed"
+                             for agent, status, _, _ in rows)
+        notice = (aider_repair_notice(project, state="outdated")
+                  if aider_outdated else None)
         if notice:
             print_action_banner(notice)
             print()
@@ -6593,6 +6779,10 @@ def cmd_hooks(args):
         if outdated:
             print(f"  update needed = wiring on disk is not this version's; repair with: "
                   f"{PROG} hooks install {' '.join(outdated)}")
+        wrapped = [agent for agent, status, _, _ in rows if status == "user wrapper"]
+        if wrapped:
+            print("  user wrapper = working but user-owned; agentbell leaves it unchanged "
+                  "and will not add a second hook")
         return
     agents = AGENTS if "all" in args.agent else args.agent
     for agent in agents:

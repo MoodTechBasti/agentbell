@@ -506,6 +506,7 @@ class TestHooks(unittest.TestCase):
         ours = [
             "/usr/local/bin/agentbell hook run_completed --agent x",
             "/repo/agentbell.py hook started --agent x --silent",
+            "C:\\Users\\Jo\\agentbell.exe hook run_completed --agent x",
             "'C:\\Users\\Jo Do\\agentbell.exe' hook run_completed --agent x",
             "'/opt/a b/agentbell' hook input_required --agent x",
         ]
@@ -520,6 +521,24 @@ class TestHooks(unittest.TestCase):
             self.assertTrue(an._is_our_hook_command(command), command)
         for command in foreign:
             self.assertFalse(an._is_our_hook_command(command), command)
+
+    def test_user_wrapped_hook_is_visible_and_never_duplicated(self):
+        path = self._settings("claude")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        wrapper = "bash -c 'agentbell hook run_completed --agent claude'"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": wrapper}
+            ]}]}}, fh)
+        status = {agent: value for agent, value, _, _ in an.hooks_status()}
+        self.assertEqual(status["claude"], "user wrapper")
+        result = an.install_hooks("claude")
+        self.assertFalse(result["changed"])
+        self.assertTrue(any("did not add a second" in note
+                            for note in result["notes"]))
+        with open(path, encoding="utf-8") as fh:
+            commands = an._json_hook_commands(path)
+        self.assertEqual(commands, [wrapper])
 
     def test_gemini_install(self):
         path = self._settings("gemini")
@@ -1306,7 +1325,7 @@ class TestApprovalPollFallback(unittest.TestCase):
         for since in seen:
             self.assertIsInstance(since, str)
             self.assertRegex(since, r"^\d+s$")
-        self.assertGreaterEqual(int(seen[0][:-1]), 90)
+        self.assertGreaterEqual(int(seen[0][:-1]), an.NTFY_LOOKBACK_MARGIN_SECONDS)
 
 
 class MockTelegram:
@@ -2145,6 +2164,50 @@ class TestApprovalHardening(unittest.TestCase):
         self.assertFalse(an.claim_consumed("claimtest", newest))   # newest kept
         os.remove(path)
 
+    def test_claim_consumed_is_once_only_across_processes(self):
+        state = tempfile.mkdtemp()
+        home = tempfile.mkdtemp()
+        gate = os.path.join(state, "go")
+        code = (
+            "import os,time,agentbell as a; "
+            f"gate={gate!r}; "
+            "\nwhile not os.path.exists(gate): time.sleep(.005)\n"
+            "print(int(a.claim_consumed('process-race','same-id')), flush=True)"
+        )
+        env = dict(os.environ, AGENTBELL_STATE_DIR=state, HOME=home,
+                   USERPROFILE=home)
+        workers = [subprocess.Popen(
+            [sys.executable, "-c", code], cwd=os.path.dirname(an.__file__),
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(8)]
+        with open(gate, "w", encoding="utf-8"):
+            pass
+        results = []
+        for worker in workers:
+            stdout, stderr = worker.communicate(timeout=10)
+            self.assertEqual(worker.returncode, 0, stderr)
+            results.append(int(stdout.strip()))
+        self.assertEqual(sum(results), 1)
+        shutil.rmtree(state, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
+
+    def test_claim_failure_is_recorded_and_not_accepted(self):
+        cfg = make_config(self.ntfy.url, topic="claimfailure")
+        waiter = an.ApprovalWaiter(
+            cfg, "claimfailure-responses", 5, approval_id="a" * 16)
+        original = an.claim_ntfy_message
+        an.claim_ntfy_message = lambda message_id: (_ for _ in ()).throw(
+            OSError("read only"))
+        try:
+            waiter._offer("message-id", "free text")
+        finally:
+            an.claim_ntfy_message = original
+        self.assertTrue(waiter.messages.empty())
+        self.assertTrue(any("cannot claim approval answer" in error
+                            for error in waiter.errors))
+        self.assertTrue(any(rec.get("event") == "answer_claim_failed"
+                            for rec in an.read_history(limit=20)))
+
     def test_stale_button_answer_ignored(self):
         cfg = make_config(self.ntfy.url, topic="staleid")
         holder, thread = self._run_ask_async(cfg, message="Q?", timeout_seconds=20)
@@ -2573,6 +2636,7 @@ class TestRunTestConfirmation(unittest.TestCase):
         for since in seen:
             self.assertIsInstance(since, str)
             self.assertRegex(since, r"^\d+[smhd]$")
+            self.assertEqual(since, f"{an.NTFY_LOOKBACK_MARGIN_SECONDS}s")
 
     def test_poll_error_becomes_the_reason(self):
         """A failing confirmation poll (e.g. HTTP 429) must surface its error
@@ -2711,6 +2775,20 @@ class TestDoctor(unittest.TestCase):
         self.assertIn("restart PowerShell", install["fix"])
         self.assertNotIn(".bashrc", install["fix"])
 
+    def test_doctor_warns_that_windows_config_acl_is_unverified(self):
+        cfg = an.Config(an.default_config(), path=os.path.join(
+            tempfile.mkdtemp(), "config.json"))
+        cfg.save()
+        original_system = an.platform.system
+        an.platform.system = lambda: "Windows"
+        try:
+            check = next(c for c in an.doctor_checks(cfg) if c["name"] == "config")
+        finally:
+            an.platform.system = original_system
+        self.assertEqual(check["status"], an.WARN)
+        self.assertIn("cannot verify its Windows ACL", check["detail"])
+        self.assertIn("icacls", check["fix"])
+
     def test_doctor_flags_missing_config_with_a_fix(self):
         tmp = tempfile.mkdtemp()
         cfg = an.Config(an.default_config(), path=os.path.join(tmp, "config.json"))
@@ -2754,6 +2832,14 @@ class TestDoctor(unittest.TestCase):
         license_check = [c for c in an.doctor_checks(cfg) if c["name"] == "license"][0]
         self.assertEqual(license_check["status"], an.FAIL)
         self.assertIsNotNone(license_check["fix"])
+
+    def test_doctor_surfaces_answer_claim_failures(self):
+        an.write_history({"event": "answer_claim_failed", "error": "OSError"})
+        cfg = make_config("http://127.0.0.1:1")
+        check = next(c for c in an.doctor_checks(cfg)
+                     if c["name"] == "approval answers")
+        self.assertEqual(check["status"], an.WARN)
+        self.assertIn("state directory", check["fix"])
 
 
 class TestMcpClients(unittest.TestCase):
@@ -3697,6 +3783,9 @@ class TestInsecureAskWarning(unittest.TestCase):
         self.assertTrue(an.is_sensitive_approval("Deploy to production?"))
         self.assertTrue(an.is_sensitive_approval("Rotate the API credentials?"))
         self.assertTrue(an.is_sensitive_approval("Delete the production database?"))
+        self.assertTrue(an.is_sensitive_approval("Deploying to production?"))
+        self.assertTrue(an.is_sensitive_approval("Deleting the production database?"))
+        self.assertTrue(an.is_sensitive_approval("Publishing the release?"))
         self.assertFalse(an.is_sensitive_approval("Deploy to staging?"))
         self.assertFalse(an.is_sensitive_approval("Delete the temporary build file?"))
         self.assertFalse(an.is_sensitive_approval("Update the README heading?"))
@@ -3705,8 +3794,6 @@ class TestInsecureAskWarning(unittest.TestCase):
         cfg = an.Config({
             "ntfy": {"server": "https://ntfy.sh", "topic": "test-topic-long-enough"},
         })
-        # reset the per-process fired flag so the test runs cleanly
-        an._warn_insecure_ask._fired = False
         buf = io.StringIO()
         stderr, sys.stderr = sys.stderr, buf
         try:
@@ -3721,7 +3808,6 @@ class TestInsecureAskWarning(unittest.TestCase):
             "ntfy": {"server": "https://ntfy.example.com", "topic": "test-topic",
                      "auth": "user:pass"},
         })
-        an._warn_insecure_ask._fired = False
         buf = io.StringIO()
         stderr, sys.stderr = sys.stderr, buf
         try:
@@ -3737,7 +3823,6 @@ class TestInsecureAskWarning(unittest.TestCase):
         cfg = an.Config({
             "ntfy": {"server": "https://ntfy.example.com", "topic": "test-topic"},
         })
-        an._warn_insecure_ask._fired = False
         buf = io.StringIO()
         stderr, sys.stderr = sys.stderr, buf
         try:
@@ -3746,22 +3831,18 @@ class TestInsecureAskWarning(unittest.TestCase):
             sys.stderr = stderr
         self.assertIn("does not have ntfy authentication", buf.getvalue())
 
-    def test_warns_only_once_per_process(self):
+    def test_warns_for_every_sensitive_ask_in_a_long_lived_process(self):
         cfg = an.Config({
             "ntfy": {"server": "https://ntfy.sh", "topic": "test-topic-long-enough"},
         })
-        an._warn_insecure_ask._fired = False
         buf = io.StringIO()
         stderr, sys.stderr = sys.stderr, buf
         try:
             an._warn_insecure_ask(cfg, "Deploy to production?")
-            buf.truncate(0)
-            buf.seek(0)
             an._warn_insecure_ask(cfg, "Deploy to production?")
         finally:
             sys.stderr = stderr
-        # second call must be silent: the flag prevents duplicates
-        self.assertEqual(buf.getvalue(), "")
+        self.assertEqual(buf.getvalue().count("Sensitive approval detected"), 2)
 
 
 class TestHookAttribution(unittest.TestCase):
@@ -4240,6 +4321,7 @@ class TestVerify(unittest.TestCase):
                          "aider_agents_block_outdated")
         self.assertEqual(data["repair_notices"][0]["command"],
                          "agentbell hooks install aider")
+        self.assertTrue(data["agents"][0]["installed"])
 
         an.install_hooks("aider", project=project)
         _, out = self._run(self._cfg(),
@@ -4375,12 +4457,55 @@ class TestVerify(unittest.TestCase):
         self.assertEqual(obs["vf-def"]["held"], 1)
         self.assertEqual(obs["vf-def"]["events"], {"run_completed": 1})
 
+    def test_project_filters_history_aggregation(self):
+        now = time.time()
+        one = tempfile.mkdtemp()
+        two = tempfile.mkdtemp()
+        records = [
+            {"ts": _iso(now), "event": "hook.run_completed", "agent": "vf-project",
+             "project": one, "delivered": ["ntfy"]},
+            {"ts": _iso(now), "event": "hook.run_completed", "agent": "vf-project",
+             "project": two, "delivered": ["ntfy"]},
+            {"ts": _iso(now), "event": "hook.run_completed", "agent": "vf-project",
+             "delivered": ["ntfy"]},
+        ]
+        with unittest.mock.patch.object(an, "read_history", return_value=records), \
+                unittest.mock.patch.object(an, "hooks_status", return_value=[]):
+            report = an.verify_report(
+                self._cfg(), agent="vf-project", since_seconds=3600,
+                project=one, now=now)
+        self.assertEqual(report["agents"][0]["count"], 1)
+
+    def test_hook_history_records_normalized_project(self):
+        project = tempfile.mkdtemp()
+        cfg = self._cfg()
+        with unittest.mock.patch.object(an, "send_notification") as send:
+            send.return_value = {"ok": True}
+            an.run_hook(cfg, "run_completed", "vf-project-record", cwd=project)
+        self.assertEqual(send.call_args.kwargs["project"], an._normalized_project(project))
+
+    def test_verify_reads_agents_md_once(self):
+        project = tempfile.mkdtemp()
+        with open(os.path.join(project, "AGENTS.md"), "w", encoding="utf-8") as fh:
+            fh.write(an.BLOCK_START + "\n--agent aider\n" + an.BLOCK_END + "\n")
+        original = an.aider_block_state
+        calls = []
+
+        def counted(value=None):
+            calls.append(value)
+            return original(value)
+
+        with unittest.mock.patch.object(an, "aider_block_state", side_effect=counted):
+            an.verify_report(self._cfg(), agent="aider", project=project)
+        self.assertEqual(calls, [project])
+
     def test_known_agent_without_events_suggests_native_installer(self):
         original = an.hooks_status
         an.hooks_status = lambda project=None: [
             (a, "not installed", "x", "hook") for a in an.AGENTS]
         try:
-            code, out = self._run(self._cfg(), ["--agent", "claude"])
+            with unittest.mock.patch.object(an, "read_history", return_value=[]):
+                code, out = self._run(self._cfg(), ["--agent", "claude"])
         finally:
             an.hooks_status = original
         self.assertEqual(code, 1)
@@ -4391,12 +4516,25 @@ class TestVerify(unittest.TestCase):
         an.hooks_status = lambda project=None: [
             ("claude", "installed", "x", "hook")]
         try:
-            # no exit-code assertion: the shared suite history may already
-            # hold observations from other tests, which is legitimate
-            _, out = self._run(self._cfg(), [])
+            with unittest.mock.patch.object(an, "read_history", return_value=[]):
+                code, out = self._run(self._cfg(), [])
         finally:
             an.hooks_status = original
+        self.assertEqual(code, 1)
         self.assertIn("finish one real agent turn", out)
+
+    def test_user_wrapper_is_installed_but_warned(self):
+        original = an.hooks_status
+        an.hooks_status = lambda project=None: [
+            ("claude", "user wrapper", "x", "hook")]
+        try:
+            with unittest.mock.patch.object(an, "read_history", return_value=[]):
+                report = an.verify_report(self._cfg(), agent="claude")
+        finally:
+            an.hooks_status = original
+        self.assertTrue(report["agents"][0]["installed"])
+        self.assertTrue(any(c["status"] == an.WARN and "user-owned" in c["detail"]
+                            for c in report["checks"]))
 
 
 class TestAgentbellBinary(unittest.TestCase):
@@ -4520,6 +4658,11 @@ class TestIntegrationGuide(unittest.TestCase):
         self.assertFalse(manifest["agent_slug"]["is_known"])
         self.assertEqual(manifest["agent_slug"]["value"], "roo-code")
         self.assertIn("roo-code", an.integration_guide(manifest))
+
+    def test_ask_exit_codes_include_runtime_error(self):
+        ask_codes = self._manifest(agent="roo-code")["exit_codes"]["ask"]
+        self.assertIn("3", ask_codes)
+        self.assertIn("error", ask_codes["3"])
 
     def test_no_credential_can_leak(self):
         """integrate never reads Config - even a populated config file with
