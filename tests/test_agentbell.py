@@ -4731,7 +4731,8 @@ class TestOpenCodePluginBehaviour(unittest.TestCase):
     with a recording `$` - the plugin logic itself, not just its text."""
 
     HARNESS = r"""
-const { AgentBell } = await import(process.argv[2]);
+import { pathToFileURL } from "node:url";
+const { AgentBell } = await import(pathToFileURL(process.argv[2]).href);
 const calls = [];
 const $ = (strings, ...values) => {
   const parts = [];
