@@ -635,13 +635,43 @@ class TestHooks(unittest.TestCase):
         os.makedirs(project)
         agents_md = os.path.join(project, "AGENTS.md")
         with open(agents_md, "w") as fh:
-            fh.write("# Existing rules\n" + an.BLOCK_START + "\nold\n" + an.BLOCK_END + "\n")
+            fh.write("# Existing rules\n" + an.BLOCK_START
+                     + "\nold: run `agentbell hook run_completed --agent opencode`\n"
+                     + an.BLOCK_END + "\n")
         an.install_hooks("opencode", project=project)
         with open(agents_md) as fh:
             text = fh.read()
         self.assertEqual(text.strip(), "# Existing rules")
         self.assertTrue(os.path.exists(
             os.path.join(project, ".opencode", "plugin", "agentbell.js")))
+
+    def test_opencode_install_leaves_aider_block_alone(self):
+        """v1.6.1 regression: `hooks install opencode` removed *any* agentbell
+        block from AGENTS.md as the v1.3rc migration and deleted the file -
+        taking the project's Aider block with it. Removal is owner-scoped."""
+        project = os.path.join(self.tmp, "proj_aider_keep")
+        os.makedirs(project)
+        an.install_hooks("aider", project=project)
+        agents_md = os.path.join(project, "AGENTS.md")
+        with open(agents_md) as fh:
+            before = fh.read()
+        self.assertIn("--agent aider", before)
+        an.install_hooks("opencode", project=project)
+        self.assertTrue(os.path.exists(agents_md))
+        with open(agents_md) as fh:
+            self.assertEqual(fh.read(), before)
+        # and the other way round: uninstalling Aider never touches a
+        # block that is not Aider's
+        with open(agents_md, "w") as fh:
+            fh.write(an.BLOCK_START + "\nlegacy --agent opencode\n" + an.BLOCK_END + "\n")
+        self.assertFalse(an.install_hooks("aider", project=project, add=False)["changed"])
+        self.assertTrue(os.path.exists(agents_md))
+        # an unrecognizable block (no owner named) is left alone as well
+        with open(agents_md, "w") as fh:
+            fh.write(an.BLOCK_START + "\nold\n" + an.BLOCK_END + "\n")
+        self.assertFalse(an.install_hooks("opencode", project=project)["changed"]
+                         and not os.path.exists(agents_md))
+        self.assertTrue(os.path.exists(agents_md))
 
     @unittest.skipUnless(HAS_TOMLLIB, "tomllib requires 3.11+")
     def test_kimi_install_uninstall(self):

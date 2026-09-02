@@ -815,3 +815,15 @@ same second from one plugin instance - exactly the case the file-based
 window cannot promise to catch. Root cause inside OpenCode was not
 established; the fix is robust to either a doubled event or a second
 listener and is exercised under node by the test suite.
+
+### 17d. Removal is owner-scoped too (v1.6.2)
+
+Minutes after the v1.6.1 install, `hooks install opencode` deleted the
+checkout's `AGENTS.md`: its v1.3rc migration removed every agentbell marker
+block in that file, and the only block there was Aider's. b1aa21e had made
+block *repair* check ownership; removal had kept the pre-shared-file
+assumption that any block between our markers is the caller's. The rule from
+§16j applies on the way out as well: only content that names the removing
+agent (`--agent <slug>`) is touched. A block that names no owner is left
+alone rather than guessed at - the cost is a stale, harmless block; the
+alternative was a deleted user file.
