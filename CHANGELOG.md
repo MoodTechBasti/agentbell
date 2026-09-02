@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.6.2 — 2026-09-03 — removal is owner-scoped
+
+### Fixed
+
+- **`agentbell hooks install opencode` no longer wipes a project's Aider
+  block.** The install migrated away from the v1.3rc OpenCode `AGENTS.md`
+  block by removing *every* agentbell marker block in that file, and deleted
+  the file when nothing else remained — in a project wired for Aider that
+  was the current Aider block (found within minutes of v1.6.1, on the
+  maintainer's own checkout). Block removal is now owner-scoped like block
+  repair has been since b1aa21e: a block is only removed when it names the
+  removing agent (`--agent opencode` for the migration, `--agent aider` for
+  `hooks uninstall aider`); a block that names another agent, or none, is
+  left untouched. `agentbell uninstall` (full reset) still removes every
+  agentbell block, and its report line says so. Rationale: `DECISIONS.md`
+  §17d.
+
 ## 1.6.1 — 2026-09-03 — one buzz per event
 
 Patch release from twelve days of real use on the maintainer's machine

@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 PROG = "agentbell"
 
 # The self-integration contract printed by `agentbell integrate` (bumped only
@@ -3154,7 +3154,22 @@ def _install_block_file(path, content, add=True, replace_stale=False):
         pattern = re.compile(
             re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END), re.S
         )
-        new_text = pattern.sub("", text).strip()
+        # Removal is owner-scoped like repair: a shared file (AGENTS.md) can
+        # hold another agent's block between the same markers, and "only
+        # entries whose content is ours are ever touched" applies on the way
+        # out too. v1.6.1's OpenCode install wiped a project's Aider block
+        # this way. A block that does not name the owner is left alone.
+        # content=None (purge) means every agentbell block: a full reset is
+        # the one caller entitled to all of them.
+        owner = re.search(r"--agent ([^\s`]+)", content) if content else None
+        matches = [m for m in pattern.finditer(text)
+                   if owner is None or owner.group(0) in m.group(0)]
+        if not matches:
+            return False
+        new_text = text
+        for match in reversed(matches):
+            new_text = new_text[:match.start()] + new_text[match.end():]
+        new_text = new_text.strip()
         if not new_text:
             os.remove(path)
         else:
@@ -4622,9 +4637,9 @@ def _project_entries(project):
     agents_md = os.path.join(project, "AGENTS.md")
     if _file_contains(agents_md, BLOCK_START):
         entries.append({
-            "kind": "hooks", "label": f"OpenCode block in {agents_md} (pre-1.3 wiring)",
-            "action": "remove the agentbell block (the rest of the file stays)",
-            "apply": lambda p=agents_md: _install_block_file(p, OPENCODE_INSTRUCTIONS, add=False),
+            "kind": "hooks", "label": f"agentbell block(s) in {agents_md} (Aider, or pre-1.3 OpenCode)",
+            "action": "remove every agentbell block (the rest of the file stays)",
+            "apply": lambda p=agents_md: _install_block_file(p, None, add=False),
         })
     return entries
 
