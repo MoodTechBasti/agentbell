@@ -17,6 +17,13 @@
   agentbell block, and its report line says so. Rationale: `DECISIONS.md`
   §17d.
 
+### Field-verified
+
+- The v1.6.1 OpenCode plugin passed its real turns on 2026-09-03 (OpenCode
+  1.18.26): a 62 s turn produced exactly one push with its duration, turns
+  of 9 s and 51 s stayed silent as `hook.skipped_short`, no duplicates.
+  `FIELD_TEST.md` row 11.
+
 ## 1.6.1 — 2026-09-03 — one buzz per event
 
 Patch release from twelve days of real use on the maintainer's machine
