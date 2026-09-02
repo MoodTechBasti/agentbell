@@ -1,4 +1,4 @@
-# FIELD TEST — 2-week checklist (v1.6.0)
+# FIELD TEST — 2-week checklist (v1.6.1)
 
 Goal: use the tool like a real user for two weeks and tick off every path below.
 Budget: ~20 minutes for the first pass, then just use it.
@@ -62,7 +62,7 @@ this retained evidence.
 | 9 | Claude Code hooks | `agentbell hooks install claude`, finish a real turn | `run_completed` push **with duration**; nothing printed into the session |
 | 9b | No spam on short turns | ask Claude something trivial (< 60 s) | **No push**; `agentbell history` shows `hook.skipped_short` |
 | 10 | Codex hooks | `agentbell hooks install codex`, finish a turn | `run_completed` push; check `/hooks` inside Codex if not |
-| 11 | OpenCode plugin | `agentbell hooks install opencode`, finish a turn in **any** repo | `run_completed` push (plugin is global); exactly one push per turn |
+| 11 | OpenCode plugin | `agentbell hooks install opencode`, finish a turn in **any** repo | `run_completed` push **with duration** (plugin is global); exactly one push per turn; a turn under 60 s stays silent (`hook.skipped_short`); a doubled `session.idle` shows up as at most one `hook.skipped_duplicate` record, never as a second buzz — **v1.6.0 result: failed** (24 same-second doubles in 415 turns, no short-turn filter; see the agent table), fixed in v1.6.1, re-verification pending |
 | 12 | MCP in a desktop app | `agentbell mcp add claude-desktop chatgpt-desktop`, restart the app | The app lists `notify` / `ask_approval` and can call them |
 | 13 | Telegram (premium) | `agentbell license activate <key>`, `agentbell init`, `agentbell bot install-service` | Question with Telegram buttons; a press answers the ask; `bot status` healthy after closing the terminal |
 | 14 | Parallel channels | with ntfy + Telegram: `agentbell ask "Deploy?"` | Both get it; first answer wins; `channel` in `--json` says which |
@@ -75,7 +75,7 @@ this retained evidence.
 | 21 | Change one setting | `agentbell config set ntfy.topic <long-random>` | Written + re-subscribe hint; `doctor` turns the topic WARN into OK; no wizard needed |
 | 22 | Setup survives a hiccup | in `init`, paste a bot token while offline | Says "could not reach Telegram", offers to keep it — the license key and topic entered before are **not** lost |
 | 23 | Self-integration (unknown agent) | hand `agentbell integrate` output to an agent NOT in the table (e.g. GitHub Copilot CLI), let it wire itself, finish one real turn | `verify --agent <slug> --since 10m` exit 0, event shown as real (not forced); push arrived with the slug as its label — **passed 2026-08-21** with GitHub Copilot CLI 1.0.80, see Tier-1 result below |
-| 24 | Double integration is detected | wire the same agent via hooks AND the Appendix A rules block on purpose, finish a turn **of at least 60 s** (a shorter turn hits `--min-duration` on the hook side, leaves only one `run_completed` record and defeats the check) | Two pushes; `agentbell verify` WARNs "possible double integration"; after removing one mechanism, a fresh window is clean (`verify --since 10m`) — **passed 2026-08-21** with GitHub Copilot CLI 1.0.80; the default 7-day window keeps warning until the old duplicate records age out |
+| 24 | Double integration is detected | wire the same agent via hooks AND the Appendix A rules block on purpose, finish a turn **of at least 60 s** (a shorter turn hits `--min-duration` on the hook side, leaves only one `run_completed` record and defeats the check) | One push — the identical second one is suppressed and recorded as `hook.skipped_duplicate` (v1.6.0 delivered both); `agentbell verify` WARNs "possible double integration" either way; after removing one mechanism, a fresh window is clean (`verify --since 10m`) — **passed 2026-08-21** with GitHub Copilot CLI 1.0.80 under v1.6.0 semantics (two pushes); the default 7-day window keeps warning until the old duplicate records age out |
 | 25 | Old Aider block migration | put a pre-scope agentbell block containing `--agent aider` in an `AGENTS.md` that also has user sections; run `agentbell hooks status`, `agentbell verify --json`, then `agentbell hooks install aider` | status/text verify show the bordered ACTION REQUIRED banner; JSON has `repair_notices[0].code == "aider_agents_block_outdated"`; reinstall preserves user sections and the next status says `installed` with no banner |
 
 ## Agent wiring — all 12
@@ -98,18 +98,28 @@ Reliability class (shown by `agentbell hooks status`):
 
 | Agent | Mechanism | Scope | Expected when a turn ends | Status |
 |---|---|---|---|---|
-| Claude Code | `~/.claude/settings.json` hooks | global | finished (with duration), failed, needs-input | `[ ]` run #9, #9b |
-| Codex | `~/.codex/config.toml` `[[hooks.…]]` | global | finished (with duration) | `[ ]` run #10 |
-| OpenCode | plugin in `~/.config/opencode/plugin/` | global | finished, failed, permission asked — exactly one push per turn | `[ ]` run #11 |
-| Gemini CLI | `~/.gemini/settings.json` `AfterAgent` | global | finished only — Gemini exposes no failure event | [ ] |
-| Kimi Code | `~/.kimi-code/config.toml` `[[hooks]]` | global | finished (with duration), failed | [ ] |
-| Qwen Code | `~/.qwen/settings.json` hooks | global | finished (with duration), failed; hooks are async, so the end of a turn never waits on the network | [ ] |
+| Claude Code | `~/.claude/settings.json` hooks | global | finished (with duration), failed, needs-input | `[x]` 2026-08-20 → 09-02, WSL2: 242 `run_completed` (223 with duration), 181 `skipped_short`, 43 `run_failed`, 1 `input_required`; delivered to ntfy + Telegram (rows 9, 9b). Finding: one API outage → 6 `run_failed` in 7 s from parallel sessions — collapsed since v1.6.1 |
+| Codex | `~/.codex/config.toml` `[[hooks.…]]` | global | finished (with duration) | `[x]` 2026-08-21 → 09-02: 70 `run_completed`, all with duration, 62 `skipped_short`; delivered to ntfy + Telegram (row 10) |
+| OpenCode | plugin in `~/.config/opencode/plugin/` | global | finished (with duration), failed, permission asked — exactly one push per turn | `[x]` events 2026-08-21 → 09-02 on OpenCode 1.18.26: 415 `run_completed`, 24 `run_failed`, 36 `permission_required`, all delivered. **"Exactly one push per turn" failed:** 24 same-second doubles (~6% of turns, same session and project) and 0 short-turn skips (no duration). Fixed in v1.6.1 (per-session idle dedupe, `--duration` + `--min-duration 60`); `[ ]` the fixed plugin's own real turns (row 11) |
+| Gemini CLI | `~/.gemini/settings.json` `AfterAgent` | global | finished only — Gemini exposes no failure event | `[ ]` installed, no events in the 7 days before 2026-09-02 (not used) |
+| Kimi Code | `~/.kimi-code/config.toml` `[[hooks]]` | global | finished (with duration), failed | `[x]` 2026-08-26/27: 5 `run_completed` with duration, 4 `skipped_short`, 1 `run_failed`; delivered to ntfy + Telegram |
+| Qwen Code | `~/.qwen/settings.json` hooks | global | finished (with duration), failed; hooks are async, so the end of a turn never waits on the network | `[ ]` installed, no events in the 7 days before 2026-09-02 (not used) |
 | Cursor | `.cursor/rules/agentbell.mdc` | project | best-effort: the agent calls the CLI on finish / needs-input / failure | [ ] |
 | Windsurf | `.windsurf/rules/agentbell.md` + legacy `.mdc` | project | best-effort; on a current (Devin) build the `.md` is the file that fires | [ ] |
 | Cline | `.clinerules/agentbell.md` | project | best-effort | [ ] |
 | Continue | `.continue/rules/agentbell.md` | project | best-effort | [ ] |
 | Zed | `.rules` block | project | best-effort; if the repo already had a `.rules`, check its own content survived | [ ] |
 | Aider | `AGENTS.md` block | project | best-effort; check a legacy OpenCode `AGENTS.md` block is not counted as Aider's | [ ] |
+
+Evidence for the ticked rows: `agentbell history --json` on the maintainer's
+WSL2 machine (2026-08-20 → 2026-09-02, 1,339 records), summarized per agent
+and event; topic names and message contents are not retained here. Delivery
+means the record lists both channels as delivered; the phone subscription
+was confirmed by `agentbell doctor` / `agentbell test` on 2026-08-22. A
+self-integrated agent (`dsh`, 68 events 2026-08-26 → 08-31: 30 finished,
+16 failed, 3 permission, 1 needs-input, 18 short skips) appears in the same
+history; it is listed as an observation only — no Tier protocol was kept for
+it.
 
 For the six rule-file agents, **"it didn't notify" is a result worth writing
 down, not a bug to hunt.** They are prompt-driven; the useful number is how
