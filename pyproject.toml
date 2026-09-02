@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentbell"
-version = "1.6.0"
+version = "1.6.1"
 description = "Push notifications and phone approvals for AI coding agents and scripts (ntfy, Telegram, OS fallback)."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -767,3 +767,51 @@ Text before and after the markers is retained byte-for-byte, ambiguous marker
 layouts are never guessed at, and a second install is idempotent. The current
 block begins with an Aider-only scope instruction so other `AGENTS.md` readers
 are told to ignore the whole block.
+
+## 17. v1.6.1: one buzz per event (2026-09-03)
+
+Twelve days of real use (1,339 history records) exposed two noise sources
+the v1.6.0 field test could not: OpenCode reporting one turn end twice, and
+an API outage turning six parallel Claude Code sessions into six identical
+failure pushes within seven seconds.
+
+### 17a. Suppress the identical push, keep the record
+
+The push text is the identity: agent, event and message - and the message
+carries the project path and the duration. Two pushes with the same text
+within 5 s are one piece of news. The suppression happens in `run_hook`,
+before delivery, and writes `hook.skipped_duplicate` with the text and the
+original event: history stays complete, `verify` counts it ("N suppressed
+(identical push)"), nothing is silent. A different text is never a repeat -
+two projects or two durations are two pushes. `--force` bypasses it, like
+every other rail.
+
+Rejected: keying on agent + event only (would swallow a second project's
+finish); a lock (portable file locking is not worth exactly-once for a
+notification - check-then-write collapses the sequential bursts observed,
+and the OpenCode plugin handles its own same-instant double in memory); a
+longer window (a genuine second turn of the same length in the same project
+within a minute is plausible, within five seconds it is not).
+
+### 17b. `run_failed` is not double-integration evidence
+
+Same argument as §16i for permission prompts: failures are driven from
+outside. One outage, many sessions, many `run_failed` within seconds - all
+real. A double integration doubles `run_completed` too, so removing
+`run_failed` from the near-duplicate set loses nothing. Because suppressed
+repeats can no longer produce a delivered pair, a suppressed `run_completed`
+repeat counts as the near-duplicate instead (`suppressed: true` in
+`verify --json`).
+
+### 17c. OpenCode: measure the turn, dedupe the idle
+
+The plugin records the user's prompt (`message.updated` with role `user`)
+per session and passes `--duration` to the hook. Explicit duration instead
+of the start marker because the marker is per agent, and parallel OpenCode
+sessions would overwrite each other's start. Unknown duration (plugin loaded
+mid-turn) still notifies - agentbell's rule, unchanged. The idle double is
+collapsed per session in memory (10 s) because both events arrive within the
+same second from one plugin instance - exactly the case the file-based
+window cannot promise to catch. Root cause inside OpenCode was not
+established; the fix is robust to either a doubled event or a second
+listener and is exercised under node by the test suite.

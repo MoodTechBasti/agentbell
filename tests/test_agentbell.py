@@ -10,11 +10,13 @@ import re
 import shlex
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +28,11 @@ import agentbell as an  # noqa: E402
 _TEST_ROOT = tempfile.mkdtemp(prefix="agentbell-tests-")
 os.environ["AGENTBELL_STATE_DIR"] = os.path.join(_TEST_ROOT, "state")
 os.environ["AGENTBELL_CONFIG_DIR"] = os.path.join(_TEST_ROOT, "config")
+
+# Many tests fire the same hook push back to back; the identical-push window
+# would turn them into `hook.skipped_duplicate`. Off here, on (patched) in
+# TestHookDedupe only.
+an.HOOK_DEDUPE_WINDOW_SECONDS = 0
 
 # tomllib is 3.11+; the project supports 3.9, so those tests are skipped there
 HAS_TOMLLIB = sys.version_info >= (3, 11)
@@ -591,6 +598,25 @@ class TestHooks(unittest.TestCase):
         self.assertFalse(an.install_hooks("opencode", project=project)["changed"])
         an.install_hooks("opencode", project=project, add=False)
         self.assertFalse(os.path.exists(path))
+
+    def test_opencode_stale_plugin_is_update_needed_until_reinstalled(self):
+        """An older plugin file (pre-1.6.1 logic, or a moved binary) must be
+        visible as 'update needed' - status observes, install repairs."""
+        project = os.path.join(self.tmp, "proj_stale")
+        path = os.path.join(project, ".opencode", "plugin", "agentbell.js")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as fh:
+            fh.write("// agentbell: old plugin without idle dedupe\nsession.idle\n")
+        status = {a: s for a, s, _, _ in an.hooks_status(project=project)}
+        self.assertEqual(status["opencode"], "update needed")
+        self.assertTrue(an.install_hooks("opencode", project=project)["changed"])
+        status = {a: s for a, s, _, _ in an.hooks_status(project=project)}
+        self.assertEqual(status["opencode"], "installed")
+        with open(path) as fh:
+            text = fh.read()
+        self.assertIn("--min-duration", text)
+        self.assertIn("IDLE_DEDUPE_MS", text)
+        self.assertNotIn("__MIN_DURATION__", text)
 
     def test_opencode_plugin_removes_duplicate_in_sibling_dir(self):
         """OpenCode loads both plugin/ and plugins/ - a leftover would double-fire."""
@@ -4554,6 +4580,235 @@ class TestIntegrationGuide(unittest.TestCase):
     def test_first_line_says_changed_nothing(self):
         first = self._guide().splitlines()[0].lower()
         self.assertIn("changed nothing", first)
+
+
+
+class TestHookDedupe(unittest.TestCase):
+    """An identical hook push within the window is one piece of news: the
+    repeat is suppressed and recorded as hook.skipped_duplicate (v1.6.1)."""
+
+    def setUp(self):
+        self.ntfy = MockNtfy()
+        self.cfg = make_config(self.ntfy.url, topic="deduptopic")
+        self._old_window = an.HOOK_DEDUPE_WINDOW_SECONDS
+        an.HOOK_DEDUPE_WINDOW_SECONDS = 5.0
+        self._clear()
+
+    def tearDown(self):
+        an.HOOK_DEDUPE_WINDOW_SECONDS = self._old_window
+        self._clear()
+        self.ntfy.stop()
+
+    def _clear(self):
+        for path in (an._dedupe_path(), an._run_marker_path("dd-claude")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _posts(self):
+        return self.ntfy.posts.get("deduptopic", [])
+
+    def _skipped(self):
+        return [r for r in an.read_history(limit=0)
+                if r.get("event") == "hook.skipped_duplicate" and r.get("agent") == "dd-claude"]
+
+    def test_identical_failure_burst_is_one_push(self):
+        before = len(self._skipped())
+        for _ in range(6):
+            an.run_hook(self.cfg, "run_failed", "dd-claude", cwd="/repo/agent-ops")
+        self.assertEqual(len(self._posts()), 1)
+        skipped = self._skipped()[before:]
+        self.assertEqual(len(skipped), 5)
+        self.assertEqual(skipped[0]["source_event"], "hook.run_failed")
+        self.assertIn("/repo/agent-ops", skipped[0]["message"])
+        self.assertEqual(skipped[0]["window"], 5.0)
+
+    def test_different_text_is_never_a_repeat(self):
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/a")
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/b")
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/a", duration=300)
+        self.assertEqual(len(self._posts()), 3)
+
+    def test_repeat_after_the_window_is_delivered(self):
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/a")
+        with open(an._dedupe_path()) as fh:
+            seen = json.load(fh)
+        seen = {k: v - 6 for k, v in seen.items()}
+        with open(an._dedupe_path(), "w") as fh:
+            json.dump(seen, fh)
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/a")
+        self.assertEqual(len(self._posts()), 2)
+        with open(an._dedupe_path()) as fh:
+            self.assertEqual(len(json.load(fh)), 1)   # pruned to the window
+
+    def test_force_bypasses_the_window(self):
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/a")
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/a", force=True)
+        self.assertEqual(len(self._posts()), 2)
+
+    def test_window_zero_disables_it(self):
+        an.HOOK_DEDUPE_WINDOW_SECONDS = 0
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/a")
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/a")
+        self.assertEqual(len(self._posts()), 2)
+
+    def test_corrupt_bookkeeping_never_blocks_a_push(self):
+        an.ensure_state_dir(os.path.dirname(an._dedupe_path()))
+        with open(an._dedupe_path(), "w") as fh:
+            fh.write("{not json")
+        an.run_hook(self.cfg, "run_completed", "dd-claude", cwd="/repo/a")
+        self.assertEqual(len(self._posts()), 1)
+
+
+class TestVerifyDedupe(unittest.TestCase):
+    """verify: failure bursts are not a double integration; suppressed
+    repeats are observed, counted and (for turn events) the duplicate evidence."""
+
+    def test_failure_burst_is_not_a_duplicate(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 12 + i), "agent": "vp-fb", "event": "hook.run_failed",
+             "delivered": ["ntfy"]}
+            for i in (0, 4, 4, 5, 5, 7)
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(obs["vp-fb"]["duplicates"], [])
+        self.assertEqual(obs["vp-fb"]["events"]["run_failed"], 6)
+
+    def test_suppressed_turn_repeat_is_the_duplicate_evidence(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 10), "agent": "vp-sd", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 9), "agent": "vp-sd", "event": "hook.skipped_duplicate",
+             "source_event": "hook.run_completed", "message": "x"},
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        o = obs["vp-sd"]
+        self.assertEqual(o["count"], 2)
+        self.assertEqual(o["delivered"], 1)
+        self.assertEqual(o["skipped_duplicate"], 1)
+        self.assertEqual(o["events"], {"run_completed": 2})
+        self.assertEqual(len(o["duplicates"]), 1)
+        self.assertTrue(o["duplicates"][0]["suppressed"])
+        self.assertEqual(o["duplicates"][0]["gap_seconds"], 1.0)
+        self.assertIn("1 suppressed (identical push)", an._obs_sentence(o, now=now))
+
+    def test_suppressed_failure_repeat_counts_but_does_not_warn(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 10), "agent": "vp-sf", "event": "hook.run_failed",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 9), "agent": "vp-sf", "event": "hook.skipped_duplicate",
+             "source_event": "hook.run_failed", "message": "x"},
+        ]
+        obs = an.hook_observations(records, 3600, now=now)
+        self.assertEqual(obs["vp-sf"]["skipped_duplicate"], 1)
+        self.assertEqual(obs["vp-sf"]["duplicates"], [])
+
+    def test_report_row_carries_the_bucket_and_warns(self):
+        now = time.time()
+        records = [
+            {"ts": _iso(now - 10), "agent": "vp-rr", "event": "hook.run_completed",
+             "delivered": ["ntfy"]},
+            {"ts": _iso(now - 9), "agent": "vp-rr", "event": "hook.skipped_duplicate",
+             "source_event": "hook.run_completed", "message": "x"},
+        ]
+        with unittest.mock.patch.object(an, "read_history", return_value=records):
+            report = an.verify_report(an.Config(), agent="vp-rr", since_seconds=3600, now=now)
+        row = [r for r in report["agents"] if r["agent"] == "vp-rr"][0]
+        self.assertEqual(row["skipped_duplicate"], 1)
+        warns = [c for c in report["checks"] if c["status"] == an.WARN
+                 and "double integration" in c["detail"]]
+        self.assertEqual(len(warns), 1)
+        self.assertIn("suppressed", warns[0]["detail"])
+
+
+@unittest.skipUnless(shutil.which("node"), "node not available")
+class TestOpenCodePluginBehaviour(unittest.TestCase):
+    """Replays OpenCode bus events through the real plugin file under node
+    with a recording `$` - the plugin logic itself, not just its text."""
+
+    HARNESS = r"""
+const { AgentBell } = await import(process.argv[2]);
+const calls = [];
+const $ = (strings, ...values) => {
+  const parts = [];
+  strings.forEach((s, i) => { if (s.trim()) parts.push(s.trim()); if (i < values.length) {
+    const v = values[i]; Array.isArray(v) ? parts.push(...v) : parts.push(String(v)); } });
+  calls.push(parts);
+  const p = Promise.resolve({});
+  p.quiet = () => p; p.nothrow = () => p;
+  return p;
+};
+const hooks = await AgentBell({ $ });
+const script = JSON.parse(process.argv[3]);
+for (const step of script) {
+  if (step.sleep) { await new Promise(r => setTimeout(r, step.sleep)); continue; }
+  await hooks.event({ event: step });
+}
+console.log(JSON.stringify(calls));
+"""
+
+    def _run(self, script):
+        tmp = tempfile.mkdtemp(prefix="agentbell-plugin-")
+        plugin = os.path.join(tmp, "agentbell.mjs")
+        with open(plugin, "w", encoding="utf-8") as fh:
+            fh.write(an.OPENCODE_PLUGIN.replace("__AGENTBELL_BIN__", json.dumps("agentbell"))
+                     .replace("__MIN_DURATION__", str(an.HOOK_MIN_DURATION)))
+        harness = os.path.join(tmp, "harness.mjs")
+        with open(harness, "w", encoding="utf-8") as fh:
+            fh.write(self.HARNESS)
+        out = subprocess.run(["node", harness, plugin, json.dumps(script)],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        calls = json.loads(out.stdout.strip().splitlines()[-1])
+        return [c[1:] for c in calls]          # drop the binary
+
+    def test_double_idle_is_one_turn_end_with_duration(self):
+        calls = self._run([
+            {"type": "message.updated", "properties": {"info": {"role": "user", "sessionID": "s1"}}},
+            {"type": "message.updated", "properties": {"info": {"role": "assistant", "sessionID": "s1"}}},
+            {"sleep": 1100},
+            {"type": "session.idle", "properties": {"sessionID": "s1"}},
+            {"type": "session.idle", "properties": {"sessionID": "s1"}},
+        ])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:4], ["hook", "run_completed", "--agent", "opencode"])
+        self.assertIn("--min-duration", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--min-duration") + 1], str(an.HOOK_MIN_DURATION))
+        self.assertEqual(calls[0][calls[0].index("--duration") + 1], "1")
+
+    def test_unknown_duration_sends_without_threshold(self):
+        calls = self._run([{"type": "session.idle", "properties": {"sessionID": "s2"}}])
+        self.assertEqual(calls, [["hook", "run_completed", "--agent", "opencode"]])
+
+    def test_two_sessions_are_two_turn_ends(self):
+        calls = self._run([
+            {"type": "session.idle", "properties": {"sessionID": "a"}},
+            {"type": "session.idle", "properties": {"sessionID": "b"}},
+        ])
+        self.assertEqual(len(calls), 2)
+
+    def test_child_session_events_are_ignored(self):
+        calls = self._run([
+            {"type": "session.created", "properties": {"info": {"id": "child", "parentID": "root"}}},
+            {"type": "message.updated", "properties": {"info": {"role": "user", "sessionID": "child"}}},
+            {"type": "session.idle", "properties": {"sessionID": "child"}},
+            {"type": "session.error", "properties": {"sessionID": "child"}},
+            {"type": "session.idle", "properties": {"sessionID": "root"}},
+        ])
+        self.assertEqual(calls, [["hook", "run_completed", "--agent", "opencode"]])
+
+    def test_error_resets_the_turn_and_notifies(self):
+        calls = self._run([
+            {"type": "message.updated", "properties": {"info": {"role": "user", "sessionID": "e"}}},
+            {"type": "session.error", "properties": {"sessionID": "e"}},
+            {"type": "session.idle", "properties": {"sessionID": "e"}},
+        ])
+        self.assertEqual(calls[0], ["hook", "run_failed", "--agent", "opencode"])
+        self.assertEqual(calls[1], ["hook", "run_completed", "--agent", "opencode"])
 
 
 if __name__ == "__main__":

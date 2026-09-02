@@ -1,5 +1,71 @@
 # Changelog
 
+## 1.6.1 — 2026-09-03 — one buzz per event
+
+Patch release from twelve days of real use on the maintainer's machine
+(1,339 history records across Claude Code, Codex, OpenCode, Kimi Code and a
+self-integrated agent). Rationale: `DECISIONS.md` §17.
+
+### Fixed
+
+- **OpenCode no longer pushes twice for one turn, and short turns stay
+  silent.** In ~6% of turns OpenCode 1.18.26 reported the same session idle
+  twice within a second (24 same-second doubles in 415 turns); the plugin
+  now reports one turn end per session per 10 s. It also measures the turn
+  from the user's prompt (`message.updated` with role `user`) and passes
+  `--duration` together with `--min-duration 60`, so OpenCode follows the
+  same "no push for a turn you watched" rule as every other hook agent
+  (before: 0 of 415 turns were skipped as short). Re-run `agentbell hooks
+  install opencode` to update the plugin file. Until the first prompt after
+  the plugin loads the duration is unknown, and an unknown duration still
+  notifies. An older plugin file now shows as `update needed` in
+  `hooks status` and as a WARN in `doctor`, each with that command as the
+  fix — status observes, only install rewrites.
+- **An identical hook push within 5 s is suppressed.** One API outage made
+  six parallel Claude Code sessions fire `StopFailure` within seven seconds:
+  six identical "run_failed" pushes for one piece of news (29 of 43 failure
+  pushes in the sample were such repeats). The hook now claims each push
+  (agent + event + text) in a small state file; a repeat inside
+  `HOOK_DEDUPE_WINDOW_SECONDS` (5 s) is recorded as `hook.skipped_duplicate`
+  — with the text and the original event — and not sent. `--force` bypasses
+  it; a push with a different text (another project, another duration) is
+  never a repeat. Two processes claiming the same push in the same instant
+  can both win (no lock): the window collapses bursts, it does not promise
+  exactly-once.
+- **`verify` no longer calls a failure burst a "possible double
+  integration".** `run_failed` left the near-duplicate set for the reason
+  `permission_required` did in 1.6.0: it is driven from outside (one outage,
+  many sessions), and `run_completed` alone exposes a double integration.
+  Suppressed repeats now show in the report ("N suppressed (identical
+  push)") and a suppressed `run_completed` repeat still raises the
+  double-integration WARN, since a delivered pair can no longer occur.
+- **Aider block repair writes atomically and only replaces its own block**
+  (shipped on `main` after the v1.6.0 tag as b1aa21e): the `replace_stale`
+  path of `_install_block_file()` used a truncating write and did not check
+  that the marker block it replaced was agentbell's.
+
+### Changed
+
+- **Outdated Aider blocks are visible instead of silently left in place.**
+  Older `AGENTS.md` blocks told every agent that reads the shared file to
+  emit hooks attributed as `aider`. `hooks status` and text-mode `verify`
+  now show a bordered ACTION REQUIRED banner; `verify --json` reports the
+  same condition in `repair_notices`. Running `agentbell hooks install
+  aider` manually replaces only the marker-owned block with an Aider-only
+  instruction and preserves every user section outside it.
+  (Shipped on `main` after the v1.6.0 tag as 0f77fbd and listed under 1.6.0
+  in the previous changelog; the v1.6.0 release archive does not contain
+  it.)
+
+### Field-verified
+
+- Claude Code, Codex, OpenCode and Kimi Code hooks are ticked in
+  `FIELD_TEST.md` from twelve days of real turns: durations, short-turn
+  skips, failures and a needs-input event, all delivered to ntfy and
+  Telegram. OpenCode's "exactly one push per turn" failed in that sample
+  (the doubles above) and is fixed here; the fixed plugin awaits its own
+  real turns.
+
 ## 1.6.0 — 2026-08-21 — the universal agent contract: `integrate` + `verify`
 
 Twelve maintained integrations answered "does it work with mine?" twelve
@@ -54,13 +120,6 @@ needs to know an agent to work with it: it **publishes a contract** and
 - `doctor` mentions self-integrated agents seen in history on its "agent
   hooks" line and cross-links `verify`; `uninstall` lists self-integrated
   wiring under "not removed automatically".
-- **Outdated Aider blocks are visible instead of silently left in place.**
-  Older `AGENTS.md` blocks told every agent that reads the shared file to
-  emit hooks attributed as `aider`. `hooks status` and text-mode `verify`
-  now show a bordered ACTION REQUIRED banner; `verify --json` reports the
-  same condition in `repair_notices`. Running `agentbell hooks install
-  aider` manually replaces only the marker-owned block with an Aider-only
-  instruction and preserves every user section outside it.
 
 ### Fixed (found by the Tier-1 field test, see below)
 

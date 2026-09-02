@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 PROG = "agentbell"
 
 # The self-integration contract printed by `agentbell integrate` (bumped only
@@ -192,6 +192,11 @@ EVENT_ALIASES = {
 # quiet: you were still at the keyboard. Only applies when the duration is
 # known (a start marker exists) and never to failures.
 HOOK_MIN_DURATION = 60
+# An identical hook push (same agent, event and text) within this window is
+# suppressed and recorded as `hook.skipped_duplicate`: a host that emits one
+# lifecycle event twice, or six parallel sessions failing on the same API
+# outage, is one piece of news, not six buzzes. 0 disables it.
+HOOK_DEDUPE_WINDOW_SECONDS = 5.0
 
 BLOCK_START = "<!-- agentbell:start -->"
 BLOCK_END = "<!-- agentbell:end -->"
@@ -1262,6 +1267,57 @@ def read_start_marker(agent, max_age=86400):
     except OSError:
         pass
     return age
+
+
+def _dedupe_path():
+    return os.path.join(state_dir(), "runs", "last-sent.json")
+
+
+def _dedupe_key(agent, event, message):
+    raw = f"{agent}\n{event}\n{message}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:20]
+
+
+def claim_hook_send(agent, event, message, window=None, now=None):
+    """True when this exact hook push may go out.
+
+    False when an identical push (same agent, event and text) was claimed
+    less than `window` seconds ago - the caller records that as
+    `hook.skipped_duplicate` so the suppression stays visible in history and
+    `verify`. Bookkeeping lives in one small JSON file that is pruned to the
+    window on every write. Two processes claiming the same push in the same
+    instant can both win (check-then-write, no lock): the window collapses
+    bursts, it does not guarantee exactly-once - and it never loses a push
+    that is not a repeat.
+    """
+    window = HOOK_DEDUPE_WINDOW_SECONDS if window is None else window
+    if not window or window <= 0:
+        return True
+    now = time.time() if now is None else now
+    path = _dedupe_path()
+    key = _dedupe_key(agent, event, message)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            seen = json.load(fh)
+        if not isinstance(seen, dict):
+            seen = {}
+    except (OSError, ValueError):
+        seen = {}
+    last = seen.get(key)
+    if isinstance(last, (int, float)) and 0 <= now - last <= window:
+        return False
+    seen = {k: v for k, v in seen.items()
+            if isinstance(v, (int, float)) and 0 <= now - v <= window}
+    seen[key] = now
+    try:
+        ensure_state_dir(os.path.dirname(path))
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open_private(tmp, "w") as fh:
+            json.dump(seen, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass          # bookkeeping must never block a notification
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2985,12 +3041,21 @@ def _instructions_text(agent):
 # OpenCode has a real plugin API (bus events), so it gets deterministic hooks
 # instead of an instruction block the model may ignore. Verified against
 # OpenCode 1.18.18: `event` fires with session.idle / session.error and
-# session.created carries info.parentID for subagent sessions.
+# session.created carries info.parentID for subagent sessions. Real use on
+# 1.18.26 showed the same session reporting idle twice within a second for
+# ~6% of turns (v1.6.1): one turn end per session per 10 s is reported. The
+# turn's duration is measured from the user's prompt (message.updated with
+# role "user") so `--min-duration` can keep short turns silent; without a
+# seen prompt the duration is unknown and agentbell notifies, as always.
 OPENCODE_PLUGIN = """// agentbell: phone notifications for OpenCode.
 // Installed by `agentbell hooks install opencode`.
 // Remove with   `agentbell hooks uninstall opencode`.
 const BIN = __AGENTBELL_BIN__
+const MIN_DURATION = __MIN_DURATION__   // seconds; shorter turns stay silent
+const IDLE_DEDUPE_MS = 10000            // one turn end per session per 10 s
 const childSessions = new Set()
+const turnStarted = new Map()           // sessionID -> ms of the prompt that began the turn
+const lastIdle = new Map()              // sessionID -> ms of the last turn end reported
 let lastPermission = 0
 
 export const AgentBell = async ({ $ }) => {
@@ -3002,17 +3067,39 @@ export const AgentBell = async ({ $ }) => {
   }
   return {
     event: async ({ event }) => {
-      const props = (event && event.properties) || {}
+      if (!event) return
+      const props = event.properties || {}
+      const info = props.info || {}
+      const sid = props.sessionID || info.sessionID
       // subagent sessions go idle too - they would notify twice
-      if (event && event.type === "session.created" && props.info && props.info.parentID) {
-        childSessions.add(props.info.id)
+      if (event.type === "session.created" && info.parentID) {
+        childSessions.add(info.id)
         return
       }
-      if (props.sessionID && childSessions.has(props.sessionID)) return
-      if (!event) return
+      if (sid && childSessions.has(sid)) return
+      if (event.type === "message.updated") {
+        // the user's prompt starts the turn; assistant updates stream all turn long
+        if (info.role === "user" && sid && !turnStarted.has(sid)) turnStarted.set(sid, Date.now())
+        return
+      }
       if (event.type === "session.idle") {
-        await fire("hook", "run_completed", "--agent", "opencode")
+        const now = Date.now()
+        // the same session can report idle twice for one turn - one push, not two
+        if (sid && now - (lastIdle.get(sid) || 0) < IDLE_DEDUPE_MS) return
+        if (sid) {
+          if (lastIdle.size > 500) lastIdle.clear()
+          lastIdle.set(sid, now)
+        }
+        const started = sid ? turnStarted.get(sid) : undefined
+        if (sid) turnStarted.delete(sid)
+        const args = ["hook", "run_completed", "--agent", "opencode"]
+        if (started) {
+          args.push("--duration", String(Math.round((now - started) / 1000)),
+                    "--min-duration", String(MIN_DURATION))
+        }
+        await fire(...args)
       } else if (event.type === "session.error") {
+        if (sid) turnStarted.delete(sid)
         await fire("hook", "run_failed", "--agent", "opencode")
       } else if (event.type === "permission.asked" || event.type === "permission.updated") {
         // both names exist across versions; collapse them into one ping
@@ -3533,6 +3620,29 @@ def opencode_plugin_paths(project=None):
     return paths[0], paths[1:]
 
 
+def _render_opencode_plugin():
+    return (OPENCODE_PLUGIN
+            .replace("__AGENTBELL_BIN__", json.dumps(agentbell_binary()))
+            .replace("__MIN_DURATION__", str(HOOK_MIN_DURATION)))
+
+
+def opencode_plugin_stale(project=None):
+    """True when the installed plugin file is not the current rendering.
+
+    Older plugin logic (pre-1.6.1: no idle dedupe, no duration) or a binary
+    that moved both look the same from here: the file on disk is not what
+    `hooks install opencode` would write now, and only that command repairs
+    it - status commands observe, they do not rewrite (DECISIONS §16k).
+    """
+    preferred, _ = opencode_plugin_paths(project)
+    try:
+        with open(preferred, "r", encoding="utf-8") as fh:
+            current = fh.read()
+    except OSError:
+        return False
+    return current != _render_opencode_plugin()
+
+
 def install_opencode_plugin(project=None, add=True):
     """Write (or remove) the OpenCode plugin; global by default."""
     preferred, others = opencode_plugin_paths(project)
@@ -3546,8 +3656,7 @@ def install_opencode_plugin(project=None, add=True):
             os.remove(preferred)
             changed = True
         return {"changed": changed, "path": preferred}
-    content = OPENCODE_PLUGIN.replace("__AGENTBELL_BIN__",
-                                      json.dumps(agentbell_binary()))
+    content = _render_opencode_plugin()
     if os.path.lexists(preferred) and _is_symlink_refused(preferred):
         return {"changed": changed, "path": preferred}
     if os.path.exists(preferred):
@@ -3584,6 +3693,8 @@ def hooks_status(project=None):
             installed = False
         status = "installed" if installed else "not installed"
         if agent == "aider" and aider_block_state(project) == "outdated":
+            status = "update needed"
+        if agent == "opencode" and installed and opencode_plugin_stale(project):
             status = "update needed"
         rows.append((agent, status, path,
                      spec.get("reliability", "unknown")))
@@ -3999,7 +4110,8 @@ def integration_manifest(agent=None, project=None):
     status_rows = hooks_status(project=project)
     detected = set(find_agents())
     known_agents = [{"name": name, "reliability": reliability,
-                     "installed": status == "installed", "detected": name in detected}
+                     "installed": status in ("installed", "update needed"),
+                     "detected": name in detected}
                     for name, status, _, reliability in status_rows]
     events = []
     for name, spec in HOOK_EVENTS.items():
@@ -5289,8 +5401,10 @@ def doctor_checks(cfg, send=False):
                 "answer daemon not running - Telegram questions arrive without buttons",
                 "agentbell bot install-service   # runs in the background from now on"))
 
-    installed_hooks = [agent for agent, status, _, _ in hooks_status() if status == "installed"]
-    missing = [a for a in find_agents() if a not in installed_hooks]
+    status_rows = hooks_status()
+    installed_hooks = [agent for agent, status, _, _ in status_rows if status == "installed"]
+    outdated_hooks = [agent for agent, status, _, _ in status_rows if status == "update needed"]
+    missing = [a for a in find_agents() if a not in installed_hooks and a not in outdated_hooks]
     # self-integrated agents (via `agentbell integrate`) have no config we
     # check, but their history records make them visible here - text only,
     # `verify` is the command that actually assesses them
@@ -5305,6 +5419,11 @@ def doctor_checks(cfg, send=False):
         if self_integrated:
             detail += "; plus self-integrated: " + ", ".join(self_integrated)
         checks.append(_check(OK, "agent hooks", detail))
+    if outdated_hooks:
+        checks.append(_check(WARN, "agent hooks",
+                             "update needed for " + ", ".join(outdated_hooks)
+                             + " (wiring on disk is not this version's)",
+                             "agentbell hooks install " + " ".join(outdated_hooks)))
     if missing:
         checks.append(_check(WARN, "agent hooks",
                              ("found but not wired up: " if installed_hooks
@@ -5440,8 +5559,12 @@ DUPLICATE_WINDOW_SECONDS = 5.0
 # (permission_required, input_required) are excluded - an agent legitimately
 # raises several permission prompts within seconds (GitHub Copilot CLI did,
 # in the v1.6.0 field test), and hook messages are templates, so such bursts
-# are indistinguishable from duplicates by content.
-DUPLICATE_EVENTS = ("started", "run_completed", "run_failed")
+# are indistinguishable from duplicates by content. `run_failed` is excluded
+# for the same reason (v1.6.1): one API outage makes every parallel session
+# fail within seconds, and Claude Code's StopFailure fired up to six times
+# in seven seconds in real use - none of it a second integration, which
+# `run_completed` alone already exposes.
+DUPLICATE_EVENTS = ("started", "run_completed")
 
 
 def _parse_since(value):
@@ -5489,6 +5612,7 @@ def hook_observations(records, since_seconds, now=None):
             continue
         obs = agents.setdefault(agent, {
             "count": 0, "delivered": 0, "held": 0, "skipped_short": 0,
+            "skipped_duplicate": 0,
             "failed": 0, "forced": 0, "events": {},
             "last_ts": ts, "started_delivered": 0, "duplicates": [],
             "unknown_events": {}, "_last": {},
@@ -5510,6 +5634,19 @@ def hook_observations(records, since_seconds, now=None):
             obs["count"] += 1
             obs["skipped_short"] += 1
             obs["events"][short] = obs["events"].get(short, 0) + 1
+            continue
+        if event == "hook.skipped_duplicate":
+            # the hook suppressed an identical push: observed, silent - and
+            # for a turn event it IS the near-duplicate evidence, since the
+            # suppression means the delivered pair can no longer appear
+            obs["count"] += 1
+            obs["skipped_duplicate"] += 1
+            obs["events"][short] = obs["events"].get(short, 0) + 1
+            if short in DUPLICATE_EVENTS:
+                last_ts = obs["_last"].get(short)
+                gap = round(ts - last_ts, 1) if last_ts is not None else None
+                obs["duplicates"].append({"event": short, "ts": ts,
+                                          "gap_seconds": gap, "suppressed": True})
             continue
         obs["count"] += 1
         obs["events"][short] = obs["events"].get(short, 0) + 1
@@ -5547,6 +5684,8 @@ def _obs_sentence(obs, now=None):
         parts.append(f"{obs['held']} held (quiet hours / queued)")
     if obs["skipped_short"]:
         parts.append(f"{obs['skipped_short']} skipped (short turn)")
+    if obs["skipped_duplicate"]:
+        parts.append(f"{obs['skipped_duplicate']} suppressed (identical push)")
     if obs["failed"]:
         parts.append(f"{obs['failed']} reached no channel")
     detail = f"{obs['count']} event(s): " + ", ".join(parts) if parts else "0 events"
@@ -5609,6 +5748,7 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                "reliability": (AGENT_SPECS[slug].get("reliability") if known
                                else "self-integrated"),
                "count": 0, "delivered": 0, "held": 0, "skipped_short": 0,
+               "skipped_duplicate": 0,
                "failed": 0, "forced": 0, "events": {}, "last_ts": None,
                "last_age_seconds": None, "duplicates": [], "unknown_events": {}}
         name = f"agent {slug}"
@@ -5620,7 +5760,8 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
             if real_events > 0:
                 observed_any = True
             row.update({k: obs[k] for k in ("count", "delivered", "held",
-                                            "skipped_short", "failed", "forced",
+                                            "skipped_short", "skipped_duplicate",
+                                            "failed", "forced",
                                             "events", "duplicates", "unknown_events")})
             row["last_ts"] = datetime.datetime.fromtimestamp(
                 obs["last_ts"]).astimezone().isoformat(timespec="seconds")
@@ -5640,11 +5781,14 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
             elif obs["count"]:
                 checks.append(_check(OK, name, detail))
             if obs["duplicates"]:
+                suppressed = sum(1 for d in obs["duplicates"] if d.get("suppressed"))
                 checks.append(_check(
                     WARN, name,
                     f"{len(obs['duplicates'])} near-duplicate turn event(s) within "
                     f"{DUPLICATE_WINDOW_SECONDS:.0f}s - possible double integration "
-                    "(or two parallel sessions, which is fine)",
+                    "(or two parallel sessions, which is fine)"
+                    + (f"; {suppressed} of them suppressed, not delivered"
+                       if suppressed else ""),
                     "keep ONE lifecycle mechanism (hooks OR a rules block); "
                     "`agentbell history` shows each record's origin"))
             if obs["started_delivered"]:
@@ -5794,7 +5938,8 @@ def print_next_steps(cfg):
     topic = (cfg.data.get("ntfy") or {}).get("topic") or "<topic>"
     server = NtfyChannel(cfg).server()
     missing = [agent for agent in find_agents()
-               if agent not in [a for a, status, _, _ in hooks_status() if status == "installed"]]
+               if agent not in [a for a, status, _, _ in hooks_status()
+                                if status in ("installed", "update needed")]]
     print()
     print("-" * 62)
     print("NEXT STEPS (copy & paste)")
@@ -6139,6 +6284,15 @@ def run_hook(cfg, event, agent, cwd=None, duration=None, force=False, silent=Fal
                        "duration": round(float(duration), 1),
                        "min_duration": float(min_duration)})
         return {"ok": True, "skipped": "shorter than min-duration"}
+    # The same push twice within seconds is one event reported twice (a host
+    # emitting session-idle twice, parallel sessions dying on one outage, a
+    # double integration) - one buzz carries all of it. Recorded, never
+    # silent: `verify` counts these and still flags a double integration.
+    if not force and not claim_hook_send(agent, f"hook.{event}", message):
+        write_history({"event": "hook.skipped_duplicate", "agent": agent,
+                       "source_event": f"hook.{event}", "message": message,
+                       "window": HOOK_DEDUPE_WINDOW_SECONDS})
+        return {"ok": True, "skipped": "identical push within dedupe window"}
     return send_notification(
         cfg, message, title=title,
         priority=spec["prio"],
@@ -6420,6 +6574,10 @@ def cmd_hooks(args):
         print()
         print("  hook  = deterministic lifecycle hook/plugin")
         print("  rule  = instruction in a rule file (best-effort by construction)")
+        outdated = [agent for agent, status, _, _ in rows if status == "update needed"]
+        if outdated:
+            print(f"  update needed = wiring on disk is not this version's; repair with: "
+                  f"{PROG} hooks install {' '.join(outdated)}")
         return
     agents = AGENTS if "all" in args.agent else args.agent
     for agent in agents:

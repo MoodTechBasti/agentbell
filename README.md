@@ -115,7 +115,7 @@ Exit 0 means "approved **or** answered" — so if you chain `agentbell ask "Depl
 |---|---|---|---|
 | **Claude Code** | `~/.claude/settings.json` hooks | global | finished (with duration), failed, needs-input |
 | **Codex** | `~/.codex/config.toml` `[[hooks.…]]` | global | finished (with duration) |
-| **OpenCode** | real plugin in `~/.config/opencode/plugin/` | global | finished, failed, permission asked |
+| **OpenCode** | real plugin in `~/.config/opencode/plugin/` | global | finished (with duration), failed, permission asked |
 | **Gemini CLI** | `~/.gemini/settings.json` `AfterAgent` | global | finished |
 | **Kimi Code** | `~/.kimi-code/config.toml` `[[hooks]]` | global | finished (with duration), failed |
 | **Qwen Code** | `~/.qwen/settings.json` hooks | global | finished (with duration), failed |
@@ -138,7 +138,9 @@ from that project to update only agentbell's marked block; all other
 
 ### No spam while you're watching
 
-"Finished" fires after *every* turn — a 20-second answer you watched happen isn't worth a push. So for Claude Code, Codex, Kimi Code and Qwen Code the installed hook carries `--min-duration 60`: turns shorter than a minute stay silent (logged as `hook.skipped_short` in `history`, so it's never a mystery). **Failures always send a notification**, and so does any turn whose duration is unknown.
+"Finished" fires after *every* turn — a 20-second answer you watched happen isn't worth a push. So for Claude Code, Codex, OpenCode, Kimi Code and Qwen Code the installed hook carries `--min-duration 60`: turns shorter than a minute stay silent (logged as `hook.skipped_short` in `history`, so it's never a mystery). **Failures always send a notification**, and so does any turn whose duration is unknown.
+
+The same push twice within 5 s (same agent, event and text) is one piece of news: the repeat is suppressed and logged as `hook.skipped_duplicate` — a host that reports one turn end twice, or six parallel sessions failing on the same outage, buzzes once.
 
 Want a different threshold? Change the number in the hook command, or re-install:
 
