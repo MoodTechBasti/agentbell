@@ -1,15 +1,26 @@
 name: Publish to PyPI
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "MANIFEST.in"
+      - "pyproject.toml"
+      - "agentbell.py"
+      - "README.md"
+      - "LICENSE"
+      - "tests/**"
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   build:
+    name: Build and verify distributions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -18,7 +29,29 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Check package version consistency
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          import tomllib
+
+          metadata = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          package_version = metadata["project"]["version"]
+          source = pathlib.Path("agentbell.py").read_text()
+          match = re.search(r'^VERSION = "([^"]+)"$', source, re.MULTILINE)
+          if match is None:
+              raise SystemExit("could not find VERSION in agentbell.py")
+          runtime_version = match.group(1)
+          if runtime_version != package_version:
+              raise SystemExit(
+                  f"agentbell.py VERSION {runtime_version!r} does not match "
+                  f"pyproject.toml version {package_version!r}"
+              )
+          PY
+
       - name: Check tag matches package version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -35,6 +68,15 @@ jobs:
               )
           PY
 
+      - name: Check release tag points at current main
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git fetch --no-tags --depth=1 origin main:refs/remotes/origin/main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -q
+
       - name: Build and check distributions
         run: |
           python -m pip install --upgrade build twine
@@ -49,8 +91,12 @@ jobs:
           import zipfile
 
           dist = pathlib.Path("dist")
-          wheel = next(dist.glob("*.whl"))
-          sdist = next(dist.glob("*.tar.gz"))
+          wheels = list(dist.glob("*.whl"))
+          sdists = list(dist.glob("*.tar.gz"))
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+          wheel = wheels[0]
+          sdist = sdists[0]
 
           with zipfile.ZipFile(wheel) as archive:
               wheel_names = archive.namelist()
@@ -81,8 +127,11 @@ jobs:
         with:
           name: python-package-distributions
           path: dist/
+          retention-days: 7
 
   publish:
+    name: Publish distributions to PyPI
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     environment:
