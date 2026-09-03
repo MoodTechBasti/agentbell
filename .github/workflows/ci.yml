@@ -42,3 +42,18 @@ jobs:
         run: |
           python -m pip install --no-deps .
           agentbell --help
+
+  gate:
+    name: CI Gate
+    if: ${{ always() }}
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require full test matrix
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          if [ "$TEST_RESULT" != "success" ]; then
+            echo "Full test matrix result: $TEST_RESULT"
+            exit 1
+          fi
