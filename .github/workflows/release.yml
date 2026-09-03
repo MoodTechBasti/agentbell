@@ -1,0 +1,149 @@
+name: Publish to PyPI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "MANIFEST.in"
+      - "pyproject.toml"
+      - "agentbell.py"
+      - "README.md"
+      - "LICENSE"
+      - "tests/**"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Check package version consistency
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          import tomllib
+
+          metadata = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          package_version = metadata["project"]["version"]
+          source = pathlib.Path("agentbell.py").read_text()
+          match = re.search(r'^VERSION = "([^"]+)"$', source, re.MULTILINE)
+          if match is None:
+              raise SystemExit("could not find VERSION in agentbell.py")
+          runtime_version = match.group(1)
+          if runtime_version != package_version:
+              raise SystemExit(
+                  f"agentbell.py VERSION {runtime_version!r} does not match "
+                  f"pyproject.toml version {package_version!r}"
+              )
+          PY
+
+      - name: Check tag matches package version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          metadata = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          expected = "v" + metadata["project"]["version"]
+          if os.environ["RELEASE_TAG"] != expected:
+              raise SystemExit(
+                  f"tag {os.environ['RELEASE_TAG']!r} does not match {expected!r}"
+              )
+          PY
+
+      - name: Check release tag points at current main
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git fetch --no-tags --depth=1 origin main:refs/remotes/origin/main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -q
+
+      - name: Build and check distributions
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Check distribution contents
+        run: |
+          python - <<'PY'
+          import pathlib
+          import tarfile
+          import zipfile
+
+          dist = pathlib.Path("dist")
+          wheels = list(dist.glob("*.whl"))
+          sdists = list(dist.glob("*.tar.gz"))
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+          wheel = wheels[0]
+          sdist = sdists[0]
+
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_names = archive.namelist()
+              wheel_code = [name for name in wheel_names if name.endswith(".py")]
+              assert wheel_code == ["agentbell.py"], wheel_code
+              entry_points = [name for name in wheel_names
+                              if name.endswith(".dist-info/entry_points.txt")]
+              assert len(entry_points) == 1, entry_points
+              entry_text = archive.read(entry_points[0]).decode()
+              assert entry_text.strip() == (
+                  "[console_scripts]\nagentbell = agentbell:main"
+              ), entry_text
+
+          with tarfile.open(sdist) as archive:
+              sdist_names = archive.getnames()
+              sdist_code = [name for name in sdist_names if name.endswith(".py")]
+              assert len(sdist_code) == 1, sdist_code
+              relative_code = pathlib.PurePosixPath(sdist_code[0]).parts[1:]
+              assert relative_code == ("agentbell.py",), sdist_code
+
+          for name in wheel_names + sdist_names:
+              parts = pathlib.PurePosixPath(name).parts
+              assert not ({"tests", "internal"} & set(parts)), name
+              assert ".license-secret" not in parts, name
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+          retention-days: 7
+
+  publish:
+    name: Publish distributions to PyPI
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/agentbell
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

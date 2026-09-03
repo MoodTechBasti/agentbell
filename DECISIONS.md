@@ -892,3 +892,36 @@ platform-specific ACL implementation would exceed the stdlib-only thin CLI
 for this patch; `doctor` now emits a visible WARN and an `icacls` inspection
 command. This is deliberately an honest unknown, not a claim that the ACL is
 unsafe or safe.
+
+## 19. v1.6.3: PyPI distribution and trusted release (2026-09-03)
+
+**Decision:** `pipx install agentbell` is the primary end-user installation
+path; `pip install agentbell` is supported for an existing virtual
+environment. `install.sh` remains the checkout/development path and retains
+its fallbacks for machines without pipx. The runtime remains one stdlib-only
+module with one console entry point; packaging tools are release-time tools,
+not runtime dependencies.
+
+Releases are built on a `v*` tag in GitHub Actions and published from a
+separate job through PyPI Trusted Publishing. The job uses the GitHub
+environment named `pypi` and `id-token: write`; no long-lived PyPI token is
+stored in the repository. The build job checks that the tag equals the
+`pyproject.toml` version, runs the standard package build and `twine check`,
+checks the artifact contents, then hands those exact artifacts to the publish
+job. A tag/version mismatch or an archive containing tests, internal files,
+the signing secret, extra Python runtime files or a missing console entry
+point fails before publication. `MANIFEST.in` excludes the tests that
+setuptools otherwise adds to a source distribution by default.
+
+**Evidence boundary:** preparing a workflow and successfully installing a
+locally built wheel does not prove that PyPI serves the package. Until a fresh
+environment can run `pipx install agentbell`, report the released version and
+execute `agentbell doctor`, the README and field-test checklist label the
+PyPI path as in preparation. Publication proof is recorded after the tag
+workflow succeeds, not inferred from configuration.
+
+The existing purge ownership model remains unchanged. A pipx installation is
+detected with `pipx list` and removed by calling `pipx uninstall agentbell`;
+agentbell does not unlink pipx's launcher or edit its managed environment by
+hand. Hooks continue to store `agentbell_binary()`'s absolute launcher path,
+so GUI clients do not depend on inheriting the shell `PATH`.

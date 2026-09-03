@@ -7,6 +7,27 @@ v1.6.2 before changing code. All confirmed or partially confirmed cases are
 fixed here; the disposition and rejected alternatives are in
 `DECISIONS.md` §18.
 
+### Added
+
+- **PyPI release preparation.** Tags matching `v*` now build a wheel and
+  source distribution, check their metadata, transfer the exact artifacts to
+  a separate publish job and upload through PyPI Trusted Publishing. The
+  workflow uses the protected `pypi` GitHub environment and OIDC; no upload
+  token is stored in the repository. The README presents `pipx install
+  agentbell` as the pending primary path without claiming publication before
+  a fresh-environment field test. The release gate also asserts that the only
+  Python runtime file in wheel and sdist is `agentbell.py`, that the console
+  entry point is present, and that tests, `internal/` and `.license-secret`
+  are absent. Rationale: `DECISIONS.md` §19.
+
+### Verified
+
+- `agentbell uninstall` recognizes a pipx-managed package and delegates its
+  removal to `pipx uninstall agentbell`; regression tests cover both pipx
+  detection and the purge action. A real isolated pipx artifact test is
+  recorded in `FIELD_TEST.md`, while installation from public PyPI remains
+  pending publication.
+
 ### Fixed
 
 - **Concurrent `ask` processes cannot consume the same ntfy reply.** The

@@ -2445,6 +2445,36 @@ class TestPurge(unittest.TestCase):
             else:
                 os.environ["XDG_BIN_HOME"] = old_xdg
 
+    def test_pipx_list_detects_agentbell_package(self):
+        completed = an.subprocess.CompletedProcess(
+            ["/tools/pipx", "list"], 0,
+            stdout="venvs are in /tmp/pipx/venvs\n   package agentbell 1.6.3\n",
+            stderr="",
+        )
+        with unittest.mock.patch.object(
+                an.shutil, "which",
+                side_effect=lambda name: "/tools/pipx" if name == "pipx" else None), \
+                unittest.mock.patch.object(
+                    an.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(an._pipx_installed(), "/tools/pipx")
+        run.assert_called_once_with(
+            ["/tools/pipx", "list"], capture_output=True, text=True, timeout=30)
+
+    def test_pipx_package_is_removed_via_pipx(self):
+        with unittest.mock.patch.object(
+                an, "_pipx_installed", return_value="/tools/pipx"), \
+                unittest.mock.patch.object(
+                    an, "_user_site_dirs", return_value=(None, None)), \
+                unittest.mock.patch.object(
+                    an, "_pipx_uninstall", return_value=True) as uninstall:
+            report = an.purge_report(project=self.project)
+            binary = [entry for entry in report["entries"]
+                      if entry["kind"] == "binary"]
+            self.assertEqual(len(binary), 1)
+            self.assertEqual(binary[0]["action"], "pipx uninstall agentbell")
+            self.assertTrue(binary[0]["apply"]())
+        uninstall.assert_called_once_with("/tools/pipx")
+
     def test_foreign_binary_not_removed(self):
         bin_dir = os.path.join(self.home, ".local", "bin")
         script = os.path.join(bin_dir, "agentbell")

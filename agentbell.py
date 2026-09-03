@@ -1478,19 +1478,33 @@ def _acquire_consumed_lock(name):
             os.mkdir(path, 0o700)
             return path
         except FileExistsError:
+            pass
+        except PermissionError:
+            # On Windows, two concurrent mkdir calls for the same lock
+            # directory can surface ERROR_ACCESS_DENIED instead of EEXIST.
+            # Treat that as contention, never as a successful claim.
+            if os.name != "nt":
+                raise
+        try:
+            stale = time.time() - os.stat(path).st_mtime > CONSUMED_LOCK_STALE_SECONDS
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            stale = False
+        if stale:
             try:
-                stale = time.time() - os.stat(path).st_mtime > CONSUMED_LOCK_STALE_SECONDS
+                os.rmdir(path)
+                continue
             except FileNotFoundError:
                 continue
-            if stale:
-                try:
-                    os.rmdir(path)
-                except FileNotFoundError:
-                    pass
-                continue
-            if time.monotonic() >= deadline:
-                raise OSError("timed out locking the consumed-answer log")
-            time.sleep(0.01)
+            except PermissionError:
+                if os.name != "nt":
+                    raise
+        if time.monotonic() >= deadline:
+            raise OSError("timed out locking the consumed-answer log")
+        time.sleep(0.01)
 
 
 def claim_consumed(name, message_id):

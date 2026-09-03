@@ -1,4 +1,4 @@
-# FIELD TEST — 2-week checklist (v1.6.1)
+# FIELD TEST — 2-week checklist (v1.6.3)
 
 Goal: use the tool like a real user for two weeks and tick off every path below.
 Budget: ~20 minutes for the first pass, then just use it.
@@ -13,15 +13,43 @@ Budget: ~20 minutes for the first pass, then just use it.
 **Start here:**
 
 ```bash
-./install.sh
+pipx install agentbell     # pending first PyPI publication; not yet verified
 agentbell init            # wizard: topic, quiet hours, agent hooks, test push
 agentbell doctor          # should be all OK
 agentbell test            # real delivery check
 ```
 
-On Windows PowerShell, replace `./install.sh` with `py -m pip install --user .` from the checkout, and use `py -m ...` for Python commands.
+Until the first PyPI publication is proven in a fresh environment, install
+from a checkout with `./install.sh` on macOS/Linux or
+`py -m pip install --user .` on Windows PowerShell. Use `py -m ...` for Python
+commands on Windows before its Scripts directory is on `PATH`.
 
 If anything is ever unclear: **`agentbell doctor`** prints the problem *and* the command that fixes it.
+
+### PyPI release preparation result (2026-09-03)
+
+This is local artifact evidence, **not** proof that PyPI serves agentbell:
+
+- The exact PyPI JSON endpoint returned HTTP 404 before release.
+- A fresh release-tools venv built the v1.6.3 wheel and sdist; `twine check`
+  passed both. Archive inspection found `agentbell.py` as the only Python
+  runtime file and the `agentbell = agentbell:main` console entry point. No
+  tests, `internal/` files or `.license-secret` were present.
+- Fresh local-wheel installs through both `pip` and an isolated pipx 1.17.2
+  environment reported `agentbell 1.6.3`; `pip show` listed no requirements.
+  In the deliberately unconfigured pipx home, `agentbell doctor` completed
+  its checks and returned the expected exit 1 with `agentbell init` as the
+  config/topic fix.
+- A Claude hook installed in that home used the absolute pipx launcher path.
+  `agentbell uninstall` first listed `pipx uninstall agentbell` in its dry
+  run, then `--yes` removed the package, state and owned hooks. `pipx list`
+  was empty afterwards. Running the checkout's `install.sh` in the same
+  isolated home selected pipx and restored a working v1.6.3 command.
+
+Rows 1 and 19 remain pending. After the tag workflow publishes, repeat with
+`pipx install agentbell` (no local path or alternate index), record the
+served version and doctor result here, then remove the README's "in
+preparation" label.
 
 ### Current-checkout installation result (2026-08-22)
 
@@ -51,7 +79,7 @@ this retained evidence.
 
 | # | What | Command / setup | Expected |
 |---|------|-----------------|----------|
-| 1 | Install + init | `./install.sh && agentbell init` | Wizard completes, config saved, test push arrives, "NEXT STEPS" block printed |
+| 1 | Install + init | `pipx install agentbell && agentbell init` | **Pending first PyPI publication.** Fresh install reports the released version; wizard completes, config saved, test push arrives, "NEXT STEPS" block printed |
 | 2 | doctor | `agentbell doctor` | All checks OK; exit 0 |
 | 3 | Basic notify | `agentbell notify "hello" --priority high --tags test` | Push with title/priority/tags |
 | 4 | ask via ntfy (buttons) | `agentbell ask "Deploy to prod?"` | Question + Approve/Deny on the phone; CLI exits 0/1 |
@@ -70,7 +98,7 @@ this retained evidence.
 | 16 | Offline queue | point the server at a dead port, `agentbell notify "offline"` | Exit 0 + stderr warning; `queue list` shows it; after fixing, `queue flush` delivers |
 | 17 | history | `agentbell history --limit 20` | sent / suppressed / deferred / queued / ask results all visible |
 | 18 | secrets | `agentbell config show` | license, bot token, ntfy password, webhook token all redacted; `ls -l` on config.json shows `-rw-------` |
-| 19 | Full purge + re-init | `agentbell uninstall`, then `--yes`, then reinstall (`./install.sh` on macOS/Linux; `py -m pip install --user .` on Windows) and `agentbell init` | Dry run lists everything; purge removes binary/config/state/hooks/MCP and keeps foreign config |
+| 19 | Full purge + re-init | `agentbell uninstall`, then `--yes`, then `pipx install agentbell && agentbell init` | **Pending first PyPI publication.** Dry run lists the pipx package and everything else; purge uses `pipx uninstall agentbell`, removes config/state/hooks/MCP, and keeps foreign config |
 | 20 | License status | `agentbell license status` | Correct premium state |
 | 21 | Change one setting | `agentbell config set ntfy.topic <long-random>` | Written + re-subscribe hint; `doctor` turns the topic WARN into OK; no wizard needed |
 | 22 | Setup survives a hiccup | in `init`, paste a bot token while offline | Says "could not reach Telegram", offers to keep it — the license key and topic entered before are **not** lost |
