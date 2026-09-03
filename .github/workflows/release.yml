@@ -1,0 +1,101 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Check tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          metadata = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          expected = "v" + metadata["project"]["version"]
+          if os.environ["RELEASE_TAG"] != expected:
+              raise SystemExit(
+                  f"tag {os.environ['RELEASE_TAG']!r} does not match {expected!r}"
+              )
+          PY
+
+      - name: Build and check distributions
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Check distribution contents
+        run: |
+          python - <<'PY'
+          import pathlib
+          import tarfile
+          import zipfile
+
+          dist = pathlib.Path("dist")
+          wheel = next(dist.glob("*.whl"))
+          sdist = next(dist.glob("*.tar.gz"))
+
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_names = archive.namelist()
+              wheel_code = [name for name in wheel_names if name.endswith(".py")]
+              assert wheel_code == ["agentbell.py"], wheel_code
+              entry_points = [name for name in wheel_names
+                              if name.endswith(".dist-info/entry_points.txt")]
+              assert len(entry_points) == 1, entry_points
+              entry_text = archive.read(entry_points[0]).decode()
+              assert entry_text.strip() == (
+                  "[console_scripts]\nagentbell = agentbell:main"
+              ), entry_text
+
+          with tarfile.open(sdist) as archive:
+              sdist_names = archive.getnames()
+              sdist_code = [name for name in sdist_names if name.endswith(".py")]
+              assert len(sdist_code) == 1, sdist_code
+              relative_code = pathlib.PurePosixPath(sdist_code[0]).parts[1:]
+              assert relative_code == ("agentbell.py",), sdist_code
+
+          for name in wheel_names + sdist_names:
+              parts = pathlib.PurePosixPath(name).parts
+              assert not ({"tests", "internal"} & set(parts)), name
+              assert ".license-secret" not in parts, name
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/agentbell
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

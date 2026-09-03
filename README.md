@@ -35,6 +35,24 @@ agent receives decision   <-  agentbell  <-  Approve / Deny
 
 ## 60-second setup
 
+### PyPI install — in preparation
+
+The primary installation path will be `pipx`, which keeps the CLI isolated
+while making `agentbell` available on your `PATH`:
+
+```bash
+pipx install agentbell
+agentbell init     # wizard: topic name, quiet hours, agent hooks, test push
+```
+
+Inside an existing virtual environment, `pip install agentbell` will be the
+alternative. **The package is not published yet:** these commands remain
+unverified until a fresh PyPI install reports v1.6.3 and `agentbell doctor`
+completes its health check. Until that evidence is recorded in
+`FIELD_TEST.md`, use the checkout path below.
+
+### Checkout install — available now
+
 **No dev experience needed.** On macOS or Linux, open a terminal and run:
 
 ```bash
@@ -45,7 +63,7 @@ agentbell init     # wizard: topic name, quiet hours, agent hooks, test push
 
 That's it. `agentbell init` prints the next steps; `agentbell doctor` tells you exactly what's wrong and how to fix it at any point.
 
-**Windows (PowerShell):** install from the same checkout without `install.sh`:
+**Windows (PowerShell):** install from the checkout without `install.sh`:
 
 ```powershell
 git clone https://github.com/MoodTechBasti/agentbell
@@ -399,7 +417,7 @@ What this tool actually protects, and what it doesn't. Read this before you gate
 | Topic too guessable | `agentbell config set ntfy.topic <long-random>`, then re-subscribe in the app |
 | "webhook is active" | another process holds a Telegram webhook: `curl -s "https://api.telegram.org/bot<TOKEN>/deleteWebhook"`, then restart the bot |
 | Hooks don't fire | `agentbell hooks status`; for Codex check `/hooks` inside Codex |
-| Start over | macOS/Linux: `agentbell uninstall` → `--yes` → `./install.sh && agentbell init`; Windows: `py -m pip install --user .` → `agentbell init` |
+| Start over | `agentbell uninstall` → `--yes`; while PyPI publishing is pending, reinstall from a checkout with `./install.sh && agentbell init` (macOS/Linux) or `py -m pip install --user .` then `agentbell init` (Windows) |
 
 ---
 
