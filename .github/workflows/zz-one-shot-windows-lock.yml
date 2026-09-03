@@ -1,0 +1,103 @@
+name: One-shot Windows lock patch
+
+on:
+  push:
+    branches:
+      - release/pypi
+    paths:
+      - ".github/workflows/zz-one-shot-windows-lock.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: release/pypi
+
+      - name: Apply exact Windows lock contention fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("agentbell.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''def _acquire_consumed_lock(name):
+              """Acquire an atomic cross-process lock for one consumed-answer log."""
+              ensure_state_dir()
+              path = _consumed_lock_path(name)
+              deadline = time.monotonic() + CONSUMED_LOCK_TIMEOUT_SECONDS
+              while True:
+                  try:
+                      os.mkdir(path, 0o700)
+                      return path
+                  except FileExistsError:
+                      try:
+                          stale = time.time() - os.stat(path).st_mtime > CONSUMED_LOCK_STALE_SECONDS
+                      except FileNotFoundError:
+                          continue
+                      if stale:
+                          try:
+                              os.rmdir(path)
+                          except FileNotFoundError:
+                              pass
+                          continue
+                      if time.monotonic() >= deadline:
+                          raise OSError("timed out locking the consumed-answer log")
+                      time.sleep(0.01)
+          '''
+          new = '''def _acquire_consumed_lock(name):
+              """Acquire an atomic cross-process lock for one consumed-answer log."""
+              ensure_state_dir()
+              path = _consumed_lock_path(name)
+              deadline = time.monotonic() + CONSUMED_LOCK_TIMEOUT_SECONDS
+              while True:
+                  try:
+                      os.mkdir(path, 0o700)
+                      return path
+                  except FileExistsError:
+                      pass
+                  except PermissionError:
+                      # On Windows, two concurrent mkdir calls for the same lock
+                      # directory can surface ERROR_ACCESS_DENIED instead of EEXIST.
+                      # Treat that as contention, never as a successful claim.
+                      if os.name != "nt":
+                          raise
+                  try:
+                      stale = time.time() - os.stat(path).st_mtime > CONSUMED_LOCK_STALE_SECONDS
+                  except FileNotFoundError:
+                      continue
+                  except PermissionError:
+                      if os.name != "nt":
+                          raise
+                      stale = False
+                  if stale:
+                      try:
+                          os.rmdir(path)
+                          continue
+                      except FileNotFoundError:
+                          continue
+                      except PermissionError:
+                          if os.name != "nt":
+                              raise
+                  if time.monotonic() >= deadline:
+                      raise OSError("timed out locking the consumed-answer log")
+                  time.sleep(0.01)
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected lock function not found exactly once; refusing to patch")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+          git diff --check
+          test "$(git diff --name-only)" = "agentbell.py"
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agentbell.py
+          git commit -m "fix: handle Windows lock contention for approval claims"
+          git push origin HEAD:release/pypi
