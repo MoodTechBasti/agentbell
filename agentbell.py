@@ -1798,8 +1798,12 @@ def _reclaim_stale(directory, max_age=CLAIM_MAX_AGE_SECONDS):
     return reclaimed
 
 
+def _item_sort_key(item):
+    return float(item.get("created", 0)), int(item.get("created_ns", 0))
+
+
 def _prune_items(directory, max_items, overflow_event):
-    items = sorted(_read_item_files(directory), key=lambda pair: pair[1].get("created", 0))
+    items = sorted(_read_item_files(directory), key=lambda pair: _item_sort_key(pair[1]))
     dropped = 0
     while len(items) > max_items:
         name, _ = items.pop(0)
@@ -1816,8 +1820,10 @@ def enqueue_item(cfg, item):
     """Persist a failed notification for later delivery (bounded queue)."""
     directory = ensure_state_dir(queue_dir())
     item = dict(item)
+    created_ns = time.time_ns()
     item.setdefault("id", secrets.token_hex(8))
-    item.setdefault("created", time.time())
+    item.setdefault("created", created_ns / 1_000_000_000)
+    item.setdefault("created_ns", created_ns)
     item.setdefault("attempts", 0)
     path = os.path.join(directory, f"{item['id']}.json")
     with open_private(path, "w") as fh:
@@ -1829,10 +1835,13 @@ def enqueue_item(cfg, item):
 def defer_item(cfg, message, title=None, priority="normal", tags=None,
                channels=None, event="notify"):
     """Hold a notification until the current quiet window ends."""
-    deliver_after = next_quiet_end(cfg.data.get("quiet_hours") or []) or time.time()
+    created_ns = time.time_ns()
+    created = created_ns / 1_000_000_000
+    deliver_after = next_quiet_end(cfg.data.get("quiet_hours") or []) or created
     item = {
         "id": secrets.token_hex(8),
-        "created": time.time(),
+        "created": created,
+        "created_ns": created_ns,
         "deliver_after": deliver_after,
         "message": message,
         "title": title,
@@ -1863,7 +1872,7 @@ def drain_queue(cfg, limit=None, timeout=QUEUE_TIMEOUT, deadline=None):
     now = time.time()
     # oldest first, as documented - file names are random ids, not timestamps
     for name, item in sorted(_read_item_files(directory),
-                             key=lambda pair: float(pair[1].get("created", 0))):
+                             key=lambda pair: _item_sort_key(pair[1])):
         if limit is not None and stats["processed"] >= limit:
             break
         if deadline is not None and time.time() >= deadline:
@@ -1982,7 +1991,7 @@ def _flush_due_items(cfg, directory, due, timeout, stats=None):
             return stats
         # oldest first: the summary should read like a timeline, but file
         # names are random ids, so sort explicitly
-        claimed.sort(key=lambda triple: float(triple[1].get("created", 0)))
+        claimed.sort(key=lambda triple: _item_sort_key(triple[1]))
         items = [item for _, item, _ in claimed]
         lines = []
         for item in items:
@@ -5303,7 +5312,7 @@ def queue_list_data():
     now = time.time()
     queued = []
     for _, item in sorted(_read_item_files(queue_dir()),
-                          key=lambda pair: float(pair[1].get("created", 0))):
+                          key=lambda pair: _item_sort_key(pair[1])):
         queued.append({
             "id": item.get("id"),
             "created": float(item.get("created", 0)),
@@ -5318,7 +5327,7 @@ def queue_list_data():
         })
     deferred = []
     for _, item in sorted(_read_item_files(deferred_dir()),
-                          key=lambda pair: float(pair[1].get("created", 0))):
+                          key=lambda pair: _item_sort_key(pair[1])):
         deferred.append({
             "id": item.get("id"),
             "created": float(item.get("created", 0)),

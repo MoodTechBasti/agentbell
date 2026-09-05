@@ -35,23 +35,22 @@ agent receives decision   <-  agentbell  <-  Approve / Deny
 
 ## 60-second setup
 
-### PyPI install — in preparation
+### PyPI install
 
-The primary installation path will be `pipx`, which keeps the CLI isolated
-while making `agentbell` available on your `PATH`:
+`pipx` keeps the CLI isolated while making `agentbell` available on your
+`PATH`:
 
 ```bash
 pipx install agentbell
 agentbell init     # wizard: topic name, quiet hours, agent hooks, test push
 ```
 
-Inside an existing virtual environment, `pip install agentbell` will be the
-alternative. **The package is not published yet:** these commands remain
-unverified until a fresh PyPI install reports v1.6.3 and `agentbell doctor`
-completes its health check. Until that evidence is recorded in
-`FIELD_TEST.md`, use the checkout path below.
+Inside an existing virtual environment, `pip install agentbell` is the
+alternative. Verified: a fresh `pip install agentbell` in a clean venv
+installs v1.6.3 from PyPI and `agentbell doctor` runs its health check —
+evidence in `FIELD_TEST.md`.
 
-### Checkout install — available now
+### Checkout install — also works
 
 **No dev experience needed.** On macOS or Linux, open a terminal and run:
 
@@ -417,7 +416,7 @@ What this tool actually protects, and what it doesn't. Read this before you gate
 | Topic too guessable | `agentbell config set ntfy.topic <long-random>`, then re-subscribe in the app |
 | "webhook is active" | another process holds a Telegram webhook: `curl -s "https://api.telegram.org/bot<TOKEN>/deleteWebhook"`, then restart the bot |
 | Hooks don't fire | `agentbell hooks status`; for Codex check `/hooks` inside Codex |
-| Start over | `agentbell uninstall` → `--yes`; while PyPI publishing is pending, reinstall from a checkout with `./install.sh && agentbell init` (macOS/Linux) or `py -m pip install --user .` then `agentbell init` (Windows) |
+| Start over | `agentbell uninstall` → `--yes`, then `pipx install agentbell && agentbell init` (or `./install.sh` from a checkout) |
 
 ---
 
