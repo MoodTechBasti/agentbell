@@ -13,7 +13,7 @@ Budget: ~20 minutes for the first pass, then just use it.
 **Start here:**
 
 ```bash
-pipx install agentbell     # published on PyPI, verified below
+pipx install agentbell     # published on PyPI (pip install verified below)
 agentbell init            # wizard: topic, quiet hours, agent hooks, test push
 agentbell doctor          # should be all OK
 agentbell test            # real delivery check
@@ -60,7 +60,7 @@ Proof that PyPI itself serves the package, not just a local wheel:
   license, agent hooks, MCP, state dir) and correctly flagged the two
   expected pre-`init` gaps (no config, no topic) with their fix commands.
 
-Row 1 and Row 19 below are updated to reflect this. `pipx` itself was not
+Rows 1 and 19 below are updated to reflect this. `pipx` itself was not
 re-tested in this pass (sandbox has no `pipx`); the isolated-pipx result
 from 2026-09-03 above still stands as pipx-specific evidence.
 
