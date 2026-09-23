@@ -3509,7 +3509,7 @@ def _codex_insert_features_flag(text):
             + "".join(lines[index:]))
 
 
-def _write_text_atomic(path, text):
+def _write_text_atomic(path, text, newline=None):
     """Replace `path` without following a symlink planted at the temp name.
 
     A hostile repo can ship `AGENTS.md.tmp` as a symlink to `~/.bashrc`.
@@ -3523,6 +3523,8 @@ def _write_text_atomic(path, text):
     leave a dotfiles checkout holding the old hooks. Rule files still
     refuse a symlink destination before they call this. Keep the mode the
     destination already had, so a 0600 Codex or Kimi config stays 0600.
+    `newline=""` writes `text` as is: text read with newline="" keeps its
+    CRLFs on every OS.
     """
     destination = os.path.realpath(path) if os.path.islink(path) else path
     directory = os.path.dirname(destination)
@@ -3546,7 +3548,7 @@ def _write_text_atomic(path, text):
     if handle is None:
         raise OSError(errno.EEXIST, "cannot create temp file", tmp)
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+        with os.fdopen(handle, "w", encoding="utf-8", newline=newline) as fh:
             fh.write(text)
         os.chmod(tmp, mode)
         os.replace(tmp, destination)
@@ -3749,6 +3751,60 @@ def _drop_toml_block(text, block):
     return new_text, new_text != text
 
 
+_TOML_KEY_PART = r"""(?:"[^"\\\n]*"|'[^'\n]*'|[A-Za-z0-9_-]+)"""
+_TOML_KEY_RE = re.compile(r"\s*" + _TOML_KEY_PART + r"(?:\s*\.\s*" + _TOML_KEY_PART + r")*\s*")
+
+
+def _toml_key_path(key):
+    """`hooks . "Stop"` -> ("hooks", "Stop"); None when `key` is not a TOML key."""
+    if not _TOML_KEY_RE.fullmatch(key):
+        return None
+    return tuple(part[1:-1] if part[0] in "\"'" else part
+                 for part in re.findall(_TOML_KEY_PART, key))
+
+
+def _toml_array_clash(text, arrays):
+    """How `text` already defines one of our [[array]] tables some other way.
+
+    Our blocks append [[hooks.Stop]] (Codex) or [[hooks]] (Kimi) tables.
+    That is only valid TOML while the name is unused or an array of
+    tables: `hooks = {...}`, `Stop = [...]` under [hooks], a dotted
+    `hooks.Stop.x = 1` or a plain [hooks.Stop] table make the whole config
+    unloadable. Returns what clashes (for the note), or "" when nothing does.
+    """
+    values, tables, seen_arrays = [], [], []
+    current, in_array = (), False
+    for line in text.splitlines():
+        header = _toml_header_key(line)
+        if header:
+            current = _toml_key_path(header.strip("[]")) or ()
+            in_array = header.startswith("[[") or any(
+                current[:len(array)] == array for array in seen_arrays)
+            if header.startswith("[["):
+                seen_arrays.append(current)
+            elif not in_array:
+                tables.append(current)
+            continue
+        key, sep, _value = _strip_toml_comment(line).partition("=")
+        path = _toml_key_path(key) if sep and not in_array else None
+        if path:
+            values.append(current + path)
+    for array in arrays:
+        for path in tables:
+            if path[:len(array)] == array and (path == array or array not in seen_arrays):
+                return "[" + ".".join(path) + "]"
+        for path in values:
+            if path[:len(array)] == array[:len(path)]:
+                return ".".join(path[:len(array)]) + " = ..."
+    return ""
+
+
+def _inline_hooks_note(agent, clash, tables):
+    return (f"{agent}: your config already has `{clash}`, so agentbell's {tables} "
+            "hook tables would make it invalid TOML - nothing was written. Move "
+            f"those hooks into {tables} tables, then run: {PROG} hooks install {agent}")
+
+
 def install_codex_hooks():
     path = codex_config_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -3777,8 +3833,9 @@ def install_codex_hooks():
     else:
         text = ""
     notes = []
-    if re.search(r"^\[hooks\.Stop\]\s*$", text, re.M):
-        notes.append("codex: found [hooks.Stop] as plain table; skipped to avoid breaking config")
+    clash = _toml_array_clash(text, [("hooks", "UserPromptSubmit"), ("hooks", "Stop")])
+    if clash:
+        notes.append(_inline_hooks_note("codex", clash, "[[hooks.<Event>]]"))
         return {"changed": False, "notes": notes}
     if _codex_features_need_note(text) == "conflict":
         # the config already sets `features` somehow, so a second definition
@@ -4259,6 +4316,9 @@ def install_kimi_hooks():
                               "agentbell markers are gone. Nothing was added, so the "
                               "hooks are not duplicated. uninstall removes a command "
                               "only when it is exactly ours"]}
+    clash = _toml_array_clash(text, [("hooks",)])
+    if clash:
+        return {"changed": False, "notes": [_inline_hooks_note("kimi", clash, "[[hooks]]")]}
     block = kimi_hooks_block()
     with open(path, "a", encoding="utf-8") as fh:
         if text and not text.endswith("\n"):
@@ -4748,7 +4808,69 @@ def mcp_tool_call(name, arguments):
     raise RuntimeError(f"unknown tool: {name}")
 
 
+def _rpc_error(request_id, code, message):
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def mcp_handle(request):
+    """One JSON-RPC message -> its response, or None when none is allowed."""
+    if not isinstance(request, dict):
+        return _rpc_error(None, -32600, "invalid request: expected a JSON object")
+    method = request.get("method")
+    if "id" not in request:
+        # A notification: JSON-RPC forbids any reply, even an error. The
+        # notifications/* ones need no action here; anything else is a
+        # client bug that must not run a tool unasked - leave a trace.
+        if not str(method).startswith("notifications/"):
+            sys.stderr.write(f"{PROG}: mcp: ignored {method!r} without an id "
+                             "(JSON-RPC notification, no reply allowed)\n")
+        return None
+    request_id = request.get("id")
+    if not isinstance(method, str):
+        return _rpc_error(request_id, -32600, "invalid request: 'method' must be a string")
+    params = request.get("params") or {}
+    if not isinstance(params, dict):
+        return _rpc_error(request_id, -32602, "invalid params: expected an object")
+    response = {"jsonrpc": "2.0", "id": request_id}
+    try:
+        if method == "initialize":
+            response["result"] = {
+                "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "agentbell", "version": VERSION},
+            }
+        elif method == "ping":
+            response["result"] = {}
+        elif method == "tools/list":
+            response["result"] = {"tools": MCP_TOOLS}
+        elif method == "tools/call":
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            if not isinstance(arguments, dict):
+                return _rpc_error(request_id, -32602, "invalid params: 'arguments' must be an object")
+            try:
+                text = mcp_tool_call(name, arguments)
+                response["result"] = {"content": [{"type": "text", "text": text}]}
+            except (RuntimeError, SystemExit) as exc:
+                # SystemExit: Config() refuses a broken config.json that way,
+                # which must fail this call, not end the server
+                response["result"] = {
+                    "content": [{"type": "text", "text": f"error: {exc}"}],
+                    "isError": True,
+                }
+        else:
+            response["error"] = {"code": -32601, "message": f"method not found: {method}"}
+    except Exception as exc:  # noqa: BLE001
+        response["error"] = {"code": -32603, "message": str(exc)}
+    return response
+
+
 def mcp_loop():
+    """The stdio server: one JSON-RPC message (or batch) per line.
+
+    Nothing a client sends may end it: junk gets a parse error, a batch
+    gets a batch of replies, notifications get none.
+    """
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
     for raw_line in stdin:
@@ -4756,41 +4878,18 @@ def mcp_loop():
         if not line:
             continue
         try:
-            request = json.loads(line)
-        except ValueError:
-            continue
-        if request.get("method") == "notifications/initialized":
-            continue
-        request_id = request.get("id")
-        method = request.get("method")
-        params = request.get("params") or {}
-        response = {"jsonrpc": "2.0", "id": request_id}
-        try:
-            if method == "initialize":
-                response["result"] = {
-                    "protocolVersion": params.get("protocolVersion", "2024-11-05"),
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "agentbell", "version": VERSION},
-                }
-            elif method == "ping":
-                response["result"] = {}
-            elif method == "tools/list":
-                response["result"] = {"tools": MCP_TOOLS}
-            elif method == "tools/call":
-                name = params.get("name")
-                arguments = params.get("arguments") or {}
-                try:
-                    text = mcp_tool_call(name, arguments)
-                    response["result"] = {"content": [{"type": "text", "text": text}]}
-                except RuntimeError as exc:
-                    response["result"] = {
-                        "content": [{"type": "text", "text": f"error: {exc}"}],
-                        "isError": True,
-                    }
+            message = json.loads(line)
+        except (ValueError, RecursionError) as exc:     # RecursionError: "[[[[..."
+            response = _rpc_error(None, -32700, f"parse error: {exc}")
+        else:
+            if isinstance(message, list) and message:
+                response = [reply for reply in map(mcp_handle, message) if reply is not None]
+            elif isinstance(message, list):
+                response = _rpc_error(None, -32600, "invalid request: empty batch")
             else:
-                response["error"] = {"code": -32601, "message": f"method not found: {method}"}
-        except Exception as exc:  # noqa: BLE001
-            response["error"] = {"code": -32603, "message": str(exc)}
+                response = mcp_handle(message)
+        if not response:
+            continue    # notifications only: no reply at all, not even []
         stdout.write((json.dumps(response) + "\n").encode("utf-8"))
         stdout.flush()
 
@@ -4877,14 +4976,57 @@ def _mcp_upsert_json(path, container, entry):
     return f"written to {path}"
 
 
+CODEX_MCP_TABLE = ("mcp_servers", "agentbell")
+
+
+def _codex_mcp_spans(lines):
+    """(start, end, key path) line ranges of [mcp_servers.agentbell] and its sub-tables.
+
+    A range runs from the header to the table's last key line. Comments
+    and blank lines after that belong to what follows - another tool's
+    marker block, a commented-out table - and are not ours to delete.
+    """
+    spans = []
+    start = last = name = None
+    for index, line in enumerate(lines):
+        header = _toml_header_key(line)
+        if header:
+            if start is not None:
+                spans.append((start, last + 1, name))
+                start = None
+            name = _toml_key_path(header.strip("[]")) or ()
+            if name[:2] == CODEX_MCP_TABLE:
+                start = last = index
+        elif start is not None and _strip_toml_comment(line).strip():
+            last = index
+    if start is not None:
+        spans.append((start, last + 1, name))
+    return spans
+
+
 def _mcp_add_codex(binary):
     path = codex_config_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     text = ""
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8", newline="") as fh:
             text = fh.read()
-    if "[mcp_servers.agentbell]" in text:
+    lines = text.splitlines(keepends=True)
+    for start, end, name in _codex_mcp_spans(lines):
+        if name != CODEX_MCP_TABLE:
+            continue
+        # A moved install (checkout -> pipx) leaves the old path behind:
+        # repair it like the JSON clients do. The other keys stay as they are.
+        for index in range(start + 1, end):
+            key, sep, value = _strip_toml_comment(lines[index]).partition("=")
+            if not sep or key.strip() != "command":
+                continue
+            if _toml_unquote(value) == binary:
+                return "already present"
+            ending = lines[index][len(lines[index].rstrip("\r\n")):]
+            lines[index] = f"command = {toml_string(binary)}{ending}"
+            _write_text_atomic(path, "".join(lines), newline="")
+            return f"updated the command path in {path}"
         return "already present"
     with open(path, "a", encoding="utf-8") as fh:
         if text and not text.endswith("\n"):
@@ -5505,34 +5647,29 @@ def _remove_mcp_server_key(path, container):
 
 
 def _remove_codex_mcp_block():
-    """Remove the [mcp_servers.agentbell] TOML block added by mcp add."""
+    """Remove the [mcp_servers.agentbell] TOML block added by mcp add.
+
+    Only our table and its sub-tables go; every other byte stays, CRLFs
+    included. Deleting up to the next header took the comment lines after
+    our table with it - an agent-ops marker block, for one.
+    """
     path = codex_config_path()
     if not os.path.exists(path):
         return False
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, "r", encoding="utf-8", newline="") as fh:
         text = fh.read()
-    if "[mcp_servers.agentbell]" not in text:
-        return False
     lines = text.splitlines(keepends=True)
-    out = []
-    skipping = False
-    changed = False
-    for line in lines:
-        stripped = line.strip()
-        if skipping:
-            if stripped.startswith("["):
-                skipping = False
-            else:
-                changed = True
-                continue
-        if stripped == "[mcp_servers.agentbell]":
-            skipping = True
-            changed = True
-            continue
-        out.append(line)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("".join(out))
-    return changed
+    spans = _codex_mcp_spans(lines)
+    if not spans:
+        return False
+    for start, end, _name in reversed(spans):
+        # with a blank line above, the blank lines below would double it
+        if start == 0 or not lines[start - 1].strip():
+            while end < len(lines) and not lines[end].strip():
+                end += 1
+        del lines[start:end]
+    _write_text_atomic(path, "".join(lines), newline="")
+    return True
 
 
 def _agent_hook_entries():
