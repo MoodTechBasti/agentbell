@@ -140,7 +140,9 @@ MIN_GUESSABLE_TOPIC_LEN = 16
 RESPONSE_SUFFIX = "-responses"
 MAX_TOPIC_LEN = 64 - len(RESPONSE_SUFFIX)
 
-TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# fullmatch only: "$" also matched before a trailing newline, and the
+# length is checked on its own so an overlong topic is called that
+TOPIC_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 # An approval warning must be narrow: routine questions should retain the
 # lightweight free ntfy flow. These patterns cover high-impact actions where a
@@ -676,8 +678,10 @@ def normalize_server(value):
     try:
         parts = urllib.parse.urlsplit(server)   # ValueError: "http://[::1"
         parts.port                              # ValueError: "8o80", 99999
-        # "?" / "#" would swallow the "/<topic>" appended to every URL
-        valid = bool(parts.hostname) and not re.search(r"[\s\x00-\x1f\x7f?#]", server)
+        # "?" / "#" would swallow the "/<topic>" appended to every URL; a host
+        # "http"/"https" is a mistyped scheme ("https//x" became https://https//x)
+        valid = parts.hostname not in (None, "", "http", "https") \
+            and not re.search(r"[\s\x00-\x1f\x7f?#]", server)
     except ValueError:
         valid = False
     if not valid:
@@ -884,7 +888,7 @@ def toml_string(value):
 
 
 def validate_topic(topic):
-    if not TOPIC_RE.match(topic or ""):
+    if not TOPIC_RE.fullmatch(topic or "") or len(topic) > 64:
         raise RuntimeError(
             f"invalid ntfy topic '{topic}'. Allowed: a-z, A-Z, 0-9, '-', '_' (max 64 chars). "
             "Run 'agentbell init' if not configured yet."
@@ -7561,7 +7565,7 @@ def rate_topic(topic):
     FAIL: ntfy rejects it, or '<topic>-responses' (what `ask` listens on)
     would not fit in ntfy's 64 characters. WARN: guessable on a public server.
     """
-    if not TOPIC_RE.match(topic or ""):
+    if not TOPIC_RE.fullmatch(topic or ""):
         return FAIL, "is not valid (allowed: a-z A-Z 0-9 - _)"
     if len(topic) > MAX_TOPIC_LEN:
         return FAIL, (f"is too long ({len(topic)} chars, max {MAX_TOPIC_LEN}) - 'ask' "
@@ -7570,6 +7574,14 @@ def rate_topic(topic):
         return WARN, ("short topic - guessable on a public server; anyone who knows it "
                       "can read your notifications and send fake approvals")
     return OK, None
+
+
+def _ntfy_in_use(cfg):
+    """False only when Telegram carries both notifications and approvals:
+    `ask`, and a Telegram channel without premium, fall back to ntfy."""
+    channels = cfg.channels()
+    return "ntfy" in channels or not (
+        "telegram" in channels and premium_enabled(cfg) and cfg.telegram_ready())
 
 
 def _path_fix_hint():
@@ -7620,37 +7632,45 @@ def doctor_checks(cfg, send=False):
         else:
             checks.append(_check(OK, "config", cfg.path))
 
-    topic = (cfg.data.get("ntfy") or {}).get("topic") or ""
-    try:
-        server = NtfyChannel(cfg).server()
-    except RuntimeError as exc:
-        # a hand-edited config: report it, the rest of the checks still run
-        server = None
-        checks.append(_check(FAIL, "ntfy server", str(exc),
-                             f"agentbell config set ntfy.server {DEFAULT_NTFY_SERVER}"))
-    topic_status, topic_problem = rate_topic(topic)
-    if not topic:
-        checks.append(_check(FAIL, "ntfy topic", "not configured", "agentbell init"))
-    elif topic_status == FAIL:
-        checks.append(_check(FAIL, "ntfy topic", f"'{topic}' {topic_problem}",
-                             "agentbell init"))
+    if not _ntfy_in_use(cfg):
+        # a Telegram-only setup used to FAIL on an unreachable ntfy.sh
+        checks.append(_check(OK, "ntfy", "not used - Telegram carries notifications "
+                             "and approvals"))
     else:
-        detail = f"{server}/{topic}" if server else topic
-        if topic_status == WARN:
-            checks.append(_check(WARN, "ntfy topic", f"{detail}  ({topic_problem})",
-                                 f"agentbell config set ntfy.topic {suggest_topic()}"))
-        else:
-            checks.append(_check(OK, "ntfy topic", detail))
-    if server and TOPIC_RE.match(topic):
+        topic = (cfg.data.get("ntfy") or {}).get("topic") or ""
         try:
-            NtfyChannel(cfg).poll(topic, int(time.time()), timeout=8.0)
-            checks.append(_check(OK, "ntfy server", f"{server} reachable"))
-        except PermanentError as exc:
-            checks.append(_check(FAIL, "ntfy server", f"{server} refused the request: {exc}",
-                                 "check ntfy.auth / the topic name: agentbell config show"))
+            server = NtfyChannel(cfg).server()
         except RuntimeError as exc:
-            checks.append(_check(FAIL, "ntfy server", f"{server} unreachable: {exc}",
-                                 "check your network, then: agentbell queue flush"))
+            # a hand-edited config: report it, the rest of the checks still run
+            server = None
+            checks.append(_check(FAIL, "ntfy server", str(exc),
+                                 # never ntfy.sh: that moved a self-hosted typo to the
+                                 # public server under the same topic
+                                 "agentbell config set ntfy.server <url>   "
+                                 "# your server, e.g. http://host:8080"))
+        topic_status, topic_problem = rate_topic(topic)
+        if not topic:
+            checks.append(_check(FAIL, "ntfy topic", "not configured", "agentbell init"))
+        elif topic_status == FAIL:
+            checks.append(_check(FAIL, "ntfy topic", f"'{topic}' {topic_problem}",
+                                 "agentbell init"))
+        else:
+            detail = f"{server}/{topic}" if server else topic
+            if topic_status == WARN:
+                checks.append(_check(WARN, "ntfy topic", f"{detail}  ({topic_problem})",
+                                     f"agentbell config set ntfy.topic {suggest_topic()}"))
+            else:
+                checks.append(_check(OK, "ntfy topic", detail))
+        if server and topic_status != FAIL:
+            try:
+                NtfyChannel(cfg).poll(topic, int(time.time()), timeout=8.0)
+                checks.append(_check(OK, "ntfy server", f"{server} reachable"))
+            except PermanentError as exc:
+                checks.append(_check(FAIL, "ntfy server", f"{server} refused the request: {exc}",
+                                     "check ntfy.auth / the topic name: agentbell config show"))
+            except RuntimeError as exc:
+                checks.append(_check(FAIL, "ntfy server", f"{server} unreachable: {exc}",
+                                     "check your network, then: agentbell queue flush"))
 
     channels = cfg.channels()
     checks.append(_check(OK, "channels", ", ".join(channels)))
@@ -7931,7 +7951,7 @@ def _normalized_project(project=None):
 
 
 def _project_matches(recorded, requested):
-    if not recorded:
+    if not recorded or not isinstance(recorded, str):   # a hand-edited record
         return False
     recorded = _normalized_project(recorded)
     requested = _normalized_project(requested)
@@ -8081,6 +8101,12 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
     topic = (cfg.data.get("ntfy") or {}).get("topic") or ""
     # the problem text never contains the topic itself (see the docstring)
     topic_status, topic_problem = rate_topic(topic)
+    server_valid = True
+    if _ntfy_in_use(cfg):
+        try:
+            NtfyChannel(cfg).server()
+        except RuntimeError:
+            server_valid = False
     if not os.path.exists(cfg.path):
         checks.append(_check(FAIL, "delivery", "no config yet - nothing can be delivered",
                              "agentbell init"))
@@ -8089,6 +8115,9 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
     elif topic_status == FAIL:
         checks.append(_check(FAIL, "delivery", f"the configured ntfy topic {topic_problem}",
                              "agentbell init"))
+    elif not server_valid:
+        checks.append(_check(FAIL, "delivery", "the configured ntfy server URL is not valid "
+                             "- every ntfy send is refused", "agentbell doctor"))
     elif topic_status == WARN:
         checks.append(_check(WARN, "delivery", f"config present, but {topic_problem}",
                              "agentbell doctor   # prints a replacement topic"))
@@ -8106,8 +8135,16 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                              "agentbell doctor   # prints the exact PATH fix command"))
 
     damage = {}
-    observations = hook_observations(
-        read_history(limit=0, damage=damage), since_seconds, now=now, project=project)
+    try:
+        records = read_history(limit=0, damage=damage)
+    except OSError as exc:
+        # str(exc) names the file, which verify never prints
+        records = []
+        checks.append(_check(WARN, "history",
+                             f"the history cannot be read ({exc.strerror or 'OSError'}) - "
+                             "no event can be observed",
+                             "agentbell doctor   # names the file"))
+    observations = hook_observations(records, since_seconds, now=now, project=project)
     note = history_damage_note(damage)
     if note:
         checks.append(_check(WARN, "history", note + " - the rest was read",
@@ -8289,12 +8326,38 @@ def cmd_verify(args):
 # Commands
 # ---------------------------------------------------------------------------
 
-def _same_ntfy_server(left, right):
-    """True when two server values are the same host after normalization."""
+def _ntfy_server_identity(value):
+    """What makes two server values the same server: letter case, a trailing
+    slash and an explicit default port do not. An empty value is the default
+    server - that is where its credential was sent."""
     try:
-        return normalize_server(left) == normalize_server(right)
+        parts = urllib.parse.urlsplit(normalize_server(value or DEFAULT_NTFY_SERVER))
     except RuntimeError:
+        # never used for a send (a port like "8o80"): correcting it on the
+        # same host keeps the credential, so only scheme and host count
+        text = str(value).strip()
+        match = re.match(r"([A-Za-z][A-Za-z0-9+.-]*)://([^/:?#@\s]*)",
+                         text if "://" in text else "https://" + text)
+        return (match.group(1).lower(), match.group(2).lower()) if match else None
+    scheme = parts.scheme.lower()
+    return (scheme, parts.hostname,
+            parts.port or (443 if scheme == "https" else 80), parts.path)
+
+
+def _forget_ntfy_credentials(ntfy, old_server, new_server):
+    """Clear ntfy.auth and ntfy.action_auth when the server really changes -
+    the next send or ask would hand them to the new server. The one rule for
+    `config set ntfy.server` and init. Returns whether the server changed."""
+    old, new = _ntfy_server_identity(old_server), _ntfy_server_identity(new_server)
+    if old and new and old[:len(new)] == new[:len(old)]:
         return False
+    for cred, label in (("auth", "password"), ("action_auth", "action token")):
+        if ntfy.get(cred):
+            ntfy[cred] = None
+            sys.stderr.write(f"{PROG}: ntfy server changed; ntfy.{cred} was cleared - not "
+                             f"sending the saved ntfy {label} to the new server (set it "
+                             f"again: agentbell config set ntfy.{cred} ...)\n")
+    return True
 
 
 def suggest_topic():
@@ -8447,31 +8510,20 @@ def cmd_init(args):
         print(f"    {ntfy['topic']}")
         print(f"    {ntfy['topic']}-responses   (replies to approval questions)")
         input("  Press Enter once subscribed...")
-    server_changed = bool(previous_server) and not _same_ntfy_server(
-        previous_server, ntfy.get("server"))
-    # action_auth is a token for the previous server. Leaving it in place
-    # publishes it inside the next ask's button headers on the new server,
-    # where those buttons do not work. --ntfy-auth replaces the password
-    # only; it is not this token.
-    if server_changed and ntfy.get("action_auth"):
-        ntfy["action_auth"] = None
-        print(f"{PROG}: ntfy server changed; not sending the saved ntfy "
-              "action token to the new server.", file=sys.stderr)
+    # --ntfy-auth replaces the password only; the action token is cleared too
+    had_auth = bool(ntfy.get("auth"))
+    if args.ntfy_auth:
+        ntfy["auth"] = None     # replaced below, not "cleared"
+    server_changed = _forget_ntfy_credentials(ntfy, previous_server, ntfy.get("server"))
     if args.ntfy_auth:
         ntfy["auth"] = args.ntfy_auth
-    elif server_changed:
-        # The saved password belongs to the previous server. Sending it to
-        # the new one both fails and discloses it.
-        if interactive:
+    elif server_changed and interactive:
+        if had_auth:
             print("  The ntfy server changed. The saved password will not be "
                   "sent to the new server.")
-            entered = ask(
-                "ntfy auth for this server (user:pass or token, blank for none)", "")
-            ntfy["auth"] = entered or None
-        else:
-            ntfy["auth"] = None
-            print(f"{PROG}: ntfy server changed; not sending the saved ntfy "
-                  "password to the new server.", file=sys.stderr)
+        entered = ask(
+            "ntfy auth for this server (user:pass or token, blank for none)", "")
+        ntfy["auth"] = entered or None
     warn_cleartext_auth(ntfy.get("server"), ntfy.get("auth"))
 
     tg = cfg.data["telegram"]
@@ -8525,34 +8577,25 @@ def cmd_init(args):
     if tg.get("bot_token") and tg.get("chat_id") and premium_enabled(cfg):
         cfg.data["channels"] = ["ntfy", "telegram"]
 
-    def parse_quiet_windows(raw):
-        """HH:MM-HH:MM[,...] or a clear ValueError - silently ignoring it is worse."""
-        windows = []
-        for window in (w.strip() for w in str(raw).split(",") if w.strip()):
-            parts = window.split("-")
-            if len(parts) != 2 or _parse_hhmm(parts[0].strip()) is None \
-                    or _parse_hhmm(parts[1].strip()) is None:
-                raise ValueError(f"invalid quiet-hours window '{window}' "
-                                 "(expected HH:MM-HH:MM, e.g. 22:00-07:30)")
-            windows.append({"start": parts[0].strip(), "end": parts[1].strip()})
-        return windows
-
     qh = cfg.data["quiet_hours"]
+    expected = "expected HH:MM-HH:MM, e.g. 22:00-07:30"
     if args.quiet_hours:
         try:
-            qh[:] = parse_quiet_windows(args.quiet_hours)
-        except ValueError as exc:
-            raise SystemExit(f"{PROG}: {exc}")
+            qh[:] = _coerce_quiet_hours(args.quiet_hours)
+        except RuntimeError as exc:
+            raise SystemExit(f"{PROG}: {exc} ({expected})")
     elif interactive:
         # Ask again on a typo: exiting here threw away every answer above
         # (topic, Telegram token, license) because nothing is saved yet.
+        # Enter keeps the current windows, like every other prompt.
+        current = ",".join(f"{w['start']}-{w['end']}" for w in normalize_quiet_hours(qh))
         while True:
             try:
-                qh[:] = parse_quiet_windows(
-                    ask("Quiet hours (e.g. 22:00-07:30, blank for none)", "") or "")
+                qh[:] = _coerce_quiet_hours(
+                    ask("Quiet hours (e.g. 22:00-07:30, 'none' for none)", current) or "")
                 break
-            except ValueError as exc:
-                print(f"  {exc} - try again, or leave it blank for none")
+            except RuntimeError as exc:
+                print(f"  {exc} ({expected}) - try again, or 'none' for none")
 
     mode = (args.quiet_hours_mode or cfg.data.get("quiet_hours_mode") or "suppress")
     if qh and interactive:
@@ -9579,7 +9622,10 @@ def cmd_mcp(args):
 
 def cmd_history(args):
     damage = {}
-    records = read_history(args.limit, damage=damage)
+    try:
+        records = read_history(args.limit, damage=damage)
+    except OSError as exc:
+        raise SystemExit(f"{PROG}: cannot read {history_path()}: {exc.strerror or exc}")
     note = history_damage_note(damage)
     if note:
         print(f"{PROG}: {note} ({history_path()})", file=sys.stderr)
@@ -9698,7 +9744,7 @@ CONFIG_SETTERS = {
                       lambda v: None if v.lower() == "none" else v),
     "approval_timeout": ("seconds", lambda v: max(1, int(v))),
     "quiet_hours": ("HH:MM-HH:MM[,HH:MM-HH:MM] ('none' clears it)",
-                    lambda v: [] if v.lower() == "none" else _coerce_quiet_hours(v)),
+                    lambda v: _coerce_quiet_hours(v)),
     "quiet_hours_mode": ("suppress or defer", lambda v: _one_of(v, ("suppress", "defer"))),
     "quiet_hours_min_priority": ("1-5", lambda v: _one_of(int(v), (1, 2, 3, 4, 5))),
     "channels": ("comma-separated: ntfy,telegram,os",
@@ -9717,19 +9763,27 @@ def _coerce_topic(value):
     topic_status, topic_problem = rate_topic(value)
     if topic_status == FAIL:
         raise RuntimeError(f"'{value}' {topic_problem}")
+    if topic_status == WARN:
+        sys.stderr.write(f"{PROG}: warning: {topic_problem}. A safer topic: "
+                         f"agentbell config set ntfy.topic {suggest_topic()}\n")
     return value
 
 
 def _coerce_quiet_hours(value):
-    """Parse every window, or refuse.
+    """Parse every window, or refuse; 'none' clears them. Shared by init.
 
     normalize_quiet_hours() drops what it cannot parse - right for a config
     read at send time, wrong here: a typo would silently mean "no quiet hours"
     and the user would find out at 3am.
     """
-    windows = normalize_quiet_hours([part.strip() for part in value.split(",") if part.strip()])
-    if len(windows) != len([p for p in value.split(",") if p.strip()]):
-        raise RuntimeError("expected HH:MM-HH:MM windows, e.g. 22:00-07:30")
+    if value.strip().lower() == "none":
+        return []
+    windows = []
+    for part in (p.strip() for p in value.split(",") if p.strip()):
+        window = normalize_quiet_hours(part)
+        if not window:
+            raise RuntimeError(f"invalid quiet-hours window '{part}'")
+        windows += window
     return windows
 
 
@@ -9750,15 +9804,8 @@ def config_set(cfg, key, raw):
         raise SystemExit(f"{PROG}: bad value for {key}: that is your ntfy.auth credential, and "
                          "the buttons show it to every subscriber - use a token that may only "
                          f"publish to <topic>{RESPONSE_SUFFIX}")
-    if key == "ntfy.server" and ntfy.get("server") \
-            and not _same_ntfy_server(ntfy.get("server"), value):
-        # same rule as init: credentials belong to the previous server, and
-        # the next send or ask would hand them to the new one
-        for cred in ("auth", "action_auth"):
-            if ntfy.get(cred):
-                ntfy[cred] = None
-                sys.stderr.write(f"{PROG}: ntfy server changed; ntfy.{cred} was cleared "
-                                 f"(set it again: agentbell config set ntfy.{cred} ...)\n")
+    if key == "ntfy.server":
+        _forget_ntfy_credentials(ntfy, ntfy.get("server"), value)
     target = cfg.data
     parts = key.split(".")
     for part in parts[:-1]:

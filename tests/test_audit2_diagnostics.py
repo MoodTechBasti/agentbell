@@ -606,6 +606,7 @@ class TestConfigSetActionAuth(_Sandbox):
         cfg.data["ntfy"]["auth"] = "owner:s3cret"
         with self.assertRaises(SystemExit) as ctx:
             an.config_set(cfg, "ntfy.action_auth", "owner:s3cret")
+        self.assertIn("your ntfy.auth credential", str(ctx.exception))
         self.assertNotIn("s3cret", str(ctx.exception))
         self.assertIsNone(cfg.data["ntfy"].get("action_auth"))
 
