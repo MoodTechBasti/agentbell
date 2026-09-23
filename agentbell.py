@@ -698,6 +698,10 @@ class PermanentError(RuntimeError):
     """A publish failure that will not succeed on retry (4xx, misconfiguration)."""
 
 
+class SendInterrupted(KeyboardInterrupt):
+    """Ctrl-C or SIGTERM while `watch` sends its push: queue it, do not retry."""
+
+
 def _auth_header(ntfy_cfg):
     auth = ntfy_cfg.get("auth")
     if not auth:
@@ -2187,16 +2191,19 @@ def _publish_item_channels(cfg, item, timeout=10.0, deadline=None):
         return _publish_channel(cfg, channel, item, wait)
 
     delivered, transient, permanent = [], {}, {}
+    interrupted = None
     for channel in channels:
         if channel == "telegram" and not premium_enabled(cfg):
             permanent[channel] = LICENSE_PREMIUM_MSG
             continue
-        if deadline is not None and time.time() >= deadline:
-            transient[channel] = "not tried: the send time budget was used up"
+        if interrupted or (deadline is not None and time.time() >= deadline):
+            transient[channel] = interrupted or "not tried: the send time budget was used up"
             continue
         try:
             publish_with_retry(lambda ch=channel: attempt(ch), deadline=deadline)
             delivered.append(channel)
+        except SendInterrupted as exc:      # watch: the rest waits in the queue
+            transient[channel] = interrupted = str(exc)
         except TransientError as exc:
             transient[channel] = str(exc)
         except RuntimeError as exc:
@@ -8548,30 +8555,12 @@ def _restore_signals(previous):
             pass
 
 
-def _terminal_already_sent(signum):
-    """True when the watched command got `signum` from the terminal itself.
-
-    The command runs in watch's own process group, the terminal's foreground
-    job. Ctrl-C and Ctrl-\\ reach every process of that job, and so does the
-    SIGHUP a shell sends its jobs when the terminal closes. Passing those on
-    as well would deliver them twice, and a second interrupt is how tools
-    such as Terraform abandon a graceful shutdown. A hangup reaches a session
-    leader alone (ssh -t host agentbell watch ..., docker run -it). On
-    Windows every process on the console gets Ctrl-C and Ctrl-Break, and no
-    other signal reaches watch from outside. A console event aimed at the
-    command's pid lands on watch itself, or kills the command while it is
-    still starting.
-    """
-    if os.name == "nt":
-        return True
-    if signum == signal.SIGHUP:
-        return os.getsid(0) != os.getpid()
-    if signum not in (signal.SIGINT, signal.SIGQUIT):
-        return False
+def _terminal_foreground():
+    """None without a controlling terminal, else whether watch is its foreground job."""
     try:
         tty = os.open("/dev/tty", os.O_RDONLY)
     except OSError:
-        return False          # no terminal: the signal was sent to watch
+        return None
     try:
         return os.tcgetpgrp(tty) == os.getpgrp()
     except OSError:
@@ -8580,17 +8569,56 @@ def _terminal_already_sent(signum):
         os.close(tty)
 
 
-def _forward_watch_signal(proc, signum):
+def _command_got_it_too(signum, had_tty, info=None):
+    """True when the watched command got `signum` as well, so watch keeps it.
+
+    The command runs in watch's own process group, the terminal's foreground
+    job. Ctrl-C and Ctrl-\\ reach every process of that job, and so does the
+    SIGHUP a shell sends its jobs when the terminal closes. Passing those on
+    as well would deliver them twice, and a second interrupt is how tools
+    such as Terraform abandon a graceful shutdown. A hangup reaches a session
+    leader alone (ssh -t host agentbell watch ..., docker run -it), and
+    without a terminal (`had_tty` at start) nothing hangs up the job.
+
+    `info` is the sender from sigtimedwait (Linux): the kernel for a key or
+    a hangup, else a process. A process in watch's own group (timeout(1),
+    the command's own `kill 0`) signaled that group; anything else is taken
+    to have signaled watch alone, although `kill %1` and systemd reach the
+    group from outside and the command then gets their SIGTERM twice.
+    Without `info`, Ctrl-C and Ctrl-\\ count as keys while watch is the
+    terminal's foreground job. On Windows every process on the console gets
+    Ctrl-C and Ctrl-Break, and no other signal reaches watch from outside. A
+    console event aimed at the command's pid lands on watch itself, or kills
+    the command while it is still starting.
+    """
+    if os.name == "nt":
+        return True
+    if info is not None and info.si_code <= 0 and info.si_pid > 0:
+        try:
+            if os.getpgid(info.si_pid) == os.getpgrp():
+                return True
+        except OSError:
+            pass              # the sender is gone
+    if signum == signal.SIGHUP:
+        return had_tty and os.getsid(0) != os.getpid()
+    if signum not in (signal.SIGINT, signal.SIGQUIT):
+        return False
+    if info is not None:
+        return info.si_code > 0
+    return bool(_terminal_foreground())
+
+
+def _forward_watch_signal(state, signum, info=None):
     """Pass `signum` on to the watched command unless it has it already.
 
     Only the command itself is signaled: its process group is watch's own
     and can hold the rest of a pipeline. Popen.send_signal skips a command
     that has exited, whose pid may belong to another process by now.
     """
-    if proc is None or _terminal_already_sent(signum):
+    if _command_got_it_too(signum, state["tty"], info):
         return
     try:
-        proc.send_signal(signum)
+        state["proc"].send_signal(signum)
     except OSError:
         pass                  # it exited between the signal and this call
 
@@ -8600,14 +8628,21 @@ def _shield_watch_signals(state):
 
     Each signal is passed on to the running command, state["proc"]. One
     that arrives while the command is being started waits in
-    state["pending"]. A signal that is ignored (nohup, a background job of
-    a script) stays ignored, so the command inherits that as well.
+    state["pending"]. Once the command has ended, one while the push is
+    being sent gives up on it (SendInterrupted: the push is queued), except
+    a hangup, and except on Windows, where the Ctrl-C that ended the command
+    may reach watch only now. A signal that is ignored (nohup, a background
+    job of a script) stays ignored, so the command inherits that as well.
     """
     def on_signal(signum, _frame):
-        if state["proc"] is None:
+        if state["sending"]:
+            if os.name != "nt" and signum != signal.SIGHUP:
+                state["interrupted"] = True
+                raise SendInterrupted(f"interrupted by {signal.Signals(signum).name}")
+        elif state["proc"] is None:
             state["pending"].append(signum)
         else:
-            _forward_watch_signal(state["proc"], signum)
+            _forward_watch_signal(state, signum)
 
     previous = []
     for name in WATCH_SIGNALS:
@@ -8634,7 +8669,78 @@ def _watch_status(returncode):
     return returncode
 
 
-def _watch_command(cmd, state):
+def _is_batch(path):
+    # Windows drops trailing dots and spaces: "x.cmd." runs x.cmd
+    return path.rstrip(". ").lower().endswith((".bat", ".cmd"))
+
+
+def _windows_program(name):
+    """`name` as a .com, .exe, .bat or .cmd file (on PATH for a bare name), or None.
+
+    CreateProcess only tries ".exe", but npm, yarn and pnpm are .cmd files.
+    shutil.which looks in the current directory first and takes any PATHEXT
+    type there: an npm.js in the project beat npm.cmd on PATH, and .js, .vbs
+    or .wsf are nothing CreateProcess can start.
+    """
+    if os.path.dirname(name):
+        directories = [""]
+    else:
+        directories = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    for directory in directories:
+        for ext in (".com", ".exe", ".bat", ".cmd"):
+            path = os.path.join(directory, name + ext)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def _batch_command_line(argv):
+    """The cmd.exe command line that runs batch file argv[0] with argv[1:] as given.
+
+    CreateProcess runs a .bat or .cmd through cmd.exe, which parses the
+    arguments again: & | < > start other commands, ^ disappears and %NAME%
+    expands (BatBadBut, CVE-2024-24576). In double quotes cmd.exe leaves
+    & | < > ^ ( ) and spaces alone. Nothing protects % " or a line break,
+    so an argument holding one is refused (ValueError), as Rust does.
+    """
+    for arg in argv:
+        if any(ch in arg for ch in '%"\r\n'):
+            raise ValueError(f"refusing to pass {arg!r} to a batch file: cmd.exe would "
+                             "change it (%, \" and line breaks cannot be passed safely)")
+    parts = [f'"{argv[0]}"']
+    for arg in argv[1:]:
+        # unquoted only what cmd.exe passes on as it is (the set Rust uses)
+        if arg and not arg.endswith("\\") and all(
+                ch.isalnum() or ch in "#$*+-./:?@\\_" if ch.isascii() else ch.isprintable()
+                for ch in arg):
+            parts.append(arg)
+        else:
+            # a trailing \ must not escape the closing quote for the program it reaches
+            parts.append(f'"{arg}' + "\\" * (len(arg) - len(arg.rstrip("\\"))) + '"')
+    cmd_exe = os.path.join(os.environ.get("SystemRoot") or "C:\\Windows", "System32", "cmd.exe")
+    return f'"{cmd_exe}" /d /v:off /s /c "{" ".join(parts)}"'
+
+
+def _start_windows(argv):
+    """Start argv the way a shell would, without cmd.exe reparsing its arguments."""
+    program = argv[0]
+    if _is_batch(program):
+        program = shutil.which(program)       # named with its extension: cwd, then PATH
+        if program is None:
+            raise FileNotFoundError(f"{argv[0]}: not found")
+    else:
+        try:
+            return subprocess.Popen(argv)
+        except FileNotFoundError:
+            program = _windows_program(program)
+            if program is None:
+                raise
+            if not _is_batch(program):
+                return subprocess.Popen([program] + argv[1:])
+    return subprocess.Popen(_batch_command_line([program] + argv[1:]))
+
+
+def _watch_command(cmd, state, shielded):
     """Start `cmd` in watch's own job and wait for it, however long it takes.
 
     `subprocess.run` waits 0.25s after Ctrl-C and then kills the child.
@@ -8644,15 +8750,25 @@ def _watch_command(cmd, state):
     signal once (see _shield_watch_signals).
     """
     argv = [str(part) for part in cmd]
-    if os.name == "nt":
-        # CreateProcess only tries ".exe": npm, yarn and pnpm are .cmd files.
-        # Look the name up the way the shell does, with PATHEXT.
-        argv[0] = shutil.which(argv[0]) or argv[0]
-    proc = subprocess.Popen(argv)
+    proc = _start_windows(argv) if os.name == "nt" else subprocess.Popen(argv)
     state["proc"] = proc
     for signum in state["pending"]:
-        _forward_watch_signal(proc, signum)
-    return proc.wait()
+        _forward_watch_signal(state, signum)
+    if not shielded or not sys.platform.startswith("linux"):
+        return proc.wait()
+    # Take each signal with its sender (see _command_got_it_too); si_code is
+    # Linux's. SIGCHLD ends the wait; the timeout covers one another thread took.
+    wanted = set(shielded) | {signal.SIGCHLD}
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, wanted)
+    try:
+        while proc.poll() is None:
+            info = signal.sigtimedwait(wanted, 1.0)
+            if info is not None and info.si_signo != signal.SIGCHLD:
+                _forward_watch_signal(state, info.si_signo, info)
+    finally:
+        # a signal still pending goes to on_signal right here, before sending
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    return proc.returncode
 
 
 def run_watch(cfg, cmd, title=None, priority=None, fail_priority=None,
@@ -8664,15 +8780,18 @@ def run_watch(cfg, cmd, title=None, priority=None, fail_priority=None,
     and do not change the exit code. A command that cannot be spawned at all
     yields exit code 127. Ctrl-C, Ctrl-\\, a closing terminal and SIGTERM do
     not stop watch: the command gets the signal, may finish its cleanup, and
-    the push is sent either way (DECISIONS §28).
+    the push is sent either way (DECISIONS §28). Once the command has ended,
+    Ctrl-C or SIGTERM during a send that hangs queues the push and ends watch.
     """
     label = " ".join(shlex.quote(str(part)) for part in cmd)
     started = time.monotonic()
-    state = {"proc": None, "pending": []}
+    state = {"proc": None, "pending": [], "tty": _terminal_foreground() is not None,
+             "sending": False, "interrupted": False}
     previous = _shield_watch_signals(state)
     try:
         try:
-            returncode = _watch_status(_watch_command(cmd, state))
+            returncode = _watch_status(
+                _watch_command(cmd, state, [signum for signum, _ in previous]))
             duration = time.monotonic() - started
             ok = returncode == 0
             if ok:
@@ -8685,29 +8804,40 @@ def run_watch(cfg, cmd, title=None, priority=None, fail_priority=None,
                 title = title or "Command failed"
                 prio = fail_priority or "urgent"
             exit_code = returncode
-        except OSError as exc:
+        except (OSError, ValueError) as exc:    # ValueError: see _batch_command_line
             exit_code = 127
             message = f"\U0001f534 {label} could not be started ({exc})"
             title = title or "Command failed"
             prio = fail_priority or "urgent"
+            if isinstance(exc, ValueError):
+                sys.stderr.write(f"{PROG}: {exc}\n")
         notification = None
         if cfg is None:     # unreadable config: cmd_watch has said so on stderr
             return {"exit_code": exit_code, "message": message, "notification": None}
+        state["sending"] = True
         try:
             notification = send_notification(
                 cfg, message, title=title, priority=prio, tags=tags,
                 force=force, event="watch",
             )
-        except RuntimeError as exc:
-            sys.stderr.write(f"{PROG}: notification not sent - {exc}\n")
+        except SendInterrupted as exc:
+            sys.stderr.write(f"{PROG}: {exc} while sending the notification "
+                             f"- see '{PROG} history'\n")
+        except Exception as exc:  # noqa: BLE001 - a bad config value or state dir must not cost the exit code
+            sys.stderr.write(f"{PROG}: notification error - {type(exc).__name__}: {exc}\n")
+        finally:
+            state["sending"] = False
         if notification and not notification["ok"]:
+            errors = "; ".join(notification.get("errors") or [])
             sent = ", ".join(r["channel"] for r in notification.get("results") or [])
             sys.stderr.write(
-                f"{PROG}: notification not sent - {'; '.join(notification.get('errors') or [])}"
-                + (f" (sent via {sent})" if sent else "")
+                f"{PROG}: "
+                + (f"notification sent via {sent}, failed on {errors}" if sent
+                   else f"notification not sent - {errors}")
                 + f" - see '{PROG} doctor'\n")
         elif notification and notification.get("queued"):
-            sys.stderr.write(f"{PROG}: {', '.join(notification['queued'])} unreachable "
+            why = "interrupted" if state["interrupted"] else "unreachable"
+            sys.stderr.write(f"{PROG}: {', '.join(notification['queued'])} {why} "
                              f"- notification queued for later delivery\n")
     finally:
         _restore_signals(previous)

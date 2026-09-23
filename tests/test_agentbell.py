@@ -2155,10 +2155,10 @@ class TestWatch(unittest.TestCase):
     def _interrupt_child(self, signum, exit_code, topic):
         """A child that takes longer than subprocess.run's 0.25s SIGKILL window.
 
-        The signal is sent only to this process, so the child sees it only
-        if watch forwards it, and it exits with `exit_code` only if it is
-        allowed to finish. Watch forwards Ctrl-C only when no terminal sent
-        it; that is pinned here, since the suite may run in a terminal.
+        watch runs as its own process, and the signal comes from this one,
+        outside watch's process group: the child sees it only if watch
+        forwards it, and it exits with `exit_code` only if it is allowed to
+        finish.
         """
         directory = tempfile.mkdtemp()
         ready = os.path.join(directory, "ready")
@@ -2177,25 +2177,31 @@ class TestWatch(unittest.TestCase):
                 "time.sleep(3)\n"
                 "raise SystemExit(0)\n"
             )
-        cfg = make_config(self.ntfy.url, topic=topic)
+        config_dir = os.path.join(directory, "config")
+        os.makedirs(config_dir)
+        with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as fh:
+            json.dump({"ntfy": {"server": self.ntfy.url, "topic": topic}}, fh)
+        # the state dir stays this module's, so read_history() sees the record
+        env = dict(os.environ, AGENTBELL_CONFIG_DIR=config_dir, HOME=directory,
+                   USERPROFILE=directory, XDG_CONFIG_HOME=directory, XDG_STATE_HOME=directory)
         before = len(self.ntfy.posts.get(topic, []))
-
-        def poke():
-            deadline = time.monotonic() + 5
+        started = time.monotonic()
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(an.__file__), "watch", "--", sys.executable, script],
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
             while not os.path.exists(ready) and time.monotonic() < deadline:
                 time.sleep(0.02)
-            if os.path.exists(ready):
-                os.kill(os.getpid(), signum)
-
-        thread = threading.Thread(target=poke)
-        thread.start()
-        started = time.monotonic()
-        try:
-            with unittest.mock.patch.object(an, "_terminal_already_sent", return_value=False):
-                result = an.run_watch(cfg, [sys.executable, script])
+            proc.send_signal(signum)
+            out, _ = proc.communicate(timeout=30)
         finally:
-            thread.join(timeout=5)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
             shutil.rmtree(directory, ignore_errors=True)
+        result = {"exit_code": proc.returncode, "message": out.decode("utf-8", "replace")}
         return result, time.monotonic() - started, before
 
     @unittest.skipIf(os.name == "nt", "POSIX process-group signals")
