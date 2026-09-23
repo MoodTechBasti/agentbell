@@ -33,6 +33,7 @@ import textwrap
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 VERSION = "1.6.3"
@@ -160,7 +161,7 @@ def priority_name(number):
     """'normal' for 3 - a bare number means nothing to the person reading it."""
     try:
         number = int(number)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: JSON's Infinity
         return str(number)
     for name, value in PRIORITIES.items():
         if value == number:
@@ -650,17 +651,35 @@ def normalize_server(value):
     Only http/https are notification servers. Anything else (file://, ftp://,
     ...) was stored happily and later handed to urllib as-is, which is at best
     a confusing failure and at worst a way to point us at a local file.
+    A URL that cannot be opened at all (no host, a port like "8o80", a space)
+    is refused too: it used to fail every send as "unreachable" and fill the
+    retry queue with pushes that could never be delivered.
     """
-    server = str(value or "").strip().rstrip("/")
-    if not server:
-        return server
+    server = str(value or "").strip()
+    if not server.rstrip("/"):
+        return ""
     if "://" not in server:
         server = "https://" + server
     scheme = server.split("://", 1)[0].lower()
     if scheme not in ("http", "https"):
         raise RuntimeError(
             f"'{server}' is not an ntfy server URL - only http:// and https:// are supported")
-    return server
+    if "@" in re.split(r"[/?#]", server.split("://", 1)[1], maxsplit=1)[0]:
+        # not echoed: the part before the @ is a password
+        raise RuntimeError("the server URL must not contain credentials - "
+                           "put them in ntfy.auth instead")
+    try:
+        parts = urllib.parse.urlsplit(server)   # ValueError: "http://[::1"
+        parts.port                              # ValueError: "8o80", 99999
+        # "?" / "#" would swallow the "/<topic>" appended to every URL
+        valid = bool(parts.hostname) and not re.search(r"[\s\x00-\x1f\x7f?#]", server)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise RuntimeError(f"'{server}' is not a valid server URL "
+                           "(expected e.g. https://ntfy.example.com or http://host:8080)")
+    # stripped only now: "https://" must fail above, not become "https://https:"
+    return server.rstrip("/")
 
 
 def warn_cleartext_auth(server, auth):
@@ -1290,20 +1309,50 @@ def _rotate_history(path):
         pass  # history is a convenience; never fail a notification over it
 
 
-def read_history(limit=50):
+def read_history(limit=50, damage=None):
+    """The newest `limit` records (all of them for 0), oldest first.
+
+    One damaged line used to crash `history` and `verify`. Bytes that are not
+    UTF-8 are now replaced with U+FFFD, and a line that is still not a JSON
+    object is skipped. Pass a dict as `damage` to get both counts
+    ("repaired", "skipped") so the caller can report them.
+    """
     if not os.path.exists(history_path()):
         return []
     records = []
-    with open(history_path(), "r", encoding="utf-8") as fh:
-        for line in fh:
+    repaired = skipped = 0
+    with open(history_path(), "rb") as fh:
+        for raw in fh:
+            try:
+                line, bad_bytes = raw.decode("utf-8"), False
+            except UnicodeDecodeError:
+                line, bad_bytes = raw.decode("utf-8", "replace"), True
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
-            except ValueError:
+                record = json.loads(line)
+            except (ValueError, RecursionError):
+                record = None
+            if not isinstance(record, dict):
+                skipped += 1
                 continue
+            if bad_bytes:
+                repaired += 1
+            records.append(record)
+    if damage is not None:
+        damage.update(repaired=repaired, skipped=skipped)
     return records[-limit:] if limit else records
+
+
+def history_damage_note(damage):
+    """One line naming what read_history() had to repair or skip, or None."""
+    parts = []
+    if damage.get("skipped"):
+        parts.append(f"{damage['skipped']} unreadable line(s) skipped")
+    if damage.get("repaired"):
+        parts.append(f"{damage['repaired']} line(s) with invalid UTF-8 shown with U+FFFD")
+    return "damaged history: " + ", ".join(parts) if parts else None
 
 
 def format_duration(seconds):
@@ -2101,7 +2150,7 @@ def publish_with_retry(fn, attempts=None, deadline=None):
 def _publish_channel(cfg, channel, item, timeout=10.0):
     message = item.get("message") or ""
     title = item.get("title")
-    priority = item.get("priority") or "normal"
+    priority = priority_name(item.get("priority") or "normal")
     tags = item.get("tags")
     prio_num = PRIORITIES.get(priority, PRIORITIES["normal"])
     if channel == "ntfy":
@@ -2584,6 +2633,9 @@ def send_notification(cfg, message, title=None, priority="normal", tags=None,
             entry["source_event"] = event
         write_history(entry)
 
+    # The webhook and MCP also get ntfy's own numbers (4 = high). Stored raw,
+    # a number was sent as "normal" and crashed `history` and `queue list`.
+    priority = priority_name(priority or "normal")
     prio_num = PRIORITIES.get(priority, PRIORITIES["normal"])
     explicit_channels = channels is not None
     channels = channels if explicit_channels else cfg.channels()
@@ -6693,6 +6745,9 @@ def webhook_server(cfg):
             else:
                 self._send(404, {"error": "not found"})
 
+    listen = str(listen).strip()
+    if listen.startswith("[") and listen.endswith("]"):
+        listen = listen[1:-1]        # "[::1]" as written in a URL
     if not token and listen not in ("127.0.0.1", "localhost", "::1"):
         # reachable from the network with no auth at all: refuse instead of
         # handing anyone on the LAN a push channel to the user's phone.
@@ -6701,8 +6756,17 @@ def webhook_server(cfg):
             f"{PROG}: refusing to listen on {listen} without a token.\n"
             f"  fix: agentbell config set webhook.token <random>\n"
             '  then call it with: -H "Authorization: Bearer <token>"')
-    server = ThreadingHTTPServer((listen, port), Handler)
-    print(f"{PROG}: webhook listening on http://{listen}:{port}"
+
+    class Server(ThreadingHTTPServer):
+        # the stock server is IPv4-only, so "::1" failed to bind
+        address_family = socket.AF_INET6 if ":" in listen else socket.AF_INET
+
+    try:
+        server = Server((listen, port), Handler)
+    except OSError as exc:     # port in use, address not on this machine
+        raise SystemExit(f"{PROG}: cannot listen on {listen} port {port}: {exc}")
+    host = f"[{listen}]" if ":" in listen else listen
+    print(f"{PROG}: webhook listening on http://{host}:{port}"
           + ("" if token else "  (no token: localhost only)"))
     if not token:
         sys.stderr.write(
@@ -6944,7 +7008,7 @@ def queue_list_data():
             "age_seconds": now - float(item.get("created", 0)),
             "message": item.get("message") or "",
             "title": item.get("title"),
-            "priority": item.get("priority") or "normal",
+            "priority": priority_name(item.get("priority") or "normal"),
             "channels": item.get("channels") or [],
             "attempts": int(item.get("attempts", 0)),
             "last_error": item.get("last_error"),
@@ -6959,7 +7023,7 @@ def queue_list_data():
             "due_in_seconds": float(item.get("deliver_after", 0)) - now,
             "message": item.get("message") or "",
             "title": item.get("title"),
-            "priority": item.get("priority") or "normal",
+            "priority": priority_name(item.get("priority") or "normal"),
             "channels": item.get("channels") or [],
             "event": item.get("event"),
         })
@@ -7067,6 +7131,25 @@ def _check(status, name, detail, fix=None):
     return {"status": status, "name": name, "detail": detail, "fix": fix}
 
 
+def rate_topic(topic):
+    """(status, problem) for an ntfy topic - the one rule doctor, verify and
+    `config set` apply. They used to disagree: doctor passed a 60-character
+    topic that verify failed, and verify passed a short one doctor warned on.
+
+    FAIL: ntfy rejects it, or '<topic>-responses' (what `ask` listens on)
+    would not fit in ntfy's 64 characters. WARN: guessable on a public server.
+    """
+    if not TOPIC_RE.match(topic or ""):
+        return FAIL, "is not valid (allowed: a-z A-Z 0-9 - _)"
+    if len(topic) > MAX_TOPIC_LEN:
+        return FAIL, (f"is too long ({len(topic)} chars, max {MAX_TOPIC_LEN}) - 'ask' "
+                      f"also needs '<topic>{RESPONSE_SUFFIX}' to fit in 64")
+    if len(topic) < MIN_GUESSABLE_TOPIC_LEN:
+        return WARN, ("short topic - guessable on a public server; anyone who knows it "
+                      "can read your notifications and send fake approvals")
+    return OK, None
+
+
 def _path_fix_hint():
     """The copy-pasteable command that puts this CLI on the PATH.
 
@@ -7116,22 +7199,27 @@ def doctor_checks(cfg, send=False):
             checks.append(_check(OK, "config", cfg.path))
 
     topic = (cfg.data.get("ntfy") or {}).get("topic") or ""
-    server = NtfyChannel(cfg).server()
+    try:
+        server = NtfyChannel(cfg).server()
+    except RuntimeError as exc:
+        # a hand-edited config: report it, the rest of the checks still run
+        server = None
+        checks.append(_check(FAIL, "ntfy server", str(exc),
+                             f"agentbell config set ntfy.server {DEFAULT_NTFY_SERVER}"))
+    topic_status, topic_problem = rate_topic(topic)
     if not topic:
         checks.append(_check(FAIL, "ntfy topic", "not configured", "agentbell init"))
-    elif not TOPIC_RE.match(topic):
-        checks.append(_check(FAIL, "ntfy topic",
-                             f"'{topic}' is not a valid topic (allowed: a-z A-Z 0-9 - _, max 64)",
+    elif topic_status == FAIL:
+        checks.append(_check(FAIL, "ntfy topic", f"'{topic}' {topic_problem}",
                              "agentbell init"))
     else:
-        detail = f"{server}/{topic}"
-        if len(topic) < MIN_GUESSABLE_TOPIC_LEN:
-            checks.append(_check(
-                WARN, "ntfy topic", detail + "  (short topic - guessable on a public server; "
-                "anyone who knows it can read your notifications and send fake approvals)",
-                f"agentbell config set ntfy.topic {suggest_topic()}"))
+        detail = f"{server}/{topic}" if server else topic
+        if topic_status == WARN:
+            checks.append(_check(WARN, "ntfy topic", f"{detail}  ({topic_problem})",
+                                 f"agentbell config set ntfy.topic {suggest_topic()}"))
         else:
             checks.append(_check(OK, "ntfy topic", detail))
+    if server and TOPIC_RE.match(topic):
         try:
             NtfyChannel(cfg).poll(topic, int(time.time()), timeout=8.0)
             checks.append(_check(OK, "ntfy server", f"{server} reachable"))
@@ -7196,8 +7284,9 @@ def doctor_checks(cfg, send=False):
     # self-integrated agents (via `agentbell integrate`) have no config we
     # check, but their history records make them visible here - text only,
     # `verify` is the command that actually assesses them
+    damage = {}
     try:
-        history_records = read_history(limit=0)
+        history_records = read_history(limit=0, damage=damage)
         observed = hook_observations(history_records,
                                      _parse_since(VERIFY_WINDOW_DEFAULT))
         cutoff = time.time() - _parse_since(VERIFY_WINDOW_DEFAULT)
@@ -7205,9 +7294,15 @@ def doctor_checks(cfg, send=False):
                           if isinstance(rec, dict)
                           and rec.get("event") == "answer_claim_failed"
                           and (_history_ts(rec) or 0) >= cutoff]
-    except Exception:  # noqa: BLE001 - doctor must not die on a bad history
+    except Exception as exc:  # noqa: BLE001 - doctor must not die on a bad history
         observed = {}
         claim_failures = []
+        checks.append(_check(WARN, "history", f"cannot read {history_path()}: {exc}",
+                             "make the file readable for your user, or move it aside"))
+    note = history_damage_note(damage)
+    if note:
+        checks.append(_check(WARN, "history", f"{note} in {history_path()}",
+                             "harmless - the rest is read; delete those lines to clear this"))
     if claim_failures:
         checks.append(_check(
             WARN, "approval answers",
@@ -7274,7 +7369,7 @@ def doctor_checks(cfg, send=False):
                              f"mkdir -p {shlex.quote(state_dir())}"))
 
     if send:
-        if not cfg.ntfy_ready():
+        if "ntfy" in channels and not cfg.ntfy_ready():
             checks.append(_check(FAIL, "delivery", "cannot test delivery without a topic",
                                  "agentbell init"))
         else:
@@ -7282,6 +7377,11 @@ def doctor_checks(cfg, send=False):
             if outcome["confirmed"]:
                 checks.append(_check(OK, "delivery",
                                      "test notification confirmed on the server"))
+            elif outcome["confirmed"] is None:
+                # ntfy is not a channel here, and only ntfy can be read back
+                checks.append(_check(OK, "delivery",
+                                     f"test notification sent via {', '.join(outcome['sent'])} "
+                                     "(not confirmable: only ntfy can be read back)"))
             elif "ntfy" in outcome["sent"]:
                 checks.append(_check(WARN, "delivery",
                                      "test notification sent (server accepted it) but not "
@@ -7444,12 +7544,16 @@ def hook_observations(records, since_seconds, now=None, project=None):
             "skipped_duplicate": 0,
             "failed": 0, "forced": 0, "events": {},
             "last_ts": ts, "started_delivered": 0, "duplicates": [],
-            "unknown_events": {}, "_last": {},
+            "unknown_events": {}, "notify_calls": 0, "_last": {},
         })
         obs["last_ts"] = max(obs["last_ts"], ts)
         event = str(rec.get("event") or "")
         canonical = str(rec.get("source_event") or event)
         short = canonical[5:] if canonical.startswith("hook.") else canonical
+        if not canonical.startswith("hook."):
+            # an MCP `notify` naming the agent: counted like any event, and
+            # marked, because it proves the MCP path, not a lifecycle hook
+            obs["notify_calls"] += 1
         if event == "hook.unknown_event":
             # the requested name is attacker-influenced free text: strip it
             # to name-safe characters so it cannot forge report lines
@@ -7520,6 +7624,8 @@ def _obs_sentence(obs, now=None):
     detail = f"{obs['count']} event(s): " + ", ".join(parts) if parts else "0 events"
     if obs["forced"]:
         detail += f"; {obs['forced']} forced smoke test(s)"
+    if obs.get("notify_calls"):
+        detail += f"; {obs['notify_calls']} of them MCP notify call(s)"
     detail += f"; last {format_age(max(0, now - obs['last_ts']))} ago"
     return detail
 
@@ -7536,14 +7642,19 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
         since_seconds = _parse_since(VERIFY_WINDOW_DEFAULT)
     checks = []
     topic = (cfg.data.get("ntfy") or {}).get("topic") or ""
+    # the problem text never contains the topic itself (see the docstring)
+    topic_status, topic_problem = rate_topic(topic)
     if not os.path.exists(cfg.path):
         checks.append(_check(FAIL, "delivery", "no config yet - nothing can be delivered",
                              "agentbell init"))
     elif not topic:
         checks.append(_check(FAIL, "delivery", "no ntfy topic configured", "agentbell init"))
-    elif not TOPIC_RE.match(topic) or len(topic) > MAX_TOPIC_LEN:
-        checks.append(_check(FAIL, "delivery",
-                             "the configured ntfy topic is not valid", "agentbell init"))
+    elif topic_status == FAIL:
+        checks.append(_check(FAIL, "delivery", f"the configured ntfy topic {topic_problem}",
+                             "agentbell init"))
+    elif topic_status == WARN:
+        checks.append(_check(WARN, "delivery", f"config present, but {topic_problem}",
+                             "agentbell doctor   # prints a replacement topic"))
     else:
         checks.append(_check(OK, "delivery",
                              "config present, topic format valid (offline check, nothing sent)"))
@@ -7557,8 +7668,13 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                              "by absolute path",
                              "agentbell doctor   # prints the exact PATH fix command"))
 
+    damage = {}
     observations = hook_observations(
-        read_history(limit=0), since_seconds, now=now, project=project)
+        read_history(limit=0, damage=damage), since_seconds, now=now, project=project)
+    note = history_damage_note(damage)
+    if note:
+        checks.append(_check(WARN, "history", note + " - the rest was read",
+                             "agentbell doctor   # names the file"))
     status_rows = hooks_status(project=project)
     installed = {name for name, status, _, _ in status_rows
                  if status in ("installed", "update needed", "user wrapper")}
@@ -7585,19 +7701,26 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                "count": 0, "delivered": 0, "held": 0, "skipped_short": 0,
                "skipped_duplicate": 0,
                "failed": 0, "forced": 0, "events": {}, "last_ts": None,
-               "last_age_seconds": None, "duplicates": [], "unknown_events": {}}
+               "last_age_seconds": None, "duplicates": [], "unknown_events": {},
+               "notify_calls": 0}
         name = f"agent {slug}"
         if obs:
             # Only a non-forced event is evidence of wiring: a --force smoke
             # test proves the delivery path and must never satisfy "a real
             # lifecycle event was observed" (DECISIONS §16c).
             real_events = obs["count"] - obs["forced"]
+            # An MCP notify naming the agent is the documented proof for an
+            # MCP-only host, but never for an installed hook: that takes a
+            # real lifecycle event (MCP calls used to verify it).
+            hook_proof_only = slug in installed and obs["notify_calls"] > 0
+            if hook_proof_only:
+                real_events -= obs["notify_calls"]
             if real_events > 0:
                 observed_any = True
             row.update({k: obs[k] for k in ("count", "delivered", "held",
                                             "skipped_short", "skipped_duplicate",
-                                            "failed", "forced",
-                                            "events", "duplicates", "unknown_events")})
+                                            "failed", "forced", "events", "duplicates",
+                                            "unknown_events", "notify_calls")})
             row["last_ts"] = datetime.datetime.fromtimestamp(
                 obs["last_ts"]).astimezone().isoformat(timespec="seconds")
             row["last_age_seconds"] = int(now - obs["last_ts"])
@@ -7610,6 +7733,11 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                 checks.append(_check(FAIL, name,
                                      detail + " - NO event reached any channel",
                                      "agentbell doctor   # checks server/auth/network"))
+            elif obs["count"] and real_events == 0 and hook_proof_only:
+                checks.append(_check(WARN, name, detail
+                                     + " - no event from the installed hook yet; MCP "
+                                       "calls prove the MCP tool, not the hook wiring",
+                                     "finish one real agent turn, then run this again"))
             elif obs["count"] and real_events == 0:
                 checks.append(_check(OK, name, detail
                                      + " - smoke test only, wiring still unproven"))
@@ -7847,8 +7975,12 @@ def cmd_init(args):
             ntfy["server"] = normalize_server(ask("ntfy server", current) or current)
         elif not previous_server:
             ntfy["server"] = DEFAULT_NTFY_SERVER
+        else:
+            # a kept server must be usable too; a hand-edited one used to
+            # crash the "next steps" printout at the very end
+            ntfy["server"] = normalize_server(previous_server)
     except RuntimeError as exc:
-        raise SystemExit(f"{PROG}: {exc}")
+        raise SystemExit(f"{PROG}: {exc} (fix: agentbell init --server <url>)")
 
     if args.topic:
         ntfy["topic"] = args.topic
@@ -7952,21 +8084,34 @@ def cmd_init(args):
     if tg.get("bot_token") and tg.get("chat_id") and premium_enabled(cfg):
         cfg.data["channels"] = ["ntfy", "telegram"]
 
-    def parse_quiet_window(raw):
-        """HH:MM-HH:MM or a clear error - silently ignoring it is worse."""
-        parts = str(raw).strip().split("-")
-        if len(parts) != 2 or _parse_hhmm(parts[0].strip()) is None \
-                or _parse_hhmm(parts[1].strip()) is None:
-            raise SystemExit(f"{PROG}: invalid quiet-hours window '{str(raw).strip()}' "
-                             "(expected HH:MM-HH:MM, e.g. 22:00-07:30)")
-        return {"start": parts[0].strip(), "end": parts[1].strip()}
+    def parse_quiet_windows(raw):
+        """HH:MM-HH:MM[,...] or a clear ValueError - silently ignoring it is worse."""
+        windows = []
+        for window in (w.strip() for w in str(raw).split(",") if w.strip()):
+            parts = window.split("-")
+            if len(parts) != 2 or _parse_hhmm(parts[0].strip()) is None \
+                    or _parse_hhmm(parts[1].strip()) is None:
+                raise ValueError(f"invalid quiet-hours window '{window}' "
+                                 "(expected HH:MM-HH:MM, e.g. 22:00-07:30)")
+            windows.append({"start": parts[0].strip(), "end": parts[1].strip()})
+        return windows
 
     qh = cfg.data["quiet_hours"]
     if args.quiet_hours:
-        qh[:] = [parse_quiet_window(w) for w in args.quiet_hours.split(",") if w.strip()]
+        try:
+            qh[:] = parse_quiet_windows(args.quiet_hours)
+        except ValueError as exc:
+            raise SystemExit(f"{PROG}: {exc}")
     elif interactive:
-        window = ask("Quiet hours (e.g. 22:00-07:30, blank for none)", "")
-        qh[:] = [parse_quiet_window(window)] if window else []
+        # Ask again on a typo: exiting here threw away every answer above
+        # (topic, Telegram token, license) because nothing is saved yet.
+        while True:
+            try:
+                qh[:] = parse_quiet_windows(
+                    ask("Quiet hours (e.g. 22:00-07:30, blank for none)", "") or "")
+                break
+            except ValueError as exc:
+                print(f"  {exc} - try again, or leave it blank for none")
 
     mode = (args.quiet_hours_mode or cfg.data.get("quiet_hours_mode") or "suppress")
     if qh and interactive:
@@ -8031,7 +8176,8 @@ def run_test(cfg, wait=True, confirm_seconds=15, poll_interval=2):
     are different facts and must never be collapsed into one.
     """
     topic = cfg.data["ntfy"]["topic"]
-    if not topic:
+    uses_ntfy = "ntfy" in cfg.channels()
+    if uses_ntfy and not topic:
         return {"sent": [], "confirmed": False, "reason": "no ntfy topic configured"}
     stamp = secrets.token_hex(4)
     message = f"Test notification from {PROG} ({stamp})"
@@ -8047,6 +8193,10 @@ def run_test(cfg, wait=True, confirm_seconds=15, poll_interval=2):
         return {"sent": [], "confirmed": False, "reason": str(exc)}
     sent = [r.get("channel") for r in result.get("results") or []]
     if "ntfy" not in sent:
+        if not uses_ntfy and sent and not result.get("errors"):
+            # e.g. Telegram only: every channel took it, and only ntfy
+            # can be read back - "not checked", never "ntfy failed"
+            return {"sent": sent, "confirmed": None, "reason": None}
         if "ntfy" in (result.get("queued") or []):
             reason = ("ntfy is unreachable right now - the test notification "
                       "was queued for later delivery")
@@ -8080,19 +8230,29 @@ def run_test(cfg, wait=True, confirm_seconds=15, poll_interval=2):
 def cmd_test(args):
     """`agentbell test` - the command users run to prove delivery works."""
     cfg = Config()
-    if not cfg.ntfy_ready():
+    # ntfy is only required when it is a configured channel: a Telegram-only
+    # setup used to be told that ntfy failed
+    uses_ntfy = "ntfy" in cfg.channels()
+    if uses_ntfy and not cfg.ntfy_ready():
         print(f"{PROG}: ntfy is not configured yet.", file=sys.stderr)
         print("  fix: agentbell init", file=sys.stderr)
         return 1
     topic = cfg.data["ntfy"]["topic"]
-    print(f"Sending a test notification to '{topic}'...")
+    if uses_ntfy:
+        print(f"Sending a test notification to '{topic}'...")
+    else:
+        print(f"Sending a test notification via {', '.join(cfg.channels())}...")
     outcome = run_test(cfg, wait=not args.no_wait)
     if outcome["confirmed"]:
         print("delivered and confirmed: published and read back from the ntfy "
               "server. Check your phone now.")
         return 0
     if outcome["confirmed"] is None:
-        print("sent. Check your phone (ntfy app, topic subscribed?).")
+        if "ntfy" in outcome["sent"]:
+            print("sent. Check your phone (ntfy app, topic subscribed?).")
+        else:
+            print(f"sent via {', '.join(outcome['sent'])}. Check your phone "
+                  "(only ntfy can be read back to confirm delivery).")
         return 0
     if "ntfy" in outcome["sent"]:
         # The server accepted the publish; only the confirmation read failed.
@@ -8108,13 +8268,15 @@ def cmd_test(args):
         return 1
     print("NOT delivered.", file=sys.stderr)
     if outcome["sent"]:
-        print(f"  (delivered on: {', '.join(outcome['sent'])} - ntfy was not)",
-              file=sys.stderr)
+        print(f"  (delivered on: {', '.join(outcome['sent'])} - "
+              + ("ntfy was not)" if uses_ntfy else "not on every channel)"), file=sys.stderr)
     if outcome["reason"]:
         print(f"  reason: {outcome['reason']}", file=sys.stderr)
-    print("  1. is the topic subscribed in the ntfy app?   topic: " + topic, file=sys.stderr)
-    print("  2. what went wrong?                           agentbell history --limit 5", file=sys.stderr)
-    print("  3. full diagnosis + fixes                     agentbell doctor", file=sys.stderr)
+    steps = [("is the topic subscribed in the ntfy app?", "topic: " + topic)] if uses_ntfy else []
+    steps += [("what went wrong?", "agentbell history --limit 5"),
+              ("full diagnosis + fixes", "agentbell doctor")]
+    for number, (question, command) in enumerate(steps, 1):
+        print(f"  {number}. {question:42s} {command}", file=sys.stderr)
     return 1
 
 
@@ -8142,12 +8304,12 @@ def cmd_notify(args):
                 print(f"sent via {', '.join(r['channel'] for r in result['results'])}")
             else:
                 print("queued for later delivery")
-        else:
-            print("error: " + "; ".join(result.get("errors", [])))
     if result.get("queued"):
         print(f"{PROG}: {', '.join(result['queued'])} unreachable - queued for later "
               f"delivery (retry now: 'agentbell queue flush')", file=sys.stderr)
     if not result["ok"]:
+        # --quiet silences success only: a failure is always reported
+        print(f"{PROG}: error: " + "; ".join(result.get("errors", [])), file=sys.stderr)
         raise SystemExit(3)
 
 
@@ -8823,21 +8985,33 @@ def cmd_mcp(args):
 
 
 def cmd_history(args):
-    records = read_history(args.limit)
+    damage = {}
+    records = read_history(args.limit, damage=damage)
+    note = history_damage_note(damage)
+    if note:
+        print(f"{PROG}: {note} ({history_path()})", file=sys.stderr)
     if args.json:
         print(json.dumps(records, indent=2))
         return
     if not records:
         print("no history yet")
         return
+    # Every field as text: a hand-edited or foreign record (a number where a
+    # name belongs, e.g. priority 4) must not crash the listing.
+    def text(record, key):
+        value = record.get(key)
+        return "" if value is None else str(value)
+
     print(f"{'time':19s} {'event':14s} {'prio':7s} {'channel':8s} message")
     for record in records:
-        channels = ",".join(record.get("channels") or [])
-        message = (record.get("message") or "")[:60].replace("\n", " ")
+        channels = record.get("channels") or []
+        channels = (",".join(str(c) for c in channels) if isinstance(channels, list)
+                    else str(channels))
+        message = text(record, "message")[:60].replace("\n", " ")
         print(
-            f"{record.get('ts', '')[:19]:19s} "
-            f"{record.get('event', ''):14s} "
-            f"{record.get('priority', ''):7s} "
+            f"{text(record, 'ts')[:19]:19s} "
+            f"{text(record, 'event'):14s} "
+            f"{priority_name(text(record, 'priority')):7s} "
             f"{channels:8s} {message}"
         )
 
@@ -8922,6 +9096,10 @@ CONFIG_SETTERS = {
     "ntfy.server": ("URL", normalize_server),
     "ntfy.auth": ("user:pass or token ('none' clears it)",
                   lambda v: None if v.lower() == "none" else v),
+    # travels inside every ask's buttons: give it a publish-only token for
+    # the <topic>-responses topic, never the account password
+    "ntfy.action_auth": ("approval-button token ('none' clears it)",
+                         lambda v: None if v.lower() == "none" else v),
     "telegram.chat_id": ("chat id", lambda v: v),
     "webhook.token": ("shared secret for the local HTTP API ('none' clears it)",
                       lambda v: None if v.lower() == "none" else v),
@@ -8943,10 +9121,9 @@ def _one_of(value, allowed):
 
 
 def _coerce_topic(value):
-    validate_topic(value)
-    if len(value) > MAX_TOPIC_LEN:
-        raise RuntimeError(f"too long ({len(value)} chars, max {MAX_TOPIC_LEN}) - "
-                           f"'ask' also needs '{value}{RESPONSE_SUFFIX}' to fit in 64")
+    topic_status, topic_problem = rate_topic(value)
+    if topic_status == FAIL:
+        raise RuntimeError(f"'{value}' {topic_problem}")
     return value
 
 
@@ -8975,15 +9152,29 @@ def config_set(cfg, key, raw):
         value = coerce(raw)
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(f"{PROG}: bad value for {key}: {exc}  (expected {hint})")
+    ntfy = cfg.data.get("ntfy") or {}
+    if key == "ntfy.action_auth" and value and value == ntfy.get("auth"):
+        raise SystemExit(f"{PROG}: bad value for {key}: that is your ntfy.auth credential, and "
+                         "the buttons show it to every subscriber - use a token that may only "
+                         f"publish to <topic>{RESPONSE_SUFFIX}")
+    if key == "ntfy.server" and ntfy.get("server") \
+            and not _same_ntfy_server(ntfy.get("server"), value):
+        # same rule as init: credentials belong to the previous server, and
+        # the next send or ask would hand them to the new one
+        for cred in ("auth", "action_auth"):
+            if ntfy.get(cred):
+                ntfy[cred] = None
+                sys.stderr.write(f"{PROG}: ntfy server changed; ntfy.{cred} was cleared "
+                                 f"(set it again: agentbell config set ntfy.{cred} ...)\n")
     target = cfg.data
     parts = key.split(".")
     for part in parts[:-1]:
         target = target.setdefault(part, {})
     target[parts[-1]] = value
     cfg.save()
-    if key in ("ntfy.server", "ntfy.auth"):
+    if key in ("ntfy.server", "ntfy.auth", "ntfy.action_auth"):
         ntfy = cfg.data.get("ntfy") or {}
-        warn_cleartext_auth(ntfy.get("server"), ntfy.get("auth"))
+        warn_cleartext_auth(ntfy.get("server"), ntfy.get("auth") or ntfy.get("action_auth"))
     return value
 
 
@@ -9039,7 +9230,8 @@ def build_parser():
     p_notify.add_argument("--defer", action="store_true",
                           help="defer until after quiet hours instead of suppressing")
     p_notify.add_argument("--json", action="store_true")
-    p_notify.add_argument("--quiet", action="store_true", help="no stdout output")
+    p_notify.add_argument("--quiet", action="store_true",
+                          help="no stdout output (failures still go to stderr, exit 3)")
     p_notify.set_defaults(func=cmd_notify)
 
     p_hook = sub.add_parser(
