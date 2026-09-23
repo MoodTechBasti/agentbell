@@ -59,8 +59,12 @@ class _ProjectCase(unittest.TestCase):
 
     def _hooks_cli(self, sub, agent):
         out, err = io.StringIO(), io.StringIO()
+        self.exit_code = 0
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            an.cmd_hooks(base._Args(sub=sub, agent=[agent], project=self.project))
+            try:
+                an.cmd_hooks(base._Args(sub=sub, agent=[agent], project=self.project))
+            except SystemExit as exc:   # a refused install exits 1 (IW-8)
+                self.exit_code = exc.code
         return out.getvalue(), err.getvalue()
 
 

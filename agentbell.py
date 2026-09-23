@@ -3433,14 +3433,16 @@ def agentbell_binary():
     return os.path.abspath(__file__)
 
 
-def agentbell_command():
-    """The argv that runs this CLI from a hook.
+def agentbell_command(binary=None):
+    """The argv that runs this CLI (`binary`, default agentbell_binary())
+    from a hook or an MCP client.
 
     agentbell.py (a checkout, or the module pip installed when its launcher
     is not on PATH) is not executable: a hook that runs it by path fails
-    with exit 126. Run it with the interpreter that runs agentbell now.
+    with exit 126, an MCP client with EACCES (WinError 193 on Windows).
+    Run it with the interpreter that runs agentbell now.
     """
-    binary = agentbell_binary()
+    binary = binary or agentbell_binary()
     if binary.lower().endswith(".py") and sys.executable:
         return [sys.executable, binary]
     return [binary]
@@ -4123,14 +4125,21 @@ def _replace_toml_block(text, block):
     rebuilt = block.rstrip() + "\n"
     if foreign:
         rebuilt += "\n" + foreign + "\n"
-    new_text = text[:start].rstrip() + "\n" + rebuilt + text[end:].lstrip("\n")
+    before, after = text[:start], text[end:]
+    if before and not before.endswith("\n"):
+        before += "\n"
+    new_text = before + rebuilt + (after[1:] if after.startswith("\n") else after)
     if new_text == text:
         return text, True, False
     return new_text, True, True
 
 
 def _drop_toml_block(text, block):
-    """Remove our marked block. Foreign tables inside it stay in the file."""
+    """Remove our marked block. Foreign tables inside it stay in the file.
+
+    Install appends "\\n" + block, so exactly that newline goes back out
+    and every other byte of the text around the block stays.
+    """
     if TOML_START not in text or TOML_END not in text:
         return text, False
     start = text.index(TOML_START)
@@ -4138,8 +4147,14 @@ def _drop_toml_block(text, block):
     end = end_at + len(TOML_END)
     _owned, foreign = _partition_toml_interior(text[start + len(TOML_START):end_at], block)
     middle = (foreign + "\n") if foreign else ""
-    new_text = text[:start].rstrip() + ("\n" if (middle or text[end:].strip()) else "")
-    new_text += middle + text[end:].lstrip("\n")
+    before, after = text[:start], text[end:]
+    if after.startswith("\n"):
+        after = after[1:]
+    if before.endswith("\n\n") or before == "\n" or (before.endswith("\n") and not middle + after):
+        before = before[:-1]
+    elif before and not before.endswith("\n") and middle + after:
+        before += "\n"
+    new_text = before + middle + after
     return new_text, new_text != text
 
 
@@ -4197,12 +4212,80 @@ def _inline_hooks_note(agent, clash, tables):
             f"those hooks into {tables} tables, then run: {PROG} hooks install {agent}")
 
 
+def _read_toml(path):
+    """A Codex/Kimi config as (text with \\n line ends, the line end to write back).
+
+    Universal newlines turned a CRLF config into LF on the next write, and
+    on Windows an LF config into CRLF. The block helpers work on \\n;
+    `_write_toml` puts the file's own line end back.
+    """
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        raw = fh.read()
+    return raw.replace("\r\n", "\n"), _line_ending(raw)
+
+
+def _write_toml(path, text, eol):
+    _write_text_atomic(path, text.replace("\n", eol), newline="")
+
+
+def _toml_hook_key(chunk):
+    """(table, event, matcher, hook event, agent) of a hook table whose one
+    command is exactly an agentbell hook command, else None."""
+    commands = _toml_command_values(chunk)
+    parsed = _parse_our_hook_command(_toml_unquote(commands[0])) if len(commands) == 1 else None
+    if not parsed:
+        return None
+    event, matcher = (re.search(rf"(?m)^[ \t]*{key}[ \t]*=[ \t]*(.*?)\s*$", chunk)
+                      for key in ("event", "matcher"))
+    return ((_chunk_header(chunk), event and _toml_unquote(event.group(1)),
+             _matcher_key({"matcher": matcher and _toml_unquote(matcher.group(1))})) + parsed)
+
+
+def _unmarked_hook_state(text, block):
+    """How `text` already runs agentbell hooks outside our markers.
+
+    "ours": a table `block` writes, with the same table, event and command
+    (Kimi strips the markers and keeps the tables; a user may write it by
+    hand). "wrapper": a hook command that runs agentbell some other way.
+    Else "": the user's own agentbell hook elsewhere (PreToolUse) and a
+    commented-out line are not our lifecycle hooks, same test as JSON.
+    """
+    owned = {_toml_hook_key(chunk) for chunk in _iter_toml_chunks(block)} - {None}
+    state = ""
+    for chunk in _iter_toml_chunks(text):
+        if _toml_hook_key(chunk) in owned:
+            return "ours"
+        if any(_OUR_HOOK_RE.search(command) and not _is_our_hook_command(command)
+               for command in map(_toml_unquote, _toml_command_values(chunk))):
+            state = "wrapper"
+    return state
+
+
+def _unmarked_hooks_note(agent, state):
+    if state == "wrapper":
+        return _wrapped_hook_note(agent)
+    return (f"{agent}: hook commands are already in this file, but the agentbell "
+            "markers are gone (or were never there). Nothing was added, so the hooks "
+            "are not duplicated")
+
+
+def _toml_hooks_state(agent):
+    """"marked", "ours", "wrapper" or "" for the Codex or Kimi config."""
+    path, block = ((codex_config_path(), codex_hooks_block) if agent == "codex"
+                   else (kimi_config_path(), kimi_hooks_block))
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return ""
+    return "marked" if TOML_START in text else _unmarked_hook_state(text, block())
+
+
 def install_codex_hooks():
     path = codex_config_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
+        text, eol = _read_toml(path)
         if TOML_START in text:
             if TOML_END not in text:
                 return {"changed": False,
@@ -4216,14 +4299,17 @@ def install_codex_hooks():
                 new_text = _codex_insert_features_flag(new_text)
                 replaced = True
             if replaced:
-                _write_text_atomic(path, new_text)
+                _write_toml(path, new_text, eol)
                 return {"changed": True,
                         "notes": ["codex: updated the hook block (binary path, flags, "
                                   "or the old misplaced 'features.hooks = true')"]}
             # no note: the caller already says "already present"
             return {"changed": False, "notes": []}
     else:
-        text = ""
+        text, eol = "", os.linesep
+    state = _unmarked_hook_state(text, codex_hooks_block())
+    if state:
+        return {"changed": False, "notes": [_unmarked_hooks_note("codex", state)]}
     notes = []
     clash = _toml_array_clash(text, [("hooks", "UserPromptSubmit"), ("hooks", "Stop")])
     if clash:
@@ -4239,10 +4325,9 @@ def install_codex_hooks():
         new_text = text
     else:
         new_text = _codex_insert_features_flag(text)
-    if new_text and not new_text.endswith("\n"):
-        new_text += "\n"
-    new_text += "\n" + codex_hooks_block()
-    _write_text_atomic(path, new_text)
+    # a text without a final newline gets no blank line: uninstall takes
+    # back exactly this one "\n"
+    _write_toml(path, new_text + "\n" + codex_hooks_block(), eol)
     return {"changed": True, "notes": notes}
 
 
@@ -4250,19 +4335,22 @@ def uninstall_codex_hooks():
     path = codex_config_path()
     if not os.path.exists(path):
         return False
-    with open(path, "r", encoding="utf-8") as fh:
-        text = fh.read()
+    text, eol = _read_toml(path)
     # A missing end marker used to raise ValueError halfway through. Leave
     # the file untouched rather than guess where our block stops.
-    if TOML_START not in text or TOML_END not in text:
+    if (TOML_START in text) != (TOML_END in text):
         return False
-    new_text, _changed = _drop_toml_block(text, codex_hooks_block())
+    if TOML_START in text:
+        new_text, _changed = _drop_toml_block(text, codex_hooks_block())
+    else:
+        # status and install count these as installed; uninstall must too
+        new_text = _drop_unmarked_hooks(text, codex_hooks_block())[0]
     # only the line we added: an identical line the user wrote themselves has
     # no marker comment, and removing it would silently turn off their hooks
     new_text = _strip_codex_flag(new_text, marked_only=True)
     if new_text == text:
         return False
-    _write_text_atomic(path, new_text)
+    _write_toml(path, new_text, eol)
     return True
 
 
@@ -4761,10 +4849,9 @@ def kimi_hooks_block():
 def install_kimi_hooks():
     path = kimi_config_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    text = ""
+    text, eol = "", os.linesep
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
+        text, eol = _read_toml(path)
         if TOML_START in text:
             if TOML_END not in text:
                 return {"changed": False,
@@ -4772,79 +4859,52 @@ def install_kimi_hooks():
                                   "skipped to avoid breaking config"]}
             new_text, _present, replaced = _replace_toml_block(text, kimi_hooks_block())
             if replaced:
-                _write_text_atomic(path, new_text)
+                _write_toml(path, new_text, eol)
                 return {"changed": True,
                         "notes": ["kimi: updated the hook block (binary path or flags changed)"]}
             return {"changed": False, "notes": []}
-        # Kimi has been seen stripping the marker comments while leaving the
-        # hook tables in place. Appending a second block would run every
-        # hook twice. Leave the commands. Uninstall removes a table only
-        # when its command is exactly ours.
-        if _OUR_HOOK_RE.search(text):
-            return {"changed": False,
-                    "notes": ["kimi: hook commands are already in this file, but the "
-                              "agentbell markers are gone. Nothing was added, so the "
-                              "hooks are not duplicated. uninstall removes a command "
-                              "only when it is exactly ours"]}
+    # Kimi has been seen stripping the marker comments while leaving the
+    # hook tables in place. Appending a second block would run every hook
+    # twice. Uninstall removes those tables (_drop_unmarked_hooks).
+    state = _unmarked_hook_state(text, kimi_hooks_block())
+    if state:
+        return {"changed": False, "notes": [_unmarked_hooks_note("kimi", state)]}
     clash = _toml_array_clash(text, [("hooks",)])
     if clash:
         return {"changed": False, "notes": [_inline_hooks_note("kimi", clash, "[[hooks]]")]}
-    # Append to the bytes as they are (CRLF included), through a symlink.
-    raw = ""
-    if text:
-        with open(path, "r", encoding="utf-8", newline="") as fh:
-            raw = fh.read()
-    if raw and not raw.endswith("\n"):
-        raw += "\n"
-    _write_text_atomic(path, raw + "\n" + kimi_hooks_block(), newline="")
+    _write_toml(path, text + "\n" + kimi_hooks_block(), eol)
     return {"changed": True, "notes": []}
-
-
-def _kimi_hooks_installed():
-    """True when Kimi will run our hooks, markers or not.
-
-    Status used to require the marker comments. After Kimi removed them the
-    hooks were still live, and doctor recommended an install that appended
-    a second copy.
-    """
-    path = kimi_config_path()
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
-        return False
-    if TOML_START in text and TOML_END in text:
-        return True
-    return bool(_OUR_HOOK_RE.search(text))
 
 
 def _toml_command_values(chunk):
     return re.findall(r"(?m)^[ \t]*command[ \t]*=[ \t]*(.*?)\s*$", chunk)
 
 
-def _drop_unmarked_kimi_hooks(text):
-    """Remove `[[hooks]]` tables whose command is exactly ours.
+def _drop_unmarked_hooks(text, block):
+    """Remove the hook tables `block` writes from a config without markers.
 
-    Kimi deletes the marker comments and leaves the tables. Those tables
-    are still ours when every command matches `_is_our_hook_command` —
-    the same check install uses, not a guess. A table that only mentions
-    agentbell (a shell wrapper) stays. Returns (new_text, removed, leftover).
+    Kimi deletes the marker comments and leaves the tables; a Codex user
+    may have written the same hook by hand. A table is still ours when its
+    table, event and command are exactly what the block writes — the same
+    check install uses, not a guess. A bare Codex `[[hooks.Stop]]` above
+    it goes too, unless another hook still belongs to it. A shell wrapper,
+    or the user's own agentbell hook under another event, stays.
+    Returns (new_text, removed, leftover).
     """
-    kept = []
-    removed = 0
-    leftover = 0
-    for chunk in _iter_toml_chunks(text):
-        commands = [_toml_unquote(value) for value in _toml_command_values(chunk)]
-        ours = [command for command in commands if _is_our_hook_command(command)]
-        mentions = [command for command in commands if _OUR_HOOK_RE.search(command)]
-        exact = bool(commands) and len(ours) == len(commands) and _chunk_header(chunk) == "[[hooks]]"
-        if exact:
-            removed += 1
-            continue
-        if mentions:
-            leftover += len(mentions)
-        kept.append(chunk)
-    return "".join(kept), removed, leftover
+    owned = {_toml_hook_key(chunk) for chunk in _iter_toml_chunks(block)} - {None}
+    chunks = list(_iter_toml_chunks(text))
+    drop = {index for index, chunk in enumerate(chunks) if _toml_hook_key(chunk) in owned}
+    for index in sorted(drop):
+        parent = _chunk_header(chunks[index - 1]) if index else ""
+        if (parent and chunks[index - 1].strip() == parent
+                and _is_child_header(_chunk_header(chunks[index]), parent)
+                and not any(_is_child_header(_chunk_header(chunk), parent)
+                            for chunk in chunks[index + 1:index + 2])):
+            drop.add(index - 1)
+    kept = [chunk for index, chunk in enumerate(chunks) if index not in drop]
+    leftover = sum(1 for chunk in kept for value in _toml_command_values(chunk)
+                   if _OUR_HOOK_RE.search(_toml_unquote(value)))
+    return "".join(kept), len(drop), leftover
 
 
 def uninstall_kimi_hooks():
@@ -4859,26 +4919,25 @@ def uninstall_kimi_hooks():
     path = kimi_config_path()
     if not os.path.exists(path):
         return {"changed": False, "notes": []}
-    with open(path, "r", encoding="utf-8") as fh:
-        text = fh.read()
+    text, eol = _read_toml(path)
     if TOML_START in text and TOML_END in text:
         new_text, changed = _drop_toml_block(text, kimi_hooks_block())
         if not changed:
             return {"changed": False, "notes": []}
-        _write_text_atomic(path, new_text)
+        _write_toml(path, new_text, eol)
         return {"changed": True, "notes": []}
     if TOML_START in text or TOML_END in text:
         return {"changed": False,
                 "notes": ["kimi: found an agentbell marker without its pair; "
                           "left the file unchanged"]}
-    new_text, removed, leftover = _drop_unmarked_kimi_hooks(text)
+    new_text, removed, leftover = _drop_unmarked_hooks(text, kimi_hooks_block())
     notes = []
     if removed:
-        _write_text_atomic(path, new_text)
+        _write_toml(path, new_text, eol)
         notes.append("kimi: removed hook commands whose agentbell markers were already gone")
     if leftover:
-        notes.append("kimi: some hook lines mention agentbell but are not exactly "
-                     "our command, so they were left in place")
+        notes.append("kimi: some hook lines mention agentbell but are not the hooks "
+                     "agentbell writes, so they were left in place")
     return {"changed": removed > 0, "notes": notes}
 
 
@@ -4991,7 +5050,7 @@ AGENT_SPECS = {
         "detect": lambda: _detect_bins_paths(("codex",), (os.path.join(_home(), ".codex"),)),
         "path": lambda project: codex_config_path(),
         "install": lambda project, add: _codex_install(add),
-        "status": lambda project: _file_contains(codex_config_path(), TOML_START),
+        "status": lambda project: bool(_toml_hooks_state("codex")),
     },
     "gemini": {
         "scope": "global", "kind": "file", "reliability": "hook",
@@ -5006,7 +5065,7 @@ AGENT_SPECS = {
         "detect": lambda: _detect_bins_paths(("kimi",), (os.path.join(_home(), ".kimi-code"),)),
         "path": lambda project: kimi_config_path(),
         "install": lambda project, add: _kimi_install(add),
-        "status": lambda project: _kimi_hooks_installed(),
+        "status": lambda project: bool(_toml_hooks_state("kimi")),
     },
     "qwen-code": {
         "scope": "global", "kind": "file", "reliability": "hook",
@@ -5182,13 +5241,16 @@ def _unchanged_install_line(agent, project=None):
     of a stray marker or another agent's block is not installed, and status
     said so right after.
     """
-    try:
-        installed = AGENT_SPECS[agent]["status"](project)
-    except OSError:
-        installed = False
-    if installed:
+    if _hooks_in_place(agent, project):
         return f"hooks for {agent} already installed (nothing changed)"
     return f"hooks for {agent} NOT installed (nothing changed)"
+
+
+def _hooks_in_place(agent, project=None):
+    try:
+        return bool(AGENT_SPECS[agent]["status"](project))
+    except OSError:
+        return False
 
 
 def hooks_status(project=None):
@@ -5212,8 +5274,8 @@ def hooks_status(project=None):
             except OSError:
                 installed = False
         status = "installed" if installed else "not installed"
-        if (agent in ("claude", "gemini", "qwen-code")
-                and _has_user_wrapped_hook(path)):
+        if ((agent in ("claude", "gemini", "qwen-code") and _has_user_wrapped_hook(path))
+                or (agent in ("codex", "kimi") and _toml_hooks_state(agent) == "wrapper")):
             status = "user wrapper"
         if agent == "aider" and aider_state == "outdated":
             status = "update needed"
@@ -5361,9 +5423,9 @@ def mcp_handle(request):
                     "isError": True,
                 }
         else:
-            response["error"] = {"code": -32601, "message": f"method not found: {method}"}
+            return _rpc_error(request_id, -32601, f"method not found: {method}")
     except Exception as exc:  # noqa: BLE001
-        response["error"] = {"code": -32603, "message": str(exc)}
+        return _rpc_error(request_id, -32603, str(exc))
     return response
 
 
@@ -5459,8 +5521,22 @@ def opencode_config_path(project=None):
     return with_comments if os.path.exists(with_comments) else plain
 
 
-def _mcp_upsert_json(path, container, entry):
-    """Add our server under data[container]['agentbell'], keeping the rest."""
+def _mcp_upsert_json(path, container, entry, project=None):
+    """Add our server under data[container]['agentbell'], keeping the rest.
+
+    A project-scoped file must stay inside `project`: a cloned repo can ship
+    .cursor/mcp.json as a symlink to another JSON file of the user's, and
+    the writer follows symlinks (for dotfiles-managed global configs).
+    """
+    if project:
+        root, target = os.path.realpath(project), os.path.realpath(path)
+        try:
+            inside = os.path.commonpath([root, target]) == root
+        except ValueError:  # another drive (Windows)
+            inside = False
+        if not inside:
+            raise RuntimeError(f"{path} leads outside {project} (to {target}) - not writing "
+                               "through it. Remove the link, then run this again")
     data = {}
     if os.path.exists(path):
         try:
@@ -5506,35 +5582,77 @@ def _codex_mcp_spans(lines):
     return spans
 
 
-def _mcp_add_codex(binary):
-    path = codex_config_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    text = ""
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8", newline="") as fh:
-            text = fh.read()
+_TOML_STRING = r'"(?:[^"\\\n]|\\.)*"' + r"|'[^'\n]*'"
+
+
+def _toml_string_array(value):
+    """A one-line TOML array of strings as a list; None for anything else."""
+    value = value.strip()
+    if not (value.startswith("[") and value.endswith("]")):
+        return None
+    inner = value[1:-1]
+    if re.sub(_TOML_STRING, "", inner).replace(",", "").strip():
+        return None
+    return [_toml_unquote(item) for item in re.findall(_TOML_STRING, inner)]
+
+
+def _codex_mcp_table(text):
+    """(lines, {"command"/"args": (line index, value)}) of [mcp_servers.agentbell],
+    or None when the config has no such table."""
     lines = text.splitlines(keepends=True)
     for start, end, name in _codex_mcp_spans(lines):
         if name != CODEX_MCP_TABLE:
             continue
-        # A moved install (checkout -> pipx) leaves the old path behind:
-        # repair it like the JSON clients do. The other keys stay as they are.
+        keys = {}
         for index in range(start + 1, end):
             key, sep, value = _strip_toml_comment(lines[index]).partition("=")
-            if not sep or key.strip() != "command":
-                continue
-            if _toml_unquote(value) == binary:
-                return "already present"
-            ending = lines[index][len(lines[index].rstrip("\r\n")):]
-            lines[index] = f"command = {toml_string(binary)}{ending}"
-            _write_text_atomic(path, "".join(lines), newline="")
-            return f"updated the command path in {path}"
+            if sep and key.strip() in ("command", "args"):
+                keys[key.strip()] = (index, value.strip())
+        return lines, keys
+    return None
+
+
+def _is_our_mcp_argv(argv):
+    """[.../agentbell, "mcp"], behind a Python interpreter or not: what mcp add writes."""
+    if len(argv) == 3 and _PYTHON_STEM.match(_command_stem(argv[0])):
+        argv = argv[1:]
+    return len(argv) == 2 and _command_stem(argv[0]) == PROG and argv[1] == "mcp"
+
+
+def _codex_mcp_lines(argv):
+    return (f"command = {toml_string(argv[0])}",
+            "args = [" + ", ".join(toml_string(arg) for arg in argv[1:]) + "]")
+
+
+def _mcp_add_codex(binary):
+    path = codex_config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    text, eol = _read_toml(path) if os.path.exists(path) else ("", os.linesep)
+    argv = agentbell_command(binary) + ["mcp"]
+    command, args = _codex_mcp_lines(argv)
+    table = _codex_mcp_table(text)
+    if table is None:
+        separator = "\n" if text and not text.endswith("\n") else ""
+        _write_toml(path, f"{text}{separator}[mcp_servers.agentbell]\n{command}\n{args}\n", eol)
+        return f"written to {path}"
+    lines, keys = table
+    current = None
+    if "command" in keys and "args" in keys:
+        current = _toml_string_array(keys["args"][1])
+        current = current and [_toml_unquote(keys["command"][1])] + current
+    if current == argv:
         return "already present"
-    with open(path, "a", encoding="utf-8") as fh:
-        if text and not text.endswith("\n"):
-            fh.write("\n")
-        fh.write(f'[mcp_servers.agentbell]\ncommand = {toml_string(binary)}\nargs = ["mcp"]\n')
-    return f"written to {path}"
+    # A moved install (checkout -> pipx) leaves the old path behind: repair
+    # it like the JSON clients do, command and args together. A runner the
+    # user chose (uvx, pipx run) is theirs, and a new command in front of
+    # its args would not start.
+    if not (current and _is_our_mcp_argv(current)):
+        return (f"left unchanged: [mcp_servers.agentbell] in {path} does not run "
+                f"agentbell's own command. To use this install, set {command} and {args}")
+    lines[keys["command"][0]] = command + "\n"
+    lines[keys["args"][0]] = args + "\n"
+    _write_toml(path, "".join(lines), eol)
+    return f"updated the command path in {path}"
 
 
 def mcp_client_present(client):
@@ -5573,8 +5691,9 @@ def mcp_add_configs(binary, project=None, clients=None):
     reported per client instead of aborting - one broken config must not stop
     the rest.
     """
-    entry = {"command": binary, "args": ["mcp"]}
-    stdio_entry = {"type": "stdio", "command": binary, "args": ["mcp"]}
+    argv = agentbell_command(binary) + ["mcp"]
+    entry = {"command": argv[0], "args": argv[1:]}
+    stdio_entry = {"type": "stdio", "command": argv[0], "args": argv[1:]}
     if clients:
         chosen = list(clients)
     else:
@@ -5588,7 +5707,7 @@ def mcp_add_configs(binary, project=None, clients=None):
     for client in chosen:
         try:
             if client == "claude":
-                rows.append((client, _mcp_add_claude_code(binary, entry)))
+                rows.append((client, _mcp_add_claude_code(entry)))
             elif client == "claude-desktop":
                 rows.append((client, _mcp_upsert_json(
                     claude_desktop_config_path(), "mcpServers", entry)))
@@ -5601,13 +5720,13 @@ def mcp_add_configs(binary, project=None, clients=None):
                     gemini_settings_path(), "mcpServers", entry)))
             elif client == "qwen-code":
                 rows.append((client, _mcp_upsert_json(
-                    qwen_settings_path(project), "mcpServers", entry)))
+                    qwen_settings_path(project), "mcpServers", entry, project)))
             elif client == "kimi":
                 rows.append((client, _mcp_upsert_json(
-                    kimi_mcp_path(project), "mcpServers", entry)))
+                    kimi_mcp_path(project), "mcpServers", entry, project)))
             elif client == "cursor":
                 rows.append((client, _mcp_upsert_json(
-                    cursor_mcp_path(project), "mcpServers", entry)))
+                    cursor_mcp_path(project), "mcpServers", entry, project)))
             elif client == "vscode":
                 rows.append((client, _mcp_upsert_json(
                     vscode_mcp_path(), "servers", stdio_entry)))
@@ -5620,12 +5739,13 @@ def mcp_add_configs(binary, project=None, clients=None):
     return rows
 
 
-def _mcp_add_claude_code(binary, entry):
+def _mcp_add_claude_code(entry):
     claude_bin = shutil.which("claude")
     if claude_bin:
         try:
             subprocess.run(
-                [claude_bin, "mcp", "add", "--scope", "user", "agentbell", "--", binary, "mcp"],
+                [claude_bin, "mcp", "add", "--scope", "user", "agentbell", "--", entry["command"]]
+                + entry["args"],
                 check=True, timeout=30, capture_output=True,
             )
             return "registered via 'claude mcp add --scope user'"
@@ -5660,7 +5780,7 @@ def jsonc_has_comments(text):
 
 
 def _mcp_add_opencode(binary, project=None):
-    entry = {"type": "local", "command": [binary, "mcp"], "enabled": True}
+    entry = {"type": "local", "command": agentbell_command(binary) + ["mcp"], "enabled": True}
     path = opencode_config_path(project)
     if path.endswith(".jsonc") and os.path.exists(path):
         try:
@@ -5674,23 +5794,30 @@ def _mcp_add_opencode(binary, project=None):
             return (f"skipped: {path} has comments that a rewrite would drop. "
                     "Add this to its \"mcp\" block:\n"
                     f'             "agentbell": {json.dumps(entry)}')
-    return _mcp_upsert_json(path, "mcp", entry)
+    return _mcp_upsert_json(path, "mcp", entry, project)
 
 
 def mcp_snippet(binary):
     """A ready-to-paste config for MCP clients we do not write ourselves."""
-    generic = {"mcpServers": {"agentbell": {"command": binary, "args": ["mcp"]}}}
-    vscode = {"servers": {"agentbell": {"type": "stdio", "command": binary, "args": ["mcp"]}}}
+    argv = agentbell_command(binary) + ["mcp"]
+    server = {"command": argv[0], "args": argv[1:]}
+    generic = {"mcpServers": {"agentbell": server}}
+    vscode = {"servers": {"agentbell": dict(type="stdio", **server)}}
+    # zed.dev/docs/ai/mcp (checked 2026-09-23): custom servers go under
+    # "context_servers" in Zed's settings.json, not "mcpServers"
+    zed = {"context_servers": {"agentbell": dict(server, env={})}}
     return (
-        "Most clients (Claude Desktop, Cursor, Windsurf, Zed, Kimi Code, ...) - "
+        "Most clients (Claude Desktop, Cursor, Windsurf, Kimi Code, ...) - "
         "mcp/claude_desktop config:\n"
         + json.dumps(generic, indent=2)
         + "\n\nVS Code (.vscode/mcp.json or user mcp.json):\n"
         + json.dumps(vscode, indent=2)
+        + "\n\nZed (settings.json - command palette: zed: open settings file):\n"
+        + json.dumps(zed, indent=2)
         + "\n\nKimi Code (~/.kimi-code/mcp.json):\n"
         + json.dumps(generic, indent=2)
         + "\n\nCodex CLI + ChatGPT Desktop (~/.codex/config.toml):\n"
-        + f'[mcp_servers.agentbell]\ncommand = {toml_string(binary)}\nargs = ["mcp"]\n'
+        + "[mcp_servers.agentbell]\n" + "\n".join(_codex_mcp_lines(argv)) + "\n"
     )
 
 
@@ -6205,21 +6332,56 @@ def _shared_dir_entry(kind, directory, names):
     }
 
 
-def _mcp_has_entry(path, container):
-    """True only if this JSON config really registers our MCP server.
+def _mcp_entry(path, container):
+    """Our MCP server's entry in this JSON config ({} when it is not an
+    object), or None when the config really registers none.
 
     A substring match would also hit unrelated paths that contain the string
     'agentbell' (project keys in ~/.claude.json, for example).
     """
     if not os.path.exists(path):
-        return False
+        return None
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        return False
+        return None
     servers = data.get(container) if isinstance(data, dict) else None
-    return isinstance(servers, dict) and "agentbell" in servers
+    if not (isinstance(servers, dict) and "agentbell" in servers):
+        return None
+    return servers["agentbell"] if isinstance(servers["agentbell"], dict) else {}
+
+
+def _mcp_has_entry(path, container):
+    return _mcp_entry(path, container) is not None
+
+
+def _mcp_command_runs(command):
+    """Can an MCP client start `command` (no shell)? A .py path cannot: a
+    checkout has agentbell.py as 0644, and Windows cannot start a script."""
+    return not command.lower().endswith(".py") and shutil.which(command) is not None
+
+
+def _mcp_registrations():
+    """(client, command) for each MCP registration doctor checks; command
+    is None when there is nothing to check (no command key)."""
+    rows = []
+    for name, path, container in _mcp_registered_targets():
+        entry = _mcp_entry(path, container)
+        if entry is not None:
+            command = entry.get("command")
+            if isinstance(command, list):   # OpenCode: one argv list
+                command = command[0] if command else None
+            rows.append((name, command if isinstance(command, str) else None))
+    try:
+        table = _codex_mcp_table(_read_toml(codex_config_path())[0])
+    except (OSError, ValueError):
+        table = None
+    if table is not None:
+        keys = table[1]
+        rows.append(("codex/chatgpt-desktop",
+                     _toml_unquote(keys["command"][1]) if "command" in keys else None))
+    return rows
 
 
 def _remove_mcp_server_key(path, container):
@@ -7306,13 +7468,18 @@ def doctor_checks(cfg, send=False):
             checks.append(_check(WARN, "agent hooks", "no agent is wired up yet",
                                  "agentbell hooks install all"))
 
-    registered = [name for name, path, container in _mcp_registered_targets()
-                  if _mcp_has_entry(path, container)]
-    if _file_contains(codex_config_path(), "[mcp_servers.agentbell]"):
-        registered.append("codex/chatgpt-desktop")
-    if registered:
-        checks.append(_check(OK, "mcp", "registered in " + ", ".join(registered)))
-    else:
+    registrations = _mcp_registrations()
+    broken = [(name, command) for name, command in registrations
+              if command is not None and not _mcp_command_runs(command)]
+    working = [name for name, command in registrations if (name, command) not in broken]
+    if working:
+        checks.append(_check(OK, "mcp", "registered in " + ", ".join(working)))
+    if broken:
+        checks.append(_check(
+            WARN, "mcp", "registered in " + ", ".join(name for name, _ in broken)
+            + ", but the client cannot start " + ", ".join(sorted({c for _, c in broken})),
+            "agentbell mcp add " + " ".join(name.split("/")[0] for name, _ in broken)))
+    if not registrations:
         checks.append(_check(WARN, "mcp", "not registered in any client (optional)",
                              "agentbell mcp add"))
 
@@ -9087,6 +9254,10 @@ def cmd_hooks(args):
                 print(f"installed hooks for {agent}: {result['path']}")
             else:
                 print(_unchanged_install_line(agent, project))
+                if not _hooks_in_place(agent, project):
+                    # a refused config (TOML clash, stray rule-file marker)
+                    # fails like a refused JSONC settings.json does
+                    failed.append(agent)
         else:
             print(f"{'removed' if result['changed'] else 'nothing to remove'} for {agent}")
         for note in result.get("notes", []):
