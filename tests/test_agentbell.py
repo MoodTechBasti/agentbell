@@ -2493,6 +2493,8 @@ class TestBotDaemon(_TelegramFixture):
         except OSError:
             pass
 
+    @unittest.skipUnless(an._process_start_token(),
+                         "no process start time on this OS; the pid check decides")
     def test_a_reused_pid_does_not_keep_the_lock(self):
         """SIGKILL leaves the lock. The pid can belong to something else."""
         path = os.path.join(an.state_dir(), "bot.lock")

@@ -708,19 +708,26 @@ def safe_url(url):
     return _TG_TOKEN_RE.sub("/bot<redacted>", str(url))
 
 
+# Whitespace plus the invisible characters a copy-paste or a UTF-8 file with
+# a BOM leaves around a token. str.strip() keeps those: to Python they are
+# not whitespace.
+_TOKEN_EDGE_RE = re.compile(r"^[\s\ufeff\u200b-\u200d\u2060]+|[\s\ufeff\u200b-\u200d\u2060]+$")
+
+
 def _telegram_token(token):
     """The bot token, or PermanentError that does not repeat it.
 
-    A paste often carries a trailing newline. That is still the token.
-    A space or CR inside it is not a token Telegram will accept, and it
+    A paste often carries a trailing newline or a zero-width character.
+    That is still the token. Anything inside it that is not printable
+    ASCII (space, CR, U+200B) is not a token Telegram will accept, and it
     must not be copied into the error: the URL parser quotes the whole
-    URL, and the old scrubber stopped at the whitespace.
+    URL, the old scrubber stopped at the whitespace, and a non-ASCII
+    character crashed the HTTP library with a traceback.
     """
-    cleaned = str(token or "").strip()
-    # Surrounding whitespace is a paste. Whitespace inside the token is not,
-    # and it must not be repeated: the HTTP library quotes the raw URL.
-    if not cleaned or any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
-        raise PermanentError("invalid bot token")
+    cleaned = _TOKEN_EDGE_RE.sub("", str(token or ""))
+    if not cleaned or any(not 32 < ord(ch) < 127 for ch in cleaned):
+        raise PermanentError("invalid bot token (it contains a space, a line break, "
+                             "an invisible character or another non-ASCII character)")
     return cleaned
 
 
@@ -1009,21 +1016,29 @@ class TelegramChannel:
         A TransientError (timeout, DNS, 5xx) passes through unchanged: it says
         nothing about the token. Calling that "invalid bot token" sends people
         to BotFather to mint a replacement for a token that was fine all along.
+        A token refused before any request keeps its own message; wrapping it
+        printed "invalid bot token: invalid bot token".
         """
+        token = _telegram_token(token)
         try:
             result = TelegramChannel._call(token, "getMe")
         except TransientError:
             raise
         except RuntimeError as exc:
-            raise PermanentError(f"invalid bot token: {exc}") from exc
+            raise PermanentError(f"invalid bot token - Telegram rejected it: {exc}") from exc
         return (result or {}).get("username")
 
     @staticmethod
     def find_chat_id(token):
+        """The newest private chat with the bot, or None.
+
+        A bot that was added to a group or a channel sees those messages too.
+        Taking one of them would send every question to the group, and let
+        anyone in it answer.
+        """
         for update in reversed(TelegramChannel._call(token, "getUpdates") or []):
-            message = update.get("message") or update.get("channel_post") or {}
-            chat = message.get("chat") or {}
-            if chat.get("id"):
+            chat = (update.get("message") or {}).get("chat") or {}
+            if chat.get("id") and chat.get("type") == "private":
                 return chat["id"]
         return None
 
@@ -1642,7 +1657,11 @@ def _consumed_lock_path(name):
 def _acquire_consumed_lock(name):
     """Acquire an atomic cross-process lock for one consumed-answer log."""
     ensure_state_dir()
-    path = _consumed_lock_path(name)
+    return _acquire_lock_dir(_consumed_lock_path(name), "the consumed-answer log")
+
+
+def _acquire_lock_dir(path, what):
+    """Short cross-process mutex: mkdir is atomic everywhere. Release: os.rmdir."""
     deadline = time.monotonic() + CONSUMED_LOCK_TIMEOUT_SECONDS
     while True:
         try:
@@ -1674,7 +1693,7 @@ def _acquire_consumed_lock(name):
                 if os.name != "nt":
                     raise
         if time.monotonic() >= deadline:
-            raise OSError("timed out locking the consumed-answer log")
+            raise OSError(f"timed out locking {what}")
         time.sleep(0.01)
 
 
@@ -1747,7 +1766,8 @@ def _update_bot_state(**changes):
 def write_bot_heartbeat(extra=None):
     now = time.time()
     state = _read_bot_state()
-    _update_bot_state(pid=os.getpid(), ts=now,
+    # `start` lets readers tell this bot from a later process with its pid
+    _update_bot_state(pid=os.getpid(), ts=now, start=_process_start_token() or None,
                       started_at=state.get("started_at", now), **(extra or {}))
 
 
@@ -1763,13 +1783,12 @@ def bot_heartbeat_fresh(max_age=BOT_HEARTBEAT_MAX_AGE):
     A fresh timestamp is not enough: a daemon killed a second ago leaves one
     behind, and `ask` would attach buttons that nobody is listening for.
     """
+    data = _read_bot_state()
+    if not _bot_lock_is_live(data):
+        return False
     try:
-        with open(_bot_state_path(), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if not data.get("pid") or not _pid_alive(data["pid"]):
-            return False
         return (time.time() - float(data.get("ts", 0))) < max_age
-    except (OSError, ValueError, TypeError):
+    except (ValueError, TypeError):
         return False
 
 
@@ -1805,19 +1824,39 @@ def _pid_alive(pid):
 
 
 def _process_start_token(pid=None):
-    """Linux start-time field for `pid`, or "" when this host has none.
+    """Start time of `pid` as an opaque string, or "" when this host has none.
 
-    /proc/<pid>/stat field 22. It stays constant for the life of that
-    process and changes when the pid is reused, which a bare pid check
-    cannot see. The command name is in parentheses and may itself contain
-    spaces and parentheses, so the fields after the last ')' are what counts.
+    It stays constant for the life of that process and changes when the
+    pid is reused, which a bare pid check cannot see. Linux: /proc/<pid>/stat
+    field 22. Windows: the creation time (Windows hands pids out again
+    quickly). macOS has none here, so the pid check alone decides there.
     """
     pid = os.getpid() if pid is None else pid
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ""
+            try:
+                created, unused = ctypes.c_ulonglong(), ctypes.c_ulonglong()
+                if not kernel32.GetProcessTimes(handle, ctypes.byref(created),
+                                                ctypes.byref(unused), ctypes.byref(unused),
+                                                ctypes.byref(unused)):
+                    return ""
+                return str(created.value)
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - never let a liveness probe raise
+            return ""
     try:
         with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8") as fh:
             stat = fh.read()
     except (OSError, ValueError):
         return ""
+    # The command name is in parentheses and may itself contain spaces and
+    # parentheses, so the fields after the last ')' are what counts.
     fields = stat.rpartition(")")[2].split()
     # state is field 3, so field 22 is index 19 of what follows the comm.
     if len(fields) <= 19:
@@ -1826,7 +1865,12 @@ def _process_start_token(pid=None):
 
 
 def _bot_lock_is_live(data):
-    """True only when the recorded process is still that same process."""
+    """True only when the recorded process is still that same process.
+
+    `data` is bot.lock or bot.json. The lock, `bot status`, `uninstall`,
+    `doctor` and `ask` all ask this; a bare pid check called a bot
+    "running" after its pid had gone to another program.
+    """
     if not isinstance(data, dict):
         return False
     try:
@@ -1844,34 +1888,61 @@ def _bot_lock_is_live(data):
     return str(current) == str(recorded)
 
 
+def _bot_lock_path():
+    return os.path.join(state_dir(), "bot.lock")
+
+
+def _read_bot_lock(path=None):
+    try:
+        with open(path or _bot_lock_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def acquire_bot_lock():
-    """Exclusive lock so only one answer daemon polls getUpdates at a time."""
+    """Exclusive lock so only one answer daemon polls getUpdates at a time.
+
+    Check and takeover run under a short mutex. Without it, two bots that
+    started together could both find the lock stale (or one found the
+    other's lock still empty), each removed the other's fresh lock, and
+    both ran.
+    """
     ensure_state_dir()
-    path = os.path.join(state_dir(), "bot.lock")
-    for _ in range(2):
+    path = _bot_lock_path()
+    try:
+        guard = _acquire_lock_dir(path + ".guard", "the bot lock")
+    except OSError as exc:
+        raise SystemExit(f"{PROG}: could not acquire bot lock at {path}: {exc}")
+    try:
+        data = _read_bot_lock()
+        if _bot_lock_is_live(data):
+            raise SystemExit(
+                f"{PROG}: another agentbell bot is already running (pid {data.get('pid')})"
+            )
+        # written whole in one step: a reader never sees an empty lock
+        write_json_atomic(path, {"pid": os.getpid(), "ts": time.time(),
+                                 "start": _process_start_token() or None}, mode=0o644)
+    except OSError as exc:
+        raise SystemExit(f"{PROG}: could not write bot lock {path}: {exc}")
+    finally:
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            data = {}
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-            except (OSError, ValueError):
-                pass
-            if _bot_lock_is_live(data):
-                raise SystemExit(
-                    f"{PROG}: another agentbell bot is already running (pid {data.get('pid')})"
-                )
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            continue
-        start = _process_start_token() or None
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"pid": os.getpid(), "ts": time.time(), "start": start}, fh)
-        return path
-    raise SystemExit(f"{PROG}: could not acquire bot lock at {path}")
+            os.rmdir(guard)
+        except OSError:
+            pass
+    return path
+
+
+def release_bot_lock(path):
+    """Remove the lock if it is still ours; a later bot may own it by now."""
+    data = _read_bot_lock(path)
+    if (data.get("pid"), data.get("start")) != (os.getpid(), _process_start_token() or None):
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def publish_with_retry(fn, attempts=None):
@@ -2521,7 +2592,7 @@ def _denial_reason(text, no_label):
     return None
 
 
-def _parse_answer(text, yes_label="Approve", no_label="Deny"):
+def _parse_answer(text, yes_label="Approve", no_label="Deny", approval_id=None):
     """Classify an answer as approved / denied / free text.
 
     Approval is only a bare "yes" (or `ja`), the yes button's label alone,
@@ -2536,11 +2607,12 @@ def _parse_answer(text, yes_label="Approve", no_label="Deny"):
     cleaned = (text or "").strip()
     if not cleaned:
         return "denied", ""
-    # machine-generated button bodies: "APPROVED <id>" / "DENIED <id>"
-    if re.fullmatch(r"approved?\s+[0-9a-f]+", cleaned, re.I):
-        return "approved", ""
-    if re.fullmatch(r"denied?\s+[0-9a-f]+", cleaned, re.I):
-        return "denied", ""
+    # machine-generated button bodies: "APPROVED <id>" / "DENIED <id>". With
+    # `approval_id` the id must be this question's: typed on Telegram,
+    # "approve 2" is a reply about option 2, not a button press.
+    body = re.fullmatch(r"(approved?|denied?)\s+([0-9a-f]+)", cleaned, re.I)
+    if body and (approval_id is None or body.group(2).lower() == approval_id):
+        return ("approved" if body.group(1)[0] in "aA" else "denied"), ""
     normalized = cleaned.replace("\u2019", "'").replace("\u2018", "'")
     standalone = _strip_trailing_punct(normalized)
     yes = _strip_trailing_punct((yes_label or "").strip())
@@ -3081,7 +3153,8 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         write_history({"event": "ask_result", "approval_id": approval_id, "result": "timeout"})
         return {"approved": False, "answer": None, "denied": False, "timeout": True}
     text = result["message"]
-    kind, answer = _parse_answer(text, yes_label=yes_label, no_label=no_label)
+    kind, answer = _parse_answer(text, yes_label=yes_label, no_label=no_label,
+                                 approval_id=approval_id)
     write_history({"event": "ask_result", "approval_id": approval_id,
                    "result": kind, "answer": answer, "raw": text, "channel": channel})
     if kind == "denied":
@@ -5666,19 +5739,12 @@ def purge_report(project=None):
     entries.extend(_mcp_entries(project))
 
     # 5. A running bot would recreate state files; warn but do not kill it
-    lock_path = os.path.join(state_dir(), "bot.lock")
-    if os.path.exists(lock_path):
-        lock_pid = None
-        try:
-            with open(lock_path, "r", encoding="utf-8") as fh:
-                lock_pid = json.load(fh).get("pid")
-        except (OSError, ValueError):
-            pass
-        if lock_pid and _pid_alive(int(lock_pid)):
-            warnings.append(
-                f"an agentbell bot is running (pid {lock_pid}); stop it first, "
-                "otherwise it will recreate state files"
-            )
+    lock = _read_bot_lock()
+    if _bot_lock_is_live(lock):
+        warnings.append(
+            f"an agentbell bot is running (pid {lock.get('pid')}); stop it first, "
+            "otherwise it will recreate state files"
+        )
 
     return {"entries": entries, "warnings": warnings}
 
@@ -5986,6 +6052,26 @@ def bot_poll_once(cfg, offset=None, poll_timeout=25):
     return next_offset
 
 
+def _bot_poll_error(error):
+    """What the log and `bot status` say about a failed getUpdates.
+
+    Telegram answers 409 Conflict for two different problems: a webhook is
+    set on the bot, or another program polls the same token. Only the
+    description tells them apart. Calling both "webhook" (and matching
+    "409" anywhere, an offset included) sent people to delete a webhook
+    that was never there.
+    """
+    if "webhook" in error.lower():
+        return ("Telegram says a webhook is active on this bot; getUpdates cannot "
+                "be used alongside it. Disable the webhook first (see README).")
+    if re.search(r"\bHTTP 409\b", error) or "terminated by other getUpdates" in error:
+        return ("Telegram says another program is polling this bot token (409 Conflict); "
+                "only one can. Stop the other one: an agentbell bot on another machine "
+                "or with another state dir (WSL and Windows count as two), or another "
+                "app that uses this bot token.")
+    return error
+
+
 def run_bot(cfg, poll_timeout=25):
     if not premium_enabled(cfg):
         raise SystemExit(f"{PROG}: {LICENSE_PREMIUM_MSG}")
@@ -5996,38 +6082,32 @@ def run_bot(cfg, poll_timeout=25):
     write_bot_heartbeat()
     print(f"{PROG}: Telegram answer bot running (chat {tg.get('chat_id')}). Ctrl-C to stop.")
     offset = None
-    # SIGTERM (service stop) used to kill the process before `finally`, so
-    # the lock stayed. The next start then refused whenever that pid was
-    # alive again, even if it was a different program.
+    # A service stop (systemctl stop, launchctl unload, a plain kill) sends
+    # SIGTERM. That is the same request as Ctrl-C: release the lock, exit 0.
+    # Without a handler the lock stayed behind; exiting 143 instead left the
+    # systemd unit "failed", and Restart=on-failure restarted the bot that
+    # had just been stopped on purpose.
     term_installed = False
     previous_term = None
 
     def _on_term(signum, _frame):
-        raise SystemExit(128 + signum)
+        raise KeyboardInterrupt
 
     try:
-        previous_term = signal.signal(signal.SIGTERM, _on_term)
-        term_installed = True
-    except (OSError, ValueError):
-        term_installed = False
-    try:
+        try:
+            previous_term = signal.signal(signal.SIGTERM, _on_term)
+            term_installed = True
+        except (OSError, ValueError):
+            term_installed = False
         while True:
             write_bot_heartbeat()
             try:
                 offset = bot_poll_once(cfg, offset=offset, poll_timeout=poll_timeout)
                 write_bot_error(None)
             except RuntimeError as exc:
-                error = str(exc)
-                if "409" in error or "webhook" in error:
-                    message = (
-                        "Telegram says a webhook is active on this bot; getUpdates cannot "
-                        "be used alongside it. Disable the webhook first (see README)."
-                    )
-                    sys.stderr.write(f"{PROG}: {message}\n")
-                    write_bot_error(message)
-                else:
-                    sys.stderr.write(f"{PROG}: {error}\n")
-                    write_bot_error(error)
+                message = _bot_poll_error(str(exc))
+                sys.stderr.write(f"{PROG}: {message}\n")
+                write_bot_error(message)
                 time.sleep(5)
             # The daemon is a natural drain point - but answering approvals
             # comes first, so one cycle's drain is capped well inside the
@@ -6043,10 +6123,7 @@ def run_bot(cfg, poll_timeout=25):
         print(f"\n{PROG}: bot stopped. Telegram buttons are inactive until you start it again.")
     finally:
         # release the lock so the next start does not have to reclaim it
-        try:
-            os.remove(lock_path)
-        except OSError:
-            pass
+        release_bot_lock(lock_path)
         if term_installed:
             try:
                 signal.signal(signal.SIGTERM, previous_term)
@@ -6141,7 +6218,7 @@ def print_bot_status(cfg):
     if data:
         pid = data.get("pid")
         age = time.time() - float(data.get("ts", 0))
-        pid_alive = bool(pid) and _pid_alive(int(pid))
+        pid_alive = _bot_lock_is_live(data)
         if pid_alive and age < BOT_HEARTBEAT_MAX_AGE:
             print(f"bot:       running (pid {pid}, heartbeat {int(age)}s ago)")
         elif pid_alive:
@@ -6152,21 +6229,17 @@ def print_bot_status(cfg):
             print(f"last error: {data['last_error']}")
     else:
         print("bot:       NOT running (start with 'agentbell bot')")
-    lock_path = os.path.join(state_dir(), "bot.lock")
+    lock_path = _bot_lock_path()
     if os.path.exists(lock_path):
-        lock_pid = None
-        try:
-            with open(lock_path, "r", encoding="utf-8") as fh:
-                lock_pid = json.load(fh).get("pid")
-        except (OSError, ValueError):
-            pass
-        if lock_pid and _pid_alive(int(lock_pid)):
+        lock = _read_bot_lock(lock_path)
+        lock_pid = lock.get("pid")
+        if _bot_lock_is_live(lock):
             if str(lock_pid) == str(data.get("pid")):
                 print(f"lock:      held by the running bot (pid {lock_pid})")
             else:
                 print(f"lock:      held by another live process (pid {lock_pid})")
         else:
-            print(f"lock:      stale (pid {lock_pid} is gone) - a new bot can start")
+            print(f"lock:      stale (the bot with pid {lock_pid} is gone) - a new bot can start")
     else:
         print("lock:      none")
     pending = []
@@ -6890,6 +6963,8 @@ def prompt_bot_token(attempts=3, reader=None):
             print("    agentbell init")
             return None
         try:
+            # saved without the paste debris (BOM, zero-width space) it came with
+            token = _telegram_token(token)
             username = TelegramChannel.validate_token(token)
             print(f"  Bot @{username} is valid.")
             return token
@@ -6901,7 +6976,7 @@ def prompt_bot_token(attempts=3, reader=None):
                 print("  Keeping it unverified. Verify later with: agentbell doctor")
                 return token
         except RuntimeError as exc:
-            print(f"  Telegram rejected it: {exc}")
+            print(f"  {exc}")
             print("  Copy the token again from @BotFather (/mybots -> API Token).")
         if attempt == attempts - 1:
             print("  Skipping Telegram for now - everything else stays configured.")
@@ -7061,6 +7136,9 @@ def cmd_init(args):
                 input("  Press Enter after sending...")
                 try:
                     chat_id = TelegramChannel.find_chat_id(token)
+                    if not chat_id:
+                        print("  No private message to the bot found (messages in groups "
+                              "and channels do not count).")
                 except RuntimeError as exc:
                     print(f"  Could not reach Telegram ({exc}).")
                     chat_id = None
@@ -7679,7 +7757,7 @@ LAUNCHD_PLIST = """\
   <key>ProgramArguments</key>
   <array><string>{binary}</string><string>bot</string><string>run</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
 </dict>
 </plist>
 """
@@ -7702,38 +7780,59 @@ def _write_service_file(path, content):
     return path
 
 
+def _run_service_step(cmd, **kwargs):
+    """Run one service-manager command; None when it worked, else why not."""
+    try:
+        done = subprocess.run(cmd, check=False, **kwargs)
+    except OSError as exc:
+        return f"'{' '.join(cmd)}' could not run ({exc})"
+    if done.returncode != 0:
+        return f"'{' '.join(cmd)}' failed (exit {done.returncode})"
+    return None
+
+
 def install_bot_service():
     """Install the answer daemon as a background service.
 
     'agentbell bot' in a terminal dies with the terminal, and the copy-the-
     example-file instruction only worked from a git checkout. Returns
-    (path, started, note).
+    (path, started, note): `note` is how to check on it, or, when the
+    service did not start, what went wrong and what to do instead.
     """
     binary = agentbell_binary()
-    if sys.platform == "darwin":
-        # a path with & or < in it would otherwise produce an invalid plist
-        from xml.sax.saxutils import escape as xml_escape      # only macOS needs it
-        path = _write_service_file(launchd_plist_path(),
-                                   LAUNCHD_PLIST.format(binary=xml_escape(binary)))
-        subprocess.run(["launchctl", "unload", path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        done = subprocess.run(["launchctl", "load", path],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        return path, done.returncode == 0, "launchctl list | grep agentbell"
     if sys.platform.startswith("win"):
         raise SystemExit(f"{PROG}: no service installer for Windows yet. Keep 'agentbell bot' "
                          "running in a terminal, or run it under WSL.")
-    path = _write_service_file(systemd_unit_path(), SYSTEMD_UNIT.format(binary=binary))
+    if sys.platform == "darwin":
+        # a path with & or < in it would otherwise produce an invalid plist
+        from xml.sax.saxutils import escape as xml_escape      # only macOS needs it
+        path, content = launchd_plist_path(), LAUNCHD_PLIST.format(binary=xml_escape(binary))
+    else:
+        path, content = systemd_unit_path(), SYSTEMD_UNIT.format(binary=binary)
+    try:
+        _write_service_file(path, content)
+    except OSError as exc:
+        raise SystemExit(f"{PROG}: could not write the service file {path}: {exc}")
+    if sys.platform == "darwin":
+        # unloading a job that is not loaded fails, and that is fine
+        subprocess.run(["launchctl", "unload", path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        problem = _run_service_step(["launchctl", "load", path], stdout=subprocess.DEVNULL)
+        if problem:
+            return path, False, f"{problem}. The plist is in place; see the error above."
+        return path, True, "launchctl list | grep agentbell"
     # WSL and containers often have no user session bus; say so instead of
     # leaving a unit file that never runs.
     if not shutil.which("systemctl") or not os.path.isdir("/run/systemd/system"):
         return path, False, ("systemd is not running here (WSL without systemd, or a container). "
                              "Start the bot from your shell profile instead:\n"
                              f"    nohup {shlex.quote(binary)} bot run >/dev/null 2>&1 &")
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-    done = subprocess.run(["systemctl", "--user", "enable", "--now", "agentbell-bot"],
-                          check=False)
-    return path, done.returncode == 0, "systemctl --user status agentbell-bot"
+    problem = (_run_service_step(["systemctl", "--user", "daemon-reload"])
+               or _run_service_step(["systemctl", "--user", "enable", "--now", "agentbell-bot"]))
+    if problem:
+        return path, False, (f"{problem}. The unit file is in place; after fixing the error "
+                             "above, run:\n    systemctl --user enable --now agentbell-bot")
+    return path, True, "systemctl --user status agentbell-bot"
 
 
 def cmd_bot(args):
@@ -7751,11 +7850,12 @@ def cmd_bot(args):
             raise SystemExit(f"{PROG}: Telegram is not configured. Run: agentbell init")
         path, started, note = install_bot_service()
         print(f"service file written to {path}")
-        if started:
-            print("service enabled and started - it keeps running after you close the terminal.")
-            print(f"\nCheck it:\n    {note}\n    agentbell bot status")
-        else:
-            print(f"\n{note}")
+        if not started:
+            # exit 0 here read as "installed" to scripts and to the user
+            print(f"{PROG}: the bot service was NOT started: {note}", file=sys.stderr)
+            raise SystemExit(1)
+        print("service enabled and started - it keeps running after you close the terminal.")
+        print(f"\nCheck it:\n    {note}\n    agentbell bot status")
         return
     run_bot(cfg)
 
