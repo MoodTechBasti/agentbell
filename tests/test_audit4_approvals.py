@@ -192,10 +192,19 @@ class TestNtfyOneCandidateRule(unittest.TestCase):
         self.assertFalse(os.path.exists(an._pending_path("ntfy-pending", a_id)))
 
     def test_a_failed_single_channel_publish_does_not_hand_its_yes_to_an_older_ask(self):
-        """APR2-1: the failed question may be on the phone three times."""
+        """APR2-1: the failed question may be on the phone three times. Every
+        attempt timed out, which proves nothing (a refusal would: AS3-2)."""
         older, _ = self._ask("b", "First: migrate prod?")
         self._id_of("First:")
-        self.ntfy.post_503_count = an.RETRY_ATTEMPTS          # every attempt fails
+        real = an.NtfyChannel.publish
+
+        def timed_out(channel, topic, message, *args, **kwargs):
+            if "Second:" in message:
+                raise an.TransientError("timeout talking to ntfy")
+            return real(channel, topic, message, *args, **kwargs)
+        patch = unittest.mock.patch.object(an.NtfyChannel, "publish", timed_out)
+        patch.start()
+        self.addCleanup(patch.stop)
         newer, _ = self._ask("a", "Second: restart staging?")
         failed = self._finish("a", newer)
         self.assertIsInstance(failed, RuntimeError)
@@ -244,7 +253,7 @@ class TestNtfyRoute(unittest.TestCase):
         an.close_pending("ntfy-pending", A, answered=True)
         self.assertEqual(an.ntfy_reply_route(1003),
                          (None, "that question is no longer open", B))
-        an.close_pending("ntfy-pending", B, answered=True)
+        _set_pending("ntfy-pending", B, expires=time.time() - 1)      # its grace is over
         self.assertEqual(an.ntfy_reply_route(1003), (None, "no approval question is open", None))
 
     def test_a_reply_older_than_every_question_is_only_stale(self):
@@ -255,10 +264,9 @@ class TestNtfyRoute(unittest.TestCase):
     def test_the_one_ask_still_publishing_holds_the_reply(self):
         self._open(A)
         self.assertIsNone(an.ntfy_reply_route(1000))
-        _set_pending("ntfy-pending", A,
-                     created=time.time() - an.QUESTION_PUBLISH_GRACE_SECONDS - 1)
+        an._let_go(an._pending_path("ntfy-pending", A))        # the ask was killed
         self.assertEqual(an.ntfy_reply_route(1000),
-                         (None, "that question's place in the chat is unknown", A))
+                         (None, "that question is no longer open", A))
 
     def test_a_refused_reply_is_claimed_so_it_is_announced_once(self):
         cfg = base.make_config("http://127.0.0.1:9", topic="apr4once")
@@ -449,14 +457,20 @@ class TestUnreadableMarkers(unittest.TestCase):
         self.assertIsNone(owner)
         self.assertEqual(reason, TWO_OPEN)
 
-    def test_an_unreadable_marker_expires_by_its_age(self):
+    def test_an_unreadable_marker_ends_a_grace_after_its_ask(self):
+        """Held, it is open however old it is; nobody holds it, it counts
+        until a grace after its last write (audit 5)."""
         self._open("ntfy-pending", A)
         self._tear("ntfy-pending", A)
-        old = time.time() - an.PENDING_UNREADABLE_MAX_AGE_SECONDS - 5
-        os.utime(an._pending_path("ntfy-pending", A), (old, old))
+        path = an._pending_path("ntfy-pending", A)
+        old = time.time() - an.PENDING_TOMBSTONE_GRACE_SECONDS - 5
+        os.utime(path, (old, old))
         with unittest.mock.patch.object(an, "PENDING_REREAD_SECONDS", 0):
+            [held] = an.pending_markers("ntfy-pending")
+            self.assertEqual((held["unreadable"], held.get("closed")), (True, None))
+            an._let_go(path)
             self.assertEqual(an.pending_markers("ntfy-pending"), [])
-        self.assertFalse(os.path.exists(an._pending_path("ntfy-pending", A)))
+        self.assertFalse(os.path.exists(path))
 
     def test_closing_an_unreadable_marker_leaves_a_tombstone(self):
         self._open("ntfy-pending", A)

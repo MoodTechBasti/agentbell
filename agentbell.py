@@ -127,20 +127,20 @@ APPROVAL_ID_BYTES = 8
 PRIME_ATTEMPTS = 3
 PRIME_RETRY_SECONDS = 0.2
 
-# A typed ntfy reply is not attributed while the one ask it could answer is
-# still publishing its question. Longer than the publish retries can take;
-# after it the question's place is unknown and the reply is not used.
-QUESTION_PUBLISH_GRACE_SECONDS = 60
-
-# An ended ask's marker stays as a tombstone at least this long: its
-# question may still be on the phone (see reply_candidates).
+# An ask's marker is open exactly while the ask holds its kernel lock. Once
+# the ask has ended (answered elsewhere, timed out, failed, killed) its
+# question may still be on the phone: it stays a candidate for a typed reply
+# for this long after the end, unless it was answered on that channel
+# (see reply_candidates).
 PENDING_TOMBSTONE_GRACE_SECONDS = 60
 
 # A marker that cannot be read is read once more after this pause: it may
-# be caught mid-rewrite. One that still cannot counts as an open question
-# of unknown place for this long, then it is deleted.
+# be caught mid-rewrite.
 PENDING_REREAD_SECONDS = 0.05
-PENDING_UNREADABLE_MAX_AGE_SECONDS = WEBHOOK_ASK_MAX_TIMEOUT + 60
+
+# The answer bot tells the chat about a refused typed reply at most once per
+# reason in this many seconds.
+BOT_NOTICE_INTERVAL_SECONDS = 60
 
 # Topics shorter than this are considered guessable on public servers.
 MIN_GUESSABLE_TOPIC_LEN = 16
@@ -732,6 +732,21 @@ class PermanentError(RuntimeError):
     """A publish failure that will not succeed on retry (4xx, misconfiguration)."""
 
 
+class TelegramRefused(RuntimeError):
+    """Telegram answered ok:false: it did not take the request."""
+
+
+def _refused(exc):
+    """Whether a failed send is known to have delivered nothing: the server
+    answered with an error status, or Telegram said ok:false. A gateway's
+    502 or 504 is no proof, nor is a timeout or a dropped connection: the
+    server behind it may have stored the message."""
+    cause = exc.__cause__
+    if isinstance(cause, urllib.error.HTTPError):
+        return cause.code not in (502, 504)
+    return isinstance(exc, TelegramRefused)
+
+
 class SendInterrupted(KeyboardInterrupt):
     """Ctrl-C or SIGTERM while `watch` sends its push: queue it, do not retry."""
 
@@ -1034,7 +1049,7 @@ class TelegramChannel:
         except ValueError as exc:
             raise RuntimeError(f"Telegram returned a non-JSON response: {exc}") from exc
         if not payload.get("ok"):
-            raise RuntimeError(f"Telegram error: {payload.get('description')}")
+            raise TelegramRefused(f"Telegram error: {payload.get('description')}")
         return payload.get("result")
 
     def _api(self, method, body=None, timeout=10.0):
@@ -1648,20 +1663,96 @@ def _pending_dir(name):
     return os.path.join(state_dir(), name)
 
 
+# The descriptors through which this process holds its asks' markers.
+_HELD_MARKERS = {}
+_HELD_MARKERS_LOCK = threading.Lock()
+
+
 def write_pending(name, approval_id, message, timeout_seconds):
     """Register an ask on one channel before its question goes out.
 
-    A typed reply that names no question is used only when exactly one
-    question can be on the phone (place_typed_reply, DECISIONS.md).
+    The ask holds a kernel lock on its marker (the bot lock's helpers,
+    §31) until close_pending(), or until its process ends, however it ends.
+    The marker is open exactly while that lock is held. No clock decides
+    it: a suspended laptop or a slow publish cannot make a waiting ask look
+    ended, and a killed one cannot look alive. A typed reply that names no
+    question is used only when exactly one question can be on the phone
+    (place_typed_reply, DECISIONS §30).
     """
     directory = ensure_state_dir(_pending_dir(name))
-    with open_private(os.path.join(directory, f"{approval_id}.json"), "w") as fh:
-        json.dump({
-            "approval_id": approval_id,
-            "message": message,
-            "created": time.time(),
-            "expires": time.time() + int(timeout_seconds) + 60,
-        }, fh)
+    path = os.path.join(directory, f"{approval_id}.json")
+    _let_go(path)                 # the same id again (tests): end the old one
+    fd = _create_marker(path)
+    deadline = time.monotonic() + 1.0      # a reader's probe holds it for a moment
+    while True:
+        try:
+            _lock_bot_fd(fd)
+            break
+        except OSError as exc:
+            if exc.errno in _LOCK_BUSY and time.monotonic() < deadline:
+                time.sleep(0.01)
+                continue
+            os.close(fd)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise RuntimeError(f"cannot lock the approval marker {path}: {exc}") from exc
+    with _HELD_MARKERS_LOCK:
+        _HELD_MARKERS[path] = fd
+    # `expires` is only for an agentbell before 1.7 still running (a bot
+    # not restarted yet), which deletes a marker without one
+    _write_held_marker(path, {"approval_id": approval_id, "message": message,
+                              "created": time.time(),
+                              "expires": time.time() + int(timeout_seconds) + 60})
+
+
+def _create_marker(path):
+    """A new, empty marker file, open for reading and writing (0600).
+
+    On Windows it is opened with FILE_SHARE_DELETE, so that, as on POSIX,
+    deleting the state dir is not blocked by an ask that holds a marker.
+    """
+    if os.name != "nt":
+        return os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+    import _winapi
+    import msvcrt
+    share_all, create_always, normal = 0x7, 2, 0x80
+    handle = _winapi.CreateFile(path, _winapi.GENERIC_READ | _winapi.GENERIC_WRITE,
+                                share_all, _winapi.NULL, create_always, normal,
+                                _winapi.NULL)
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
+    except OSError:
+        _winapi.CloseHandle(handle)
+        raise
+
+
+def _write_held_marker(path, data):
+    """Rewrite a marker this process holds, in place, so its lock stays.
+    False when this process does not hold it."""
+    raw = json.dumps(data).encode("utf-8")
+    with _HELD_MARKERS_LOCK:
+        fd = _HELD_MARKERS.get(path)
+        if fd is None:
+            return False
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, raw)
+        os.ftruncate(fd, len(raw))
+    return True
+
+
+def _let_go(path):
+    """Drop this process's lock on a marker: from now on its ask has ended."""
+    with _HELD_MARKERS_LOCK:
+        fd = _HELD_MARKERS.pop(path, None)
+    if fd is None:
+        return
+    try:
+        _lock_bot_fd(fd, unlock=True)
+    except OSError:
+        pass                      # closing the descriptor releases it too
+    os.close(fd)
 
 
 def _pending_path(name, approval_id):
@@ -1669,28 +1760,52 @@ def _pending_path(name, approval_id):
 
 
 def close_pending(name, approval_id, answered):
-    """Turn an ended ask's marker into a tombstone until it expires.
+    """End an ask on one channel: its marker becomes a tombstone.
 
-    Its question may still be on the phone. Unanswered, it keeps counting
-    when a typed reply is placed, so a "yes" typed under it never goes to
-    another ask; answered, it no longer does. A marker that was never
-    written (the ask failed before) stays absent.
+    `answered` means the answer came through this channel: the question
+    there is settled and the tombstone no longer counts. Otherwise (no
+    answer, a failed send, an answer on the other channel) the question
+    may still be on the phone, and the tombstone counts when a typed reply
+    is placed for PENDING_TOMBSTONE_GRACE_SECONDS, so a "yes" typed under
+    it does not go to another ask. The tombstone is written before the lock
+    is dropped: whoever finds the lock free reads the final state. A marker
+    this process does not hold (never written, already ended) is left as
+    it is.
     """
     path = _pending_path(name, approval_id)
-    data = _read_marker(path)
-    if data is None:
-        return
-    if not data:
-        data = {"approval_id": approval_id, "created": time.time(), "expires": 0}
+    with _HELD_MARKERS_LOCK:
+        if path not in _HELD_MARKERS:
+            return
+    data = _read_marker(path) or {"approval_id": approval_id}
     data.update(closed=True, answered=bool(answered),
-                expires=max(data["expires"], time.time() + PENDING_TOMBSTONE_GRACE_SECONDS))
+                expires=time.time() + PENDING_TOMBSTONE_GRACE_SECONDS)
     try:
-        with open_private(path, "w") as fh:
-            json.dump(data, fh)
+        _write_held_marker(path, data)
     except OSError as exc:
         sys.stderr.write(f"{PROG}: cannot close the question in {name} "
-                         f"({type(exc).__name__}); typed replies are not used "
-                         "until it expires\n")
+                         f"({type(exc).__name__}); it counts as unanswered "
+                         f"for {PENDING_TOMBSTONE_GRACE_SECONDS}s\n")
+    finally:
+        _let_go(path)
+
+
+def discard_pending(name, approval_id):
+    """Delete an ask's marker on a channel whose server refused every copy
+    of the question: nothing there can be answered, so it must not hold
+    up a typed reply meant for another question."""
+    path = _pending_path(name, approval_id)
+    try:
+        # expired before the lock goes: a reader in between deletes it too
+        if not _write_held_marker(path, {"approval_id": approval_id, "closed": True,
+                                         "answered": False, "expires": 0}):
+            return
+    except OSError:
+        pass                      # an unwritten one ends as unanswered instead
+    _let_go(path)
+    try:
+        os.remove(path)
+    except OSError:
+        pass                      # a reader has it open (Windows): it prunes it
 
 
 def _read_marker(path):
@@ -1715,13 +1830,17 @@ def _read_marker(path):
 
 
 def pending_markers(name):
-    """Every unexpired marker of one channel: open asks and tombstones.
+    """Every marker of one channel that still counts: open asks and
+    tombstones in their grace.
 
-    Expired markers are deleted on the way: a killed `ask` would otherwise
-    leave one behind that blocks typed replies for good. A marker that
-    cannot be read counts as an open ask whose question's place is unknown
-    ({"unreadable": True}) until it is old: skipping it would hand a typed
-    reply to another ask (WIN-1).
+    A marker is open while its ask holds its lock, whatever the clock says.
+    One nobody holds has ended: its ask closed it, or died without closing
+    it (SIGKILL, a crash, an older agentbell). An unclosed one is closed
+    here, unanswered, and its grace starts now. A tombstone past its grace
+    is deleted. A marker that cannot be read counts as a question whose
+    place is unknown ({"unreadable": True}), because skipping it would hand
+    a typed reply to another ask (WIN-1): open while held, otherwise until a
+    grace after its last write.
     """
     directory = _pending_dir(name)
     if not os.path.isdir(directory):
@@ -1732,18 +1851,26 @@ def pending_markers(name):
         if not entry.endswith(".json"):
             continue
         path = os.path.join(directory, entry)
+        # the lock before the content: an ask writes its tombstone before
+        # it lets go, so a free lock means what is read now is final
+        held = _lock_held(path)
         data = _read_marker(path)
         if data is None:
             continue
         if not data:
             try:
-                created = os.stat(path).st_mtime
+                written = os.stat(path).st_mtime
             except OSError:
                 continue
-            data = {"approval_id": entry[:-len(".json")], "unreadable": True,
-                    "created": created,
-                    "expires": created + PENDING_UNREADABLE_MAX_AGE_SECONDS}
-        if data["expires"] < now:
+            data = {"approval_id": entry[:-len(".json")], "unreadable": True}
+            if not held:
+                data.update(closed=True, answered=False,
+                            expires=written + PENDING_TOMBSTONE_GRACE_SECONDS)
+        elif not held and not data.get("closed"):
+            ended = _mark_ended(path, data, now)
+            held = ended is None          # it had only just taken its lock
+            data = ended or data
+        if not held and data["expires"] < now:
             try:
                 os.remove(path)
             except OSError:
@@ -1751,6 +1878,36 @@ def pending_markers(name):
             continue
         markers.append(data)
     return markers
+
+
+def _mark_ended(path, data, now):
+    """Close the marker of an ask that ended without closing it, unanswered;
+    the tombstone, or None when the ask turns out to be alive.
+
+    Its lock was free before `data` was read. It is probed once more: the
+    ask may have taken its lock and written `data` in between, and a live
+    marker must never be replaced. The new file replaces the old one whole,
+    so two readers doing this at once cannot mix their writes.
+    """
+    if _lock_held(path):
+        return None
+    data = dict(data, closed=True, answered=False,
+                expires=now + PENDING_TOMBSTONE_GRACE_SECONDS)
+    tmp = f"{path}.{os.getpid()}-{threading.get_ident()}.tmp"
+    try:
+        with open_private(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        if not isinstance(exc, PermissionError):     # Windows: open elsewhere
+            sys.stderr.write(f"{PROG}: cannot close the question of an ask that "
+                             f"ended ({type(exc).__name__}); its grace restarts "
+                             "until it can\n")
+    return data
 
 
 def pending_is_open(name, approval_id):
@@ -1840,17 +1997,16 @@ def refuse_typed_reply(cfg, channel, text, reason, about=None, reply_to=None):
 def _remember_question(name, approval_id, fields):
     """Store where a question sits in its reply stream on its pending marker.
 
-    Only an existing marker is updated: recreating one that was never
-    written would leave a question open that nobody waits on. A failure is
-    reported, because typed replies would then never be used for this
-    question.
+    Only a marker this process still holds is updated: writing one that
+    was never written or has ended would leave a question open that nobody
+    waits on. A failure is reported, because typed replies would then never
+    be used for this question.
     """
     path = _pending_path(name, approval_id)
     try:
         data = _read_json_object(path)
         data.update(fields)
-        with open_private(path, "w") as fh:
-            json.dump(data, fh)
+        _write_held_marker(path, data)
     except (FileNotFoundError, _NotJsonObject):
         return
     except (OSError, ValueError) as exc:
@@ -1904,14 +2060,14 @@ def ntfy_reply_route(reply_time):
     they all have to reach the same verdict from the same markers. While
     the one ask it could answer is still publishing, its question's time is
     unknown and the reply may be its answer: nobody decides, and the poller
-    offers the reply again. Past QUESTION_PUBLISH_GRACE_SECONDS (a killed
-    ask, an older agentbell) the place stays unknown and it is not used.
+    offers the reply again. The publish ends with a time, an unknown place
+    or a deleted marker; an ask killed meanwhile has ended, and its reply
+    is not used.
     """
     markers = pending_markers("ntfy-pending")
     candidates = reply_candidates(markers)
     if (len(candidates) == 1 and not candidates[0].get("closed")
-            and "question_time" not in candidates[0]
-            and time.time() - candidates[0]["created"] < QUESTION_PUBLISH_GRACE_SECONDS):
+            and "question_time" not in candidates[0]):
         return None
     return place_typed_reply(markers, "question_time", reply_time, strict=False)
 
@@ -2107,10 +2263,11 @@ _BOT_LOCK_BYTE = 1 << 20
 
 
 def _lock_bot_fd(fd, unlock=False, shared=False):
-    """Take (or drop) the bot lock on `fd` without waiting; OSError when busy.
+    """Take (or drop) the bot lock, or an ask's lock on its pending marker,
+    on `fd` without waiting; OSError when busy.
 
     A `shared` lock is a probe's: probes never block each other, only a bot
-    does. Windows has no shared lock and takes an exclusive one.
+    or an ask does. Windows has no shared lock and takes an exclusive one.
     """
     if os.name == "nt":
         import msvcrt
@@ -2125,8 +2282,17 @@ def _lock_bot_fd(fd, unlock=False, shared=False):
 def bot_running():
     """Does an answer bot hold bot.lock right now? `bot status`, `uninstall`,
     `doctor` and `ask` ask this; the pid in the file is only for people."""
+    return _lock_held(_bot_lock_path())
+
+
+def _lock_held(path):
+    """Does a process hold the kernel lock on `path` right now?
+
+    The probe lock is dropped at once. On Windows it is exclusive, so a
+    busy answer may be another probe's moment: it is tried once more.
+    """
     try:
-        fd = os.open(_bot_lock_path(), os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY)
     except OSError:
         return False
     try:
@@ -2135,7 +2301,7 @@ def bot_running():
         except OSError as exc:
             if os.name != "nt" or exc.errno not in _LOCK_BUSY:
                 raise
-            time.sleep(0.05)          # maybe another probe's moment, not a bot
+            time.sleep(0.05)          # maybe another probe's moment, not a holder
             _lock_bot_fd(fd)
         _lock_bot_fd(fd, unlock=True)
     except OSError as exc:
@@ -3399,6 +3565,25 @@ def _warn_insecure_ask(cfg, message):
         sys.stderr.flush()
 
 
+def _publish_question(fn):
+    """publish_with_retry(fn) for an approval question. Its error carries
+    `refused_every_time`: every attempt was refused (_refused), so no copy
+    of the question reached the phone."""
+    errors = []
+
+    def attempt():
+        try:
+            return fn()
+        except RuntimeError as exc:
+            errors.append(exc)
+            raise
+    try:
+        return publish_with_retry(attempt)
+    except RuntimeError as exc:
+        exc.refused_every_time = bool(errors) and all(_refused(e) for e in errors)
+        raise
+
+
 def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="Deny",
             buttons=True, print_status=True, channels=None):
     """Ask a question on one or more channels and wait for the first answer.
@@ -3458,7 +3643,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                 tags=["question", "approval"],
                 actions=actions,
             )
-        return publish_with_retry(publish)
+        return _publish_question(publish)
 
     def _note_ntfy_failure(exc, detail):
         """Record an ntfy failure. With another channel still up, warn and go on."""
@@ -3495,11 +3680,16 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
             wrapped = RuntimeError(f"ntfy: {exc}")
             _note_ntfy_failure(wrapped, str(wrapped))
             ntfy_waiter.stop_event.set()
-            # the server may have stored the question before the error (a
-            # timeout, a reset): its place is unknown, and the marker keeps
-            # counting, so a reply is never handed to another ask
+            # The server refused every copy: nothing is on the phone. Else it
+            # may have stored the question before the error (a timeout, a
+            # reset): its place is unknown, and the marker keeps counting,
+            # so a reply is never handed to another ask.
             with arm_lock:
-                if not ask_closed.is_set():
+                if ask_closed.is_set():
+                    return
+                if getattr(exc, "refused_every_time", False):
+                    discard_pending("ntfy-pending", approval_id)
+                else:
                     remember_ntfy_question(approval_id, None)
             return
         with arm_lock:
@@ -3517,7 +3707,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         )
         sys.stderr.flush()
 
-    answered = False
+    answered_on = None
     try:
         # register the open question only now, so the finally below always
         # closes it again. The ntfy marker is written by _arm_ntfy, after
@@ -3540,13 +3730,15 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                     buttons=buttons and bot_heartbeat_fresh(),
                 )
             try:
-                sent = publish_with_retry(send_tg)
+                sent = _publish_question(send_tg)
                 message_id = sent.get("message_id") if isinstance(sent, dict) else None
                 if message_id:
                     remember_tg_question_message(approval_id, message_id)
             except RuntimeError as exc:
                 telegram_error = exc
                 sys.stderr.write(f"{PROG}: telegram: {exc}\n")
+                if getattr(exc, "refused_every_time", False):
+                    discard_pending("tg-pending", approval_id)
             if telegram_error is not None and arm_thread is not None:
                 # Telegram cannot deliver. Wait until we know whether ntfy
                 # can carry the ask; do not burn the approval timeout on a
@@ -3565,7 +3757,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                        "timeout": timeout_seconds, "buttons": buttons, "channels": channels})
 
         result = wait_first(waiters, timeout_seconds, print_status)
-        answered = not result.get("timeout")
+        answered_on = None if result.get("timeout") else result.get("channel")
         # A response topic we cannot read (403, wrong auth, DNS) otherwise
         # looks exactly like "nobody answered" for the whole timeout.
         if result.get("timeout"):
@@ -3579,15 +3771,16 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         # server, webhook server) an abandoned waiter would keep polling ntfy
         # every few seconds for the rest of the process's life. The lock
         # keeps _arm_ntfy from writing to the marker after we closed it. The
-        # markers stay as tombstones: the question may still be on the phone.
+        # markers stay as tombstones: the question may still be on the phone,
+        # also on the channel that did not carry the answer.
         with arm_lock:
             ask_closed.set()
             if ntfy_waiter is not None:
                 ntfy_waiter.stop_event.set()
             for _, pending_waiter in waiters:
                 pending_waiter.stop_event.set()
-            close_pending("ntfy-pending", approval_id, answered)
-            close_pending("tg-pending", approval_id, answered)
+            close_pending("ntfy-pending", approval_id, answered_on == "ntfy")
+            close_pending("tg-pending", approval_id, answered_on == "telegram")
             remove_tg_answer(approval_id)
 
     if print_status:
@@ -7404,8 +7597,12 @@ def webhook_server(cfg):
 TG_CALLBACK_RE = re.compile(r"^agentbell\|([0-9a-f]{8,16})\|(approved|denied)$")
 
 
-def handle_bot_update(cfg, update):
-    """Process one getUpdates entry: callback query or free-text reply."""
+def handle_bot_update(cfg, update, session=None):
+    """Process one getUpdates entry: callback query or free-text reply.
+
+    `session` is the running bot's state (run_bot): it holds back notices
+    about refused replies during the backlog and rate-limits them.
+    """
     tg = cfg.data.get("telegram", {})
     chat_id = str(tg.get("chat_id") or "")
     callback = update.get("callback_query")
@@ -7467,15 +7664,38 @@ def handle_bot_update(cfg, update):
         return
     owner, reason, about = _tg_reply_owner(markers, message)
     if owner is None:
-        if reason == REPLY_PREDATES:
-            # a replayed backlog message: nobody is waiting on it
-            write_history({"event": "stale_answer", "approval_id": about,
-                           "text": text[:120], "reason": reason})
+        held_back = None if reason == REPLY_PREDATES else _bot_notice_held_back(session, reason)
+        if reason == REPLY_PREDATES or held_back:
+            # a replayed backlog message, or one more of a burst
+            entry = {"event": "stale_answer", "approval_id": about, "channel": "telegram",
+                     "text": text[:120], "reason": reason}
+            if held_back:
+                entry["notice"] = held_back
+            write_history(entry)
         else:
             refuse_typed_reply(cfg, "telegram", text, reason, about,
                                reply_to=message.get("message_id"))
         return
     write_tg_answer(owner["approval_id"], text)
+
+
+def _bot_notice_held_back(session, reason):
+    """Why the bot does not tell the chat about a refused reply, or None.
+
+    A restarted bot first replays up to a day of chat (the backlog):
+    nobody is waiting for an answer to that. After it, a burst of refused
+    replies gets one notice per reason a minute.
+    """
+    if session is None:
+        return None
+    if session.get("backlog"):
+        return "not sent: chat backlog from before the bot started"
+    now = time.monotonic()
+    last = session.setdefault("notices", {}).get(reason)
+    if last is not None and now - last < BOT_NOTICE_INTERVAL_SECONDS:
+        return "not sent: one notice per reason a minute"
+    session["notices"][reason] = now
+    return None
 
 
 # The question's own "ID: <approval id>" line, as Telegram quotes it back in
@@ -7523,14 +7743,23 @@ def _tg_reply_owner(markers, message):
                              strict=True)
 
 
-def bot_poll_once(cfg, offset=None, poll_timeout=25):
-    """One getUpdates cycle; returns the next offset (or the previous one)."""
+def bot_poll_once(cfg, offset=None, poll_timeout=25, session=None):
+    """One getUpdates cycle; returns the next offset (or the previous one).
+
+    While `session` is in its backlog, the poll does not wait: whatever it
+    returns was sent before the bot started. The first empty answer ends
+    the backlog.
+    """
     token = cfg.data.get("telegram", {}).get("bot_token")
-    updates = TelegramChannel.get_updates(token, offset=offset, timeout=poll_timeout)
+    backlog = session is not None and session.get("backlog")
+    updates = TelegramChannel.get_updates(token, offset=offset,
+                                          timeout=0 if backlog else poll_timeout)
     next_offset = offset
     for update in updates:
         next_offset = int(update.get("update_id", 0)) + 1
-        handle_bot_update(cfg, update)
+        handle_bot_update(cfg, update, session)
+    if backlog and not updates:
+        session["backlog"] = False
     return next_offset
 
 
@@ -7564,6 +7793,7 @@ def run_bot(cfg, poll_timeout=25):
     write_bot_heartbeat()
     print(f"{PROG}: Telegram answer bot running (chat {tg.get('chat_id')}). Ctrl-C to stop.")
     offset = None
+    session = {"backlog": True, "notices": {}}
     # A service stop (systemctl stop, launchctl unload, a plain kill) sends
     # SIGTERM. That is the same request as Ctrl-C: release the lock, exit 0.
     # Exiting 143 instead left the systemd unit "failed", and
@@ -7584,7 +7814,8 @@ def run_bot(cfg, poll_timeout=25):
         while True:
             write_bot_heartbeat()
             try:
-                offset = bot_poll_once(cfg, offset=offset, poll_timeout=poll_timeout)
+                offset = bot_poll_once(cfg, offset=offset, poll_timeout=poll_timeout,
+                                       session=session)
                 write_bot_error(None)
             except RuntimeError as exc:
                 message = _bot_poll_error(str(exc))
@@ -9180,6 +9411,21 @@ def _record_hook_error(event, args, exc):
 
 def cmd_ask(args):
     cfg = Config()
+    # An agent that gives up on the ask (its tool timeout) sends SIGTERM; a
+    # closed terminal sends SIGHUP. Leave through run_ask's cleanup, so the
+    # question ends at once as unanswered: its buttons say it has expired.
+    previous = []
+
+    def _on_signal(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        try:
+            if signum is not None and signal.getsignal(signum) != signal.SIG_IGN:  # nohup
+                previous.append((signum, signal.signal(signum, _on_signal)))
+        except (OSError, ValueError):
+            pass                  # not the main thread: the kernel lock still ends it
     try:
         outcome = run_ask(
             cfg, args.message,
@@ -9193,6 +9439,8 @@ def cmd_ask(args):
     except RuntimeError as exc:
         print(f"{PROG}: {exc}", file=sys.stderr)
         raise SystemExit(3)
+    finally:
+        _restore_signals(previous)
     if args.json:
         print(json.dumps(outcome))
     elif outcome["timeout"]:

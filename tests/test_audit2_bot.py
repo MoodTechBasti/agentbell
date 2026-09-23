@@ -86,10 +86,13 @@ class TestBotStopsCleanlyOnSigterm(unittest.TestCase):
             # i.e. past installing the SIGTERM handler
             approval_id = "abcdef0123456789"
             os.makedirs(os.path.join(state, "tg-pending"))
-            with open(os.path.join(state, "tg-pending", f"{approval_id}.json"), "w",
-                      encoding="utf-8") as fh:
-                json.dump({"approval_id": approval_id, "created": time.time(),
-                           "expires": time.time() + 600}, fh)
+            marker = os.path.join(state, "tg-pending", f"{approval_id}.json")
+            with open(marker, "w", encoding="utf-8") as fh:
+                json.dump({"approval_id": approval_id, "created": time.time()}, fh)
+            # an ask is waiting on it: it holds the marker's lock
+            held = os.open(marker, os.O_RDWR)
+            self.addCleanup(os.close, held)
+            an._lock_bot_fd(held)
             tg.queue_update({"update_id": 7, "callback_query": {
                 "id": "cq", "data": f"agentbell|{approval_id}|approved",
                 "message": {"message_id": 1, "chat": {"id": 42}, "text": "Q?"}}})

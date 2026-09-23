@@ -371,12 +371,11 @@ class TestNtfyReplyRouting(unittest.TestCase):
         self.assertEqual(self._got(b), ["staging"])
 
     def test_a_killed_ask_stuck_publishing_blocks_typed_replies(self):
-        """Its question may be on the phone: until its marker expires, typed
-        text is not used (audit 4); the buttons still work."""
+        """Its question may be on the phone: for its grace, typed text is not
+        used (audit 4); the buttons still work."""
         a = self._waiter(self.A, 1000)
         an.write_ntfy_pending(self.B, "Q?", 60)
-        _set_pending("ntfy-pending", self.B,
-                     created=time.time() - an.QUESTION_PUBLISH_GRACE_SECONDS - 5)
+        an._let_go(_pending_path("ntfy-pending", self.B))   # killed: its lock is gone
         a._offer("r6", "staging", 1001)
         self.assertEqual(self._got(a), [])
         a._offer("r6b", f"APPROVED {self.A}", 1002)
@@ -517,13 +516,20 @@ class TestNtfyFailureInTwoChannelAsk(base._TelegramFixture):
 
     def test_failed_ntfy_question_keeps_a_marker_of_unknown_place(self):
         """A failed publish may still have been stored (audit 3, APR-1): its
-        marker stays, without a time, so no reply goes to another ask."""
-        ntfy = base.MockNtfy(post_503_count=1000)
+        marker stays, without a time, so no reply goes to another ask. A
+        dropped connection proves nothing; a refusal would (audit 5, AS3-2)."""
+        ntfy = base.MockNtfy()
         self.addCleanup(ntfy.stop)
         cfg = self._tg_cfg(ntfy_url=ntfy.url, channels=("ntfy", "telegram"))
         before = len(self.tg.requests)
         holder = {}
-        with contextlib.redirect_stderr(io.StringIO()):
+        attempts = []
+
+        def dropped(*_args, **_kwargs):
+            attempts.append(1)
+            raise an.TransientError("connection to ntfy failed (ConnectionResetError)")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                unittest.mock.patch.object(an.NtfyChannel, "publish", dropped):
             thread = threading.Thread(target=lambda: holder.update(
                 result=an.run_ask(cfg, "Deploy?", timeout_seconds=20, print_status=False)),
                 daemon=True)
@@ -533,7 +539,7 @@ class TestNtfyFailureInTwoChannelAsk(base._TelegramFixture):
             sent = next(r for r in self.tg.requests[before:] if r["method"] == "sendMessage")
             approval_id = re.search(r"ID: ([0-9a-f]+)", sent["body"]["text"]).group(1)
             # every publish attempt has failed ...
-            _wait_for(lambda: ntfy.post_503_count <= 1000 - an.RETRY_ATTEMPTS)
+            _wait_for(lambda: len(attempts) >= an.RETRY_ATTEMPTS)
             # ... and the marker written before the first one says so
             marker = _pending_path("ntfy-pending", approval_id)
 
@@ -550,10 +556,11 @@ class TestNtfyFailureInTwoChannelAsk(base._TelegramFixture):
             thread.join(timeout=10)
         self.assertTrue(holder["result"]["approved"])
         self.assertEqual(holder["result"]["channel"], "telegram")
-        # answered: a tombstone that no longer counts for typed replies
+        # answered on Telegram: on ntfy the question may still be on the
+        # phone, so its tombstone keeps counting for its grace (AS3-4)
         with open(marker, encoding="utf-8") as fh:
             data = json.load(fh)
-        self.assertEqual((data["closed"], data["answered"]), (True, True))
+        self.assertEqual((data["closed"], data["answered"]), (True, False))
 
 
 # ---------------------------------------------------------------------------

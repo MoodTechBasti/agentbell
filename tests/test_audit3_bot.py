@@ -299,7 +299,7 @@ class TestBotLoop(base._TelegramFixture):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def _poll(self, cfg, offset=None, poll_timeout=25):
+    def _poll(self, cfg, offset=None, poll_timeout=25, session=None):
         self.polls += 1
         if self.polls > 1:
             raise KeyboardInterrupt           # Ctrl-C after one full cycle

@@ -37,13 +37,17 @@ that is still running from an earlier version. Until it restarts, `ask`,
   phone.** A reply that names no question (anything but a button, a typed
   `APPROVED <id>` / `DENIED <id>`, or Telegram's Reply on the question)
   goes to an ask only when exactly one approval question can still be
-  open. A question that failed to send, timed out or ended unanswered keeps
-  counting until its timeout plus 60 seconds. Otherwise the reply is
-  refused, recorded as `stale_answer`, and a "Reply not used" notice on
-  the same channel says to tap a button, use Reply (Telegram), or send
-  `APPROVED <id>` / `DENIED <id>` (ntfy). A reply written before the
-  question went out is stale; replies are ordered by Telegram message id
-  or by the ntfy server's time, not by the local clock.
+  open. An ask counts while its process waits for the answer. After it
+  ends without an answer on that channel (timed out, failed to send,
+  killed, or answered on the other channel), its question keeps counting
+  for 60 seconds. A question the server refused outright (an HTTP error
+  status, Telegram `ok: false`) never reached the phone and does not
+  count. Otherwise the reply is refused, recorded as `stale_answer`, and a
+  "Reply not used" notice on the same channel says to tap a button, use
+  Reply (Telegram), or send `APPROVED <id>` / `DENIED <id>` (ntfy). A
+  reply written before the question went out is stale; replies are
+  ordered by Telegram message id or by the ntfy server's time, not by the
+  local clock.
 - **`watch` keeps the terminal and survives signals until the push is
   sent.** The command runs in `watch`'s own process group, the terminal's
   foreground job, so sudo, ssh and gpg password prompts work and Ctrl-Z
@@ -180,8 +184,31 @@ that is still running from an earlier version. Until it restarts, `ask`,
   question as an answer or a denial instead of being dropped until the
   timeout.
 - A pending-question file caught mid-write is read again. One that stays
-  unreadable counts as open (for up to about an hour, with a notice)
-  instead of being ignored.
+  unreadable counts as a question whose place is unknown, instead of
+  being ignored: while its ask waits, and for 60 seconds after.
+- A waiting ask no longer disappears after the laptop sleeps or a publish
+  is slow. Its question used to expire by the wall clock: its button said
+  "expired", and a typed `yes` could approve a newer ask. An ask now
+  holds a kernel lock on its pending-question file while it waits, the
+  same kind as the bot lock, and the question is open exactly as long as
+  that lock is held.
+- A killed `ask` (SIGKILL, a crash) ends with its process. Its button says
+  "This question has expired." instead of accepting an answer nobody
+  reads and editing the message to "Answered". On SIGTERM and SIGHUP (an
+  agent's tool timeout, a closed terminal) `ask` ends its question as
+  unanswered before it exits with 128 + the signal number; a SIGHUP
+  ignored by `nohup` stays ignored.
+- A failed or killed ask no longer blocks typed replies for its whole
+  timeout (up to an hour for a webhook ask); see Changed for the
+  60-second rule.
+- An ask answered on Telegram still counts on ntfy for 60 seconds, and
+  the other way round: its question and buttons are still on that
+  phone, so a typed `yes` there no longer approves the next ask.
+- A restarted Telegram bot no longer answers every message of the
+  replayed chat backlog with "Reply not used". It first reads the backlog
+  without waiting and only records refused replies in it. After that it
+  sends at most one notice per reason a minute; the others are recorded
+  as `stale_answer` with the reason they were not sent.
 
 #### Queue and quiet hours
 

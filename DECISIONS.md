@@ -1424,11 +1424,33 @@ and same-second ties only moved the problem.
 costs a tap on a button, a misrouted one runs the wrong command. A typed
 reply is used only when exactly one question can still be on the phone.
 
-- The candidates are every open ask plus every ended ask that got no
-  answer. An ended ask's marker becomes a tombstone (`closed`,
-  `answered`) and stays until it expires: the ask's timeout plus 60 s
-  from its start, and at least 60 s after its end. Answered tombstones
-  do not count.
+- An ask is open exactly while its process holds a kernel lock on its
+  pending marker (one per channel), the same lock as the bot's (§31):
+  `flock` on POSIX, `msvcrt.locking` on Windows. Readers probe it without
+  waiting and drop the probe at once. No clock decides whether an ask is
+  open. A clock that jumps (a laptop that slept, a publish slower than
+  the old 60 s slack) used to delete a waiting ask's marker: its button
+  said "expired" and a typed "yes" went to a newer ask. A killed or
+  crashed ask loses the lock with its process, so its marker cannot stay
+  open.
+- The candidates are every open ask plus every ended ask whose question
+  may still be on that phone. When an ask ends, each marker becomes a
+  tombstone (`closed`, `answered`, `expires`) before the lock is
+  dropped. `answered` is true only on the channel that carried the
+  answer: an ask answered on Telegram still has its question and
+  buttons on ntfy. An answered tombstone does not count. Any other
+  tombstone (no answer, a failed send, a kill, an answer on the other
+  channel) counts for `PENDING_TOMBSTONE_GRACE_SECONDS` (60 s) after the
+  ask ended, then it is deleted. A marker whose ask died without closing
+  it is closed by the first reader that finds its lock free, and its 60 s
+  start then. `ask` turns SIGTERM and SIGHUP into a normal exit
+  (128 + signal), so an agent's tool timeout closes the question at once.
+  The wall clock only prunes tombstones nobody holds.
+- A question the server refused (every attempt answered with an HTTP
+  error status other than a gateway's 502/504, or Telegram `ok: false`)
+  never reached the phone: its marker on that channel is deleted. A
+  timeout or a dropped connection proves nothing, since the server may
+  have stored the question, so that marker stays with an unknown place.
 - With exactly one candidate, the reply is used when that ask is still
   open and its question is known to be out before the reply: a greater
   Telegram message id, or an ntfy server time that is not earlier
@@ -1440,16 +1462,23 @@ reply is used only when exactly one question can still be on the phone.
   the message with `Your reply "…" was not used: <reason>. Please tap a
   button, or answer with Reply on the question.`, and on ntfy the
   waiting ask publishes a "Reply not used" notification (priority high,
-  up to 60 characters of the reply) to the main topic.
+  up to 60 characters of the reply) to the main topic. A starting bot
+  first reads the chat backlog without waiting, until a poll comes back
+  empty. Nobody waits on an answer to that backlog, so a reply refused
+  there is only recorded. After it the bot sends at most one notice per
+  reason a minute (`BOT_NOTICE_INTERVAL_SECONDS`); a reply it does not
+  announce is recorded with `notice: "not sent: …"`.
 - Explicit routes are unchanged and always work: the buttons, a typed
   `APPROVED <id>` / `DENIED <id>` with the full id (any letter case),
   and Telegram's Reply on the question. A reply that names a question
   that has ended is not used. `approve 2` is not an id; it is free text.
 - A marker that cannot be read is read once more after 50 ms (it may be
-  caught mid-rewrite). If it still cannot be read it counts as an open
-  question of unknown place, for up to about an hour, then it is
-  deleted. On ntfy a typed reply is not used while the one candidate is
-  still publishing its question (up to 60 s).
+  caught mid-rewrite). If it still cannot be read it counts as a
+  question of unknown place: while its lock is held, and for 60 s after
+  its last write once nobody holds it; then it is deleted. On ntfy a
+  typed reply waits while the one candidate is still publishing its
+  question; the publish ends with a time, an unknown place or a deleted
+  marker.
 - A server that sends no message times (real ntfy does) gets no typed
   replies at all. Buttons still work.
 
@@ -1461,13 +1490,19 @@ reason after them: `wait`, `warte`, `später`, `hang on`, `one moment`,
 wait`, `ok, later`, `👍⏳`), which also catches benign `yes, no problem`;
 that errs on the side of not running the gated command.
 
-**Cost.** Fewer typed replies are accepted. With two asks open, or for up
-to the timeout plus 60 s after an ask that ended unanswered, typed text is
-refused with a notice. A duplicate "yes" meant for an ask that was already
-answered can still reach a later single open ask when it is typed after
-that ask's question; excluding answered tombstones is the price of not
-blocking every reply after every answer. Markers are local, so two
-machines sharing one topic still cannot see each other's asks (§12i).
+**Cost.** Fewer typed replies are accepted. With two asks open, or for
+60 s after an ask ended without an answer on that channel, typed text is
+refused with a notice. A "yes" typed under an ended question more than
+60 s after it ended can reach a later single open ask; so can a
+duplicate "yes" meant for an ask that was already answered on that
+channel. Excluding them is the price of not blocking every reply after
+every ask. A marker needs a filesystem with `flock` (not some network
+mounts): where it cannot be locked, `ask` fails with that error, like
+the bot. An ask started by an earlier version holds no lock and counts
+as ended once a new reader sees it; its markers still carry `expires`
+for a pre-1.7 bot that has not been restarted. Markers are local, so
+two machines sharing one topic still cannot see each other's asks
+(§12i).
 
 ## 31. The bot lock is a kernel lock (2026-09-23)
 
