@@ -5802,12 +5802,16 @@ def _is_our_binary(path):
 
     pip's generated console script only mentions the module name
     (`from agentbell import main`); module and CLI name are the same word,
-    so one check catches both a copied script and pip's launcher.
+    so one check catches both a copied script and pip's launcher. On Windows
+    that launcher is an .exe with the script zipped onto its end, so the
+    tail is read as well as the head.
     """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, "rb") as fh:
             head = fh.read(4096)
-        return "agentbell" in head
+            fh.seek(max(os.fstat(fh.fileno()).st_size - 4096, 0))
+            tail = fh.read(4096)
+        return b"agentbell" in head or b"agentbell" in tail
     except OSError:
         return False
 
@@ -5824,17 +5828,40 @@ def _under_pipx(path):
     return "/pipx/venvs/" in os.path.realpath(path)
 
 
-def _pipx_installed():
+def _runs_this_command(path):
+    """True if `path` is the launcher running this process. pip's Windows
+    launcher hands its own path to Python with '.exe' cut off."""
+    argv0 = sys.argv[0] if sys.argv else ""
+    return bool(argv0) and (_same_path(argv0, path) or _same_path(argv0 + ".exe", path))
+
+
+def _pipx_installed(warnings=None):
+    """pipx's path if it has agentbell installed, else None.
+
+    `pipx list` exits 1 as soon as any of its venvs has a problem, even an
+    unrelated one. Healthy venvs are still listed on stdout and broken ones
+    on stderr, so both are searched and the exit code only decides whether
+    a miss is worth a warning.
+    """
     pipx = shutil.which("pipx")
     if not pipx:
         return None
+    fallback = "if agentbell was installed with pipx, run 'pipx uninstall agentbell'"
     try:
         proc = subprocess.run([pipx, "list"], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        if warnings is not None:
+            warnings.append(f"could not run 'pipx list' ({exc}); {fallback}")
         return None
-    if proc.returncode != 0 or not re.search(r"^\s*package\s+agentbell\b", proc.stdout, re.M):
-        return None
-    return pipx
+    output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    if re.search(r"^\s*package\s+agentbell(?![\w.-])", output, re.M):
+        return pipx
+    if proc.returncode != 0 and warnings is not None:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        warnings.append(f"'pipx list' exited {proc.returncode}"
+                        + (f" ({detail[-1].strip()})" if detail else "")
+                        + f" and did not list agentbell; {fallback}")
+    return None
 
 
 def _pipx_uninstall(pipx):
@@ -5870,6 +5897,74 @@ def _delete_path(path, directory=False):
         return False
     os.remove(path)
     return True
+
+
+# The top-level names agentbell writes into its config and state directory.
+# The default directories (.../agentbell) are its own and go whole. One named
+# by AGENTBELL_CONFIG_DIR / AGENTBELL_STATE_DIR can be shared - someone points
+# it at ~/.config - so only these names and their .tmp/.lock siblings are
+# deleted there, and the directory itself only once nothing else is left.
+# A new file written straight into the state dir belongs on this list.
+CONFIG_DIR_NAMES = ("config.json",)
+STATE_DIR_NAMES = ("history.jsonl", "queue", "deferred", "runs", "bot.json",
+                   "bot.lock", "tg-answers", "tg-pending", "ntfy-pending",
+                   "ntfy-consumed", ".doctor-probe")
+
+
+def _same_path(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _split_owned(directory, names):
+    """(ours, theirs): the entries of `directory` agentbell wrote, and the rest."""
+    ours, theirs = [], []
+    try:
+        present = sorted(os.listdir(directory))
+    except OSError:
+        return ours, theirs
+    for entry in present:
+        if entry in names or any(entry.startswith(name + ".")
+                                 and entry.endswith((".tmp", ".lock")) for name in names):
+            ours.append(entry)
+        else:
+            theirs.append(entry)
+    return ours, theirs
+
+
+def _names_preview(names, limit=5):
+    shown = ", ".join(names[:limit])
+    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def _delete_owned(directory, names):
+    """Delete agentbell's entries of a shared directory, then the directory
+    itself if nothing else is in it. What stays is reported by the caller."""
+    ours, theirs = _split_owned(directory, names)
+    for entry in ours:
+        path = os.path.join(directory, entry)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    if ours and not theirs and not os.path.islink(directory):
+        os.rmdir(directory)
+    return bool(ours)
+
+
+def _shared_dir_entry(kind, directory, names):
+    ours, theirs = _split_owned(directory, names)
+    if not ours:
+        return None
+    if theirs:
+        rest = f"the directory stays: it also holds {_names_preview(theirs)}"
+    else:
+        rest = "then the directory (nothing else is in it)"
+    return {
+        "kind": kind.split()[0], "label": f"agentbell's {kind} files in {directory}",
+        "action": f"delete {_names_preview(ours)}; {rest}",
+        "apply": lambda d=directory, n=names: _delete_owned(d, n),
+        "shared_dir": (directory, names),
+    }
 
 
 def _mcp_has_entry(path, container):
@@ -6046,7 +6141,7 @@ def purge_report(project=None):
         )
 
     # 1. CLI entry (pipx / pip --user / standalone copy)
-    pipx = _pipx_installed()
+    pipx = _pipx_installed(warnings)
     seen_paths = set()
     if pipx:
         entries.append({
@@ -6062,14 +6157,21 @@ def purge_report(project=None):
             if name.startswith("agentbell") and name.endswith((".dist-info", ".egg-info"))
         )
     if user_base and pip_user_data:
-        script = os.path.join(user_base, "bin", "agentbell")
-        if os.path.exists(script) and _is_our_binary(script) and not _under_pipx(script):
-            entries.append({
-                "kind": "binary", "label": f"pip --user script {script}",
-                "action": f"delete {script}",
-                "apply": lambda p=script: _delete_path(p),
-            })
-            seen_paths.add(script)
+        # pip's console script: <user base>/bin/agentbell on Linux and macOS,
+        # an agentbell.exe launcher in Scripts next to site-packages on Windows
+        for script in (os.path.join(user_base, "bin", "agentbell"),
+                       os.path.join(os.path.dirname(user_site), "Scripts", "agentbell.exe")):
+            if os.path.exists(script) and _is_our_binary(script) and not _under_pipx(script):
+                # Windows cannot delete the launcher this command runs from
+                locked = platform.system() == "Windows" and _runs_this_command(script)
+                entries.append({
+                    "kind": "binary", "label": f"pip --user script {script}",
+                    "action": f"delete {script}" + (
+                        " (Windows locks it while it runs this command)" if locked else ""),
+                    "apply": lambda p=script: _delete_path(p),
+                    "locked": locked,
+                })
+                seen_paths.add(script)
     for name in pip_user_data:
         path = os.path.join(user_site, name)
         entries.append({
@@ -6109,28 +6211,45 @@ def purge_report(project=None):
             "apply": lambda p=standalone: _delete_path(p),
         })
 
-    # 2. Config (incl. license key) + state
+    # 2. Config (incl. license key) + state. A default directory goes whole;
+    # of one set by env var only agentbell's own entries (see STATE_DIR_NAMES).
     cfile = config_path()
-    cdir = config_dir()
-    if os.path.isdir(cdir):
-        entries.append({
-            "kind": "config", "label": f"config directory {cdir}",
-            "action": "delete directory (config.json incl. license key)",
-            "apply": lambda p=cdir: _delete_path(p, directory=True),
-        })
-    elif os.path.exists(cfile):
-        entries.append({
-            "kind": "config", "label": f"config file {cfile}",
-            "action": "delete file (incl. license key)",
-            "apply": lambda p=cfile: _delete_path(p),
-        })
-    sdir = state_dir()
-    if os.path.isdir(sdir):
-        entries.append({
-            "kind": "state", "label": f"state directory {sdir}",
-            "action": "delete directory (history, queue, deferred, bot state/lock, run markers)",
-            "apply": lambda p=sdir: _delete_path(p, directory=True),
-        })
+    whole, shared = [], []                        # shared: [kind, directory, names]
+    for kind, directory, names, env, what in (
+            ("config", config_dir(), CONFIG_DIR_NAMES, CONFIG_DIR_ENV,
+             "config.json incl. license key"),
+            ("state", state_dir(), STATE_DIR_NAMES, STATE_DIR_ENV,
+             "history, queue, deferred, bot state/lock, run markers")):
+        if not os.environ.get(env):
+            if os.path.isdir(directory):
+                whole.append({
+                    "kind": kind, "label": f"{kind} directory {directory}",
+                    "action": f"delete directory ({what})",
+                    "apply": lambda p=directory: _delete_path(p, directory=True),
+                })
+            continue
+        same = next((item for item in shared if _same_path(item[1], directory)), None)
+        if same:                                  # both env vars name one directory
+            same[0] += f" + {kind}"
+            same[2] += names
+        else:
+            shared.append([kind, directory, tuple(names)])
+    if os.environ.get(CONFIG_FILE_ENV) and os.path.isfile(cfile):
+        home = next((item for item in shared
+                     if _same_path(os.path.dirname(cfile), item[1])), None)
+        if home:
+            home[2] += (os.path.basename(cfile),)     # goes with its neighbours
+        else:
+            entries.append({
+                "kind": "config", "label": f"config file {cfile} ({CONFIG_FILE_ENV})",
+                "action": "delete file (incl. license key)",
+                "apply": lambda p=cfile: _delete_path(p),
+            })
+    entries.extend(whole)
+    for item in shared:
+        entry = _shared_dir_entry(*item)
+        if entry:
+            entries.append(entry)
 
     # 3. Agent hooks (only our own markers are removed)
     entries.extend(_agent_hook_entries())
@@ -6173,10 +6292,12 @@ def cmd_uninstall(args):
         for entry in entries:
             print(f"  {entry['kind']:8s} {entry['label']}  ->  {entry['action']}")
         print()
-        print("run 'agentbell uninstall --yes' to delete everything listed above")
+        # `py -m` leaves the launcher idle, so it can go too
+        command = "py -m agentbell" if any(e.get("locked") for e in entries) else PROG
+        print(f"run '{command} uninstall --yes' to delete everything listed above")
         print("not removed automatically: " + "; ".join(PURGE_NOT_REMOVED))
         return
-    failures = 0
+    failures = locked = 0
     for entry in entries:
         try:
             if entry["apply"]():
@@ -6186,13 +6307,26 @@ def cmd_uninstall(args):
         except Exception as exc:  # noqa: BLE001
             failures += 1
             print(f"failed   {entry['label']}: {exc}")
+            if (isinstance(exc, PermissionError)
+                    and str(exc.filename or "").lower().endswith(".exe")):
+                # this command, a bot or an MCP client may be running it; a
+                # re-run cannot help once the module itself is gone
+                locked += 1
+                print("         Windows locks a launcher while it runs - "
+                      "delete it by hand once nothing uses it any more")
+    for entry in entries:
+        directory, names = entry.get("shared_dir") or (None, ())
+        theirs = _split_owned(directory, names)[1] if directory else []
+        if theirs:
+            print(f"kept     {directory}: {_names_preview(theirs)} (not agentbell's)")
     print()
     print("not removed automatically: " + "; ".join(PURGE_NOT_REMOVED))
     if failures:
-        print(f"{failures} step(s) failed - see above; re-run 'agentbell uninstall --yes'")
+        rerun = "; re-run 'agentbell uninstall --yes'" if failures > locked else ""
+        print(f"{failures} step(s) failed - see above{rerun}")
         raise SystemExit(1)
     print("Done. Fresh start:")
-    print("  ./install.sh && agentbell init")
+    print("  pipx install agentbell && agentbell init   (or ./install.sh from a checkout)")
 
 
 # ---------------------------------------------------------------------------
