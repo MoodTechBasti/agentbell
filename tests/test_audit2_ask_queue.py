@@ -2,6 +2,8 @@
 
 A7   postponements ("später", "wait, tests are red") deny instead of exit 0
 M13  a typed reply sent between two parallel asks reaches exactly one of them
+     (audit 4, APR2-1/APR2-2: now none of them, with a notice; only one
+     candidate question takes typed text)
 L    draining the offline queue respects quiet hours
 L    a channel that fails for good on a queued/deferred item leaves a trace
 """
@@ -225,27 +227,30 @@ class TestTelegramReplyRouting(base._TelegramFixture):
             message["reply_to_message"] = reply_to
         an.handle_bot_update(self.cfg, {"update_id": message_id, "message": message})
 
-    def test_reply_sent_between_two_questions_answers_the_older_one(self):
+    def test_reply_sent_between_two_questions_is_not_used(self):
+        """Two questions open: typed text names neither (audit 4)."""
         self._ask(self.A, 100)
         self._ask(self.B, 102)
         mark = _history_mark()
         self._reply(101, "staging")          # written before B's question existed
-        self.assertEqual(an.read_tg_answer(self.A), "staging")
+        self.assertIsNone(an.read_tg_answer(self.A))
         self.assertIsNone(an.read_tg_answer(self.B))
-        self.assertFalse([r for r in _history_since(mark) if r.get("event") == "stale_answer"])
+        stale = [r for r in _history_since(mark) if r.get("event") == "stale_answer"]
+        self.assertEqual([r["reason"] for r in stale],
+                         ["2 approval questions are open or just ended"])
 
-    def test_reply_after_both_questions_answers_the_newest(self):
+    def test_reply_after_both_questions_is_not_used(self):
         self._ask(self.A, 100)
         self._ask(self.B, 102)
         self._reply(103, "prod")
-        self.assertEqual(an.read_tg_answer(self.B), "prod")
+        self.assertIsNone(an.read_tg_answer(self.B))
         self.assertIsNone(an.read_tg_answer(self.A))
 
     def test_question_whose_send_failed_makes_replies_stale(self):
         """A failed send may still have reached the chat (audit 3, APR-2).
 
         Its marker has no message id for the whole ask. The reply may be
-        its answer: stale, never handed to the older ask.
+        its answer: not used, never handed to the older ask.
         """
         self._ask(self.A, 100)
         self._ask(self.C)                    # newer, send "failed"
@@ -254,7 +259,8 @@ class TestTelegramReplyRouting(base._TelegramFixture):
         self.assertIsNone(an.read_tg_answer(self.A))
         self.assertIsNone(an.read_tg_answer(self.C))
         stale = [r for r in _history_since(mark) if r.get("event") == "stale_answer"]
-        self.assertEqual([r["approval_id"] for r in stale], [self.C])
+        self.assertEqual([r["reason"] for r in stale],
+                         ["2 approval questions are open or just ended"])
 
     def test_telegram_reply_to_a_question_answers_that_question(self):
         self._ask(self.A, 100)
@@ -316,25 +322,24 @@ class TestNtfyReplyRouting(unittest.TestCase):
             items.append(waiter.messages.get_nowait())
         return items
 
-    def test_reply_between_two_questions_answers_the_older_one_in_any_order(self):
-        for first in ("A", "B"):
-            with self.subTest(first_to_see_the_reply=first):
-                _clean_state()
-                a = self._waiter(self.A, 1000)
-                b = self._waiter(self.B, 1002)
-                order = (b, a) if first == "B" else (a, b)
-                for waiter in order:
-                    waiter._offer("r1", "staging", 1001)
-                self.assertEqual(self._got(a), ["staging"])
-                self.assertEqual(self._got(b), [])
-
-    def test_reply_after_the_newest_question_answers_it(self):
-        a = self._waiter(self.A, 1000)
-        b = self._waiter(self.B, 1002)
-        for waiter in (a, b):
-            waiter._offer("r2", "prod", 1003)
-        self.assertEqual(self._got(a), [])
-        self.assertEqual(self._got(b), ["prod"])
+    def test_reply_with_two_open_questions_is_used_by_neither_in_any_order(self):
+        """Audit 4: between the two questions or after both, typed text
+        names neither; one record and one notice, whoever sees it first."""
+        for reply_time in (1001, 1003):
+            for first in ("A", "B"):
+                with self.subTest(reply_time=reply_time, first_to_see_the_reply=first):
+                    _clean_state()
+                    a = self._waiter(self.A, 1000)
+                    b = self._waiter(self.B, 1002)
+                    order = (b, a) if first == "B" else (a, b)
+                    mark = _history_mark()
+                    for waiter in order:
+                        waiter._offer("r1", "staging", reply_time)
+                    self.assertEqual(self._got(a) + self._got(b), [])
+                    stale = [r for r in _history_since(mark)
+                             if r.get("event") == "stale_answer"]
+                    self.assertEqual([r["reason"] for r in stale],
+                                     ["2 approval questions are open or just ended"])
 
     def test_reply_older_than_every_question_is_stale(self):
         a = self._waiter(self.A, 1000)
@@ -344,22 +349,17 @@ class TestNtfyReplyRouting(unittest.TestCase):
         self.assertTrue(any(r.get("event") == "stale_answer" and r.get("text") == "yes"
                             for r in _history_since(mark)))
 
-    def test_reply_waits_while_a_question_is_still_being_published(self):
-        """Neither ask may give the reply up before the other's time is known."""
+    def test_reply_while_another_question_is_being_published_is_not_used(self):
+        """Two candidates already: nothing to wait for (audit 4)."""
         a = self._waiter(self.A, 1000)
         b = self._waiter(self.B)                  # publishing: no time yet
         mark = _history_mark()
         for waiter in (a, b):
             waiter._offer("r4", "staging", 1001)
         self.assertEqual(self._got(a) + self._got(b), [])
-        self.assertNotIn("r4", a.seen)            # the next poll offers it again
-        self.assertNotIn("r4", b.seen)
-        self.assertFalse([r for r in _history_since(mark) if r.get("event") == "stale_answer"])
-        an.remember_ntfy_question(self.B, 1002)   # B's question went out after it
-        for waiter in (b, a):
-            waiter._offer("r4", "staging", 1001)
-        self.assertEqual(self._got(a), ["staging"])
-        self.assertEqual(self._got(b), [])
+        self.assertIn("r4", a.seen)               # decided, not offered again
+        self.assertEqual(len([r for r in _history_since(mark)
+                              if r.get("event") == "stale_answer"]), 1)
 
     def test_instant_reply_to_a_question_being_published_is_kept(self):
         """A responder can answer before `ask` has stored its question's time."""
@@ -370,13 +370,17 @@ class TestNtfyReplyRouting(unittest.TestCase):
         b._offer("r5", "staging", 1003)
         self.assertEqual(self._got(b), ["staging"])
 
-    def test_a_killed_ask_stuck_publishing_does_not_block_others(self):
+    def test_a_killed_ask_stuck_publishing_blocks_typed_replies(self):
+        """Its question may be on the phone: until its marker expires, typed
+        text is not used (audit 4); the buttons still work."""
         a = self._waiter(self.A, 1000)
         an.write_ntfy_pending(self.B, "Q?", 60)
         _set_pending("ntfy-pending", self.B,
                      created=time.time() - an.QUESTION_PUBLISH_GRACE_SECONDS - 5)
         a._offer("r6", "staging", 1001)
-        self.assertEqual(self._got(a), ["staging"])
+        self.assertEqual(self._got(a), [])
+        a._offer("r6b", f"APPROVED {self.A}", 1002)
+        self.assertEqual(self._got(a), [f"APPROVED {self.A}"])
 
     def test_a_finished_waiter_does_not_claim_a_reply(self):
         a = self._waiter(self.A, 1000)
@@ -385,16 +389,15 @@ class TestNtfyReplyRouting(unittest.TestCase):
         self.assertEqual(self._got(a), [])
         self.assertNotIn("r7", an._read_consumed("ntfy"))
 
-    def test_server_without_times_keeps_newest_open_ask_rule(self):
-        a = self._waiter(self.A, None)
+    def test_server_without_times_uses_no_typed_reply(self):
+        """Without times a reply cannot be placed after its question (audit 4)."""
         b = self._waiter(self.B, None)
-        now = time.time()        # a coarse clock may stamp both markers alike
-        _set_pending("ntfy-pending", self.A, created=now - 1)
-        _set_pending("ntfy-pending", self.B, created=now)
-        for waiter in (a, b):
-            waiter._offer("r8", "staging", None)
-        self.assertEqual(self._got(a), [])
-        self.assertEqual(self._got(b), ["staging"])
+        mark = _history_mark()
+        b._offer("r8", "staging", None)
+        self.assertEqual(self._got(b), [])
+        self.assertEqual([r["reason"] for r in _history_since(mark)
+                          if r.get("event") == "stale_answer"],
+                         ["that question's place in the chat is unknown"])
 
     def test_publish_reports_the_server_time(self):
         ntfy = TimedNtfy()
@@ -416,8 +419,8 @@ class TestNtfyReplyRouting(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             an.remember_ntfy_question(self.A, 1000)
         self.assertIn("cannot record the question", err.getvalue())
-        # a finished ask removed its marker: nothing to record, nothing to say
-        an.remove_ntfy_pending(self.A)
+        # a marker that is gone: nothing to record, nothing to say
+        os.remove(_pending_path("ntfy-pending", self.A))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             an.remember_ntfy_question(self.A, 1000)
@@ -427,7 +430,11 @@ class TestNtfyReplyRouting(unittest.TestCase):
 
 
 class TestNtfyReplyBetweenParallelAsks(unittest.TestCase):
-    """End to end: the reply that used to be dropped by both asks."""
+    """End to end: the reply that used to be dropped by both asks silently.
+
+    Audit 4: with two questions open it is still used by neither, but the
+    phone is told once; the buttons answer both.
+    """
 
     def setUp(self):
         _clean_state()
@@ -469,18 +476,26 @@ class TestNtfyReplyBetweenParallelAsks(unittest.TestCase):
             second = threading.Thread(target=ask, args=("b", "Second?"), daemon=True)
             second.start()
             _wait_for(lambda: len(self.ntfy.posts.get("m13e2e", [])) == 2)
+            mark = _history_mark()
             gate.set()                                      # the first ask looks now
-            first.join(timeout=15)
-            self.assertFalse(first.is_alive())
-            self.assertEqual(results["a"]["answer"], "staging", results["a"])
-            self.assertFalse(results["a"]["timeout"])
-            self.assertTrue(second.is_alive())               # not answered by it
-            body = self.ntfy.posts["m13e2e"][1]["body"]
-            second_id = re.search(r"ID: ([0-9a-f]+)", body).group(1)
+            _wait_for(lambda: [r for r in _history_since(mark)
+                               if r.get("event") == "stale_answer"],
+                      message="the reply was neither used nor refused")
+            self.assertTrue(first.is_alive())
+            self.assertTrue(second.is_alive())
+            notices = [r["body"] for r in self.ntfy.posts["m13e2e"]
+                       if "was not used" in r["body"]]
+            self.assertEqual(len(notices), 1, notices)
+            first_id, second_id = (re.search(r"ID: ([0-9a-f]+)", r["body"]).group(1)
+                                   for r in self.ntfy.posts["m13e2e"][:2])
+            self.ntfy.add("m13e2e-responses", f"APPROVED {first_id}")
             self.ntfy.add("m13e2e-responses", f"APPROVED {second_id}")
+            first.join(timeout=15)
             second.join(timeout=15)
+        self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
-        self.assertTrue(results["b"]["approved"])
+        self.assertTrue(results["a"]["approved"], results["a"])
+        self.assertTrue(results["b"]["approved"], results["b"])
 
 
 class TestNtfyFailureInTwoChannelAsk(base._TelegramFixture):
@@ -500,9 +515,9 @@ class TestNtfyFailureInTwoChannelAsk(base._TelegramFixture):
         _clean_state()
         self.addCleanup(_clean_state)
 
-    def test_failed_ntfy_question_keeps_an_uncertain_marker(self):
+    def test_failed_ntfy_question_keeps_a_marker_of_unknown_place(self):
         """A failed publish may still have been stored (audit 3, APR-1): its
-        marker stays, without a time, so no reply goes to an older ask."""
+        marker stays, without a time, so no reply goes to another ask."""
         ntfy = base.MockNtfy(post_503_count=1000)
         self.addCleanup(ntfy.stop)
         cfg = self._tg_cfg(ntfy_url=ntfy.url, channels=("ntfy", "telegram"))
@@ -522,21 +537,23 @@ class TestNtfyFailureInTwoChannelAsk(base._TelegramFixture):
             # ... and the marker written before the first one says so
             marker = _pending_path("ntfy-pending", approval_id)
 
-            def uncertain():
+            def unplaced():
                 try:
                     with open(marker, encoding="utf-8") as fh:
-                        return json.load(fh).get("question_uncertain")
+                        data = json.load(fh)
                 except (OSError, ValueError):       # caught mid-write
                     return False
-            _wait_for(uncertain, message="the failed ntfy question is not marked uncertain")
-            with open(marker, encoding="utf-8") as fh:
-                self.assertNotIn("question_time", json.load(fh))
+                return "question_time" in data and data["question_time"] is None
+            _wait_for(unplaced, message="the failed ntfy question is not marked unplaced")
             self.assertTrue(thread.is_alive())               # Telegram still carries it
             an.write_tg_answer(approval_id, "approved")
             thread.join(timeout=10)
         self.assertTrue(holder["result"]["approved"])
         self.assertEqual(holder["result"]["channel"], "telegram")
-        self.assertFalse(os.path.exists(marker))
+        # answered: a tombstone that no longer counts for typed replies
+        with open(marker, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual((data["closed"], data["answered"]), (True, True))
 
 
 # ---------------------------------------------------------------------------

@@ -240,7 +240,7 @@ class TestSharedDirsM10(_UninstallFixture):
         with open(an.__file__, "r", encoding="utf-8") as fh:
             source = fh.read()
         written = set(re.findall(r'os\.path\.join\(state_dir\(\),\s*"([^"/]+)"', source))
-        written |= set(re.findall(r'_pending_dir\("([^"]+)"\)', source))
+        written |= set(re.findall(r'(?:_pending_dir|write_pending)\("([^"]+)"', source))
         written |= {f"{name}-consumed" for name in
                     re.findall(r'claim_consumed\("([^"]+)"', source)}
         self.assertTrue({"history.jsonl", "queue", "bot.lock", "tg-pending"} <= written)

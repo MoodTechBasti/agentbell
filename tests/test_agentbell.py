@@ -166,10 +166,13 @@ class MockNtfy:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"id":"x","time":1,"event":"message"}')
+                # the server's clock in whole seconds, like real ntfy
+                self.wfile.write(json.dumps({"id": record["id"], "time": int(record["ts"]),
+                                             "event": "message"}).encode())
 
             def _write(self, record):
-                line = json.dumps({"event": "message", "id": record["id"], "message": record["body"]})
+                line = json.dumps({"event": "message", "id": record["id"],
+                                   "time": int(record["ts"]), "message": record["body"]})
                 self.wfile.write((line + "\n").encode())
                 self.wfile.flush()
 
@@ -248,6 +251,12 @@ class MockNtfy:
     def stop(self):
         self.server.shutdown()
         self.server.server_close()
+
+
+def _remove_pending(name, approval_id):
+    """Drop an ask's marker outright; an ended ask leaves a tombstone."""
+    with contextlib.suppress(OSError):
+        os.remove(an._pending_path(name, approval_id))
 
 
 def make_config(server_url, topic="testtopic"):
@@ -614,6 +623,11 @@ class TestApprovalFlow(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.ntfy.stop()
+
+    def setUp(self):
+        # an ask that ended unanswered leaves a tombstone that refuses typed
+        # replies for a while; every test starts without one
+        shutil.rmtree(os.path.join(an.state_dir(), "ntfy-pending"), ignore_errors=True)
 
     def _run_ask_async(self, cfg, **kwargs):
         holder = {}
@@ -2113,6 +2127,9 @@ class _TelegramFixture(unittest.TestCase):
             os.remove(an._bot_state_path())
         except OSError:
             pass
+        # no tombstone of an earlier test's ask may refuse this test's replies
+        for name in ("ntfy-pending", "tg-pending"):
+            shutil.rmtree(os.path.join(an.state_dir(), name), ignore_errors=True)
 
     def _tg_cfg(self, licensed=True, ntfy_url="https://ntfy.sh", channels=("telegram",)):
         cfg = an.Config({
@@ -2414,7 +2431,7 @@ class TestBotDaemon(_TelegramFixture):
         edited = self.tg.last("editMessageText")
         self.assertIn("Answered: approved", edited["body"]["text"])
         an.remove_tg_answer("abcdef0123456789")
-        an.remove_tg_pending("abcdef0123456789")
+        _remove_pending("tg-pending", "abcdef0123456789")
 
     def test_expired_callback_not_attributed(self):
         """A button pressed after the ask ended must never leak into a newer ask."""
@@ -2433,7 +2450,7 @@ class TestBotDaemon(_TelegramFixture):
         answered = self.tg.last("answerCallbackQuery")
         self.assertEqual(answered["body"]["callback_query_id"], "cq3")
         self.assertIn("expired", answered["body"]["text"])
-        an.remove_tg_pending("feedface01234567")
+        _remove_pending("tg-pending", "feedface01234567")
 
     def test_free_text_attributed_to_newest_pending(self):
         cfg = self._tg_cfg()
@@ -2446,10 +2463,10 @@ class TestBotDaemon(_TelegramFixture):
         an.bot_poll_once(cfg, poll_timeout=1)
         self.assertEqual(an.read_tg_answer("deadbeef"), "staging")
         an.remove_tg_answer("deadbeef")
-        an.remove_tg_pending("deadbeef")
+        _remove_pending("tg-pending", "deadbeef")
 
     def _stamp_question(self, approval_id, message_id):
-        path = an._tg_pending_path(approval_id)
+        path = an._pending_path("tg-pending", approval_id)
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         data["question_message_id"] = message_id
@@ -2485,7 +2502,7 @@ class TestBotDaemon(_TelegramFixture):
         an.bot_poll_once(cfg, poll_timeout=1)
         self.assertEqual(an.read_tg_answer("deadbeef"), "yes")
         an.remove_tg_answer("deadbeef")
-        an.remove_tg_pending("deadbeef")
+        _remove_pending("tg-pending", "deadbeef")
 
     def test_reply_without_a_message_id_is_not_ordered_as_newer(self):
         cfg = self._tg_cfg()
@@ -2497,7 +2514,7 @@ class TestBotDaemon(_TelegramFixture):
         })
         an.bot_poll_once(cfg, poll_timeout=1)
         self.assertIsNone(an.read_tg_answer("deadbeef"))
-        an.remove_tg_pending("deadbeef")
+        _remove_pending("tg-pending", "deadbeef")
 
     def test_unknown_callback_answered_politely(self):
         cfg = self._tg_cfg()
@@ -2604,7 +2621,7 @@ class TestAskParallelChannels(_TelegramFixture):
         holder, thread = self._run_ask_async(cfg, message="Deploy?", timeout_seconds=20)
         body = self._wait_new_request("sendMessage", before=holder["tg_before"])["body"]
         match = an.re.search(r"ID: ([0-9a-f]+)", body["text"])
-        with open(an._tg_pending_path(match.group(1)), encoding="utf-8") as fh:
+        with open(an._pending_path("tg-pending", match.group(1)), encoding="utf-8") as fh:
             question_id = json.load(fh).get("question_message_id")
         self.assertIsInstance(question_id, int)
         self.assertGreater(question_id, 0)
@@ -2980,17 +2997,28 @@ class TestApprovalHardening(unittest.TestCase):
         posts = self._wait_posts("par", 2)
         id_b = an.re.search(r"ID: ([0-9a-f]+)", posts[-1]["body"]).group(1)
         self.assertNotEqual(id_a, id_b)
-        # free text goes to the newest open question (B)
+        # free text names neither of two open questions: used by none, and
+        # the phone is told so once
         urllib.request.urlopen(
             urllib.request.Request(f"{self.ntfy.url}/par-responses", method="POST",
                                    data=b"staging")
         ).read()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not any(
+                "was not used" in p["body"] for p in self.ntfy.posts.get("par", [])):
+            time.sleep(0.05)
+        notices = [p for p in self.ntfy.posts["par"] if "was not used" in p["body"]]
+        self.assertEqual(len(notices), 1)
+        self.assertTrue(thread_a.is_alive())
+        self.assertTrue(thread_b.is_alive())
+        # a button answer reaches each of them
+        urllib.request.urlopen(
+            urllib.request.Request(f"{self.ntfy.url}/par-responses", method="POST",
+                                   data=f"DENIED {id_b}".encode())
+        ).read()
         thread_b.join(timeout=10)
         self.assertFalse(thread_b.is_alive())
-        self.assertEqual(holder_b["result"]["answer"], "staging")
-        self.assertFalse(holder_b["result"]["approved"])
-        self.assertTrue(thread_a.is_alive())  # A unaffected
-        # a button answer for A still reaches A
+        self.assertTrue(holder_b["result"]["denied"])
         urllib.request.urlopen(
             urllib.request.Request(f"{self.ntfy.url}/par-responses", method="POST",
                                    data=f"APPROVED {id_a}".encode())
@@ -3001,26 +3029,24 @@ class TestApprovalHardening(unittest.TestCase):
         self.assertEqual(holder_a["result"].get("channel"), "ntfy")
 
     def test_free_text_claimed_by_another_ask_is_not_answered_twice(self):
-        """The case the newest-open check alone cannot decide.
+        """The case the markers alone cannot decide.
 
         On a slow box the ask that took a free-text reply is already finished
-        - and its pending marker deleted - by the time a second ask's poll
-        reaches the same message. That ask then finds itself "newest open" and
-        answers the very same reply. The claim recorded before the marker
-        disappeared is what stops it.
+        - its marker an answered tombstone that no longer counts - by the time
+        a second ask's poll reaches the same message. That ask then finds
+        itself the only open question and answers the very same reply. The
+        claim recorded before the marker was closed is what stops it.
         """
         cfg = make_config(self.ntfy.url, topic="claimed")
         holder, thread = self._run_ask_async(cfg, message="Which env?", timeout_seconds=20)
         posts = self._wait_posts("claimed", 1)
         approval_id = an.re.search(r"ID: ([0-9a-f]+)", posts[-1]["body"]).group(1)
-        # The other, newer ask: it takes the reply and shuts down (marker gone)
-        # before the message is ever handed to the ask above.
+        # The other ask took the reply (its claim) and ended (an answered
+        # tombstone) before the message is ever handed to the ask above.
         other_id = "b" * 16
         an.write_ntfy_pending(other_id, "Second question?", 20)
-        other = an.ApprovalWaiter(cfg, "claimed-responses", 20, approval_id=other_id)
-        other._offer("race-msg-1", "race-claimed-reply")
-        self.assertEqual(other.messages.get_nowait(), "race-claimed-reply")
-        an.remove_ntfy_pending(other_id)
+        self.assertTrue(an.claim_ntfy_message("race-msg-1"))
+        an.close_pending("ntfy-pending", other_id, answered=True)
         self.ntfy.inject("claimed-responses", "race-claimed-reply", "race-msg-1")
         deadline = time.monotonic() + 15
         ignored = False
@@ -3090,11 +3116,13 @@ class TestApprovalHardening(unittest.TestCase):
         cfg = make_config(self.ntfy.url, topic="claimfailure")
         waiter = an.ApprovalWaiter(
             cfg, "claimfailure-responses", 5, approval_id="a" * 16)
+        an.write_ntfy_pending("a" * 16, "Q?", 5)          # the one open question
+        an.remember_ntfy_question("a" * 16, 1000)
         original = an.claim_ntfy_message
         an.claim_ntfy_message = lambda message_id: (_ for _ in ()).throw(
             OSError("read only"))
         try:
-            waiter._offer("message-id", "free text")
+            waiter._offer("message-id", "free text", 1001)
         finally:
             an.claim_ntfy_message = original
         self.assertTrue(waiter.messages.empty())
@@ -4160,7 +4188,7 @@ class TestForeignTelegramAnswer(unittest.TestCase):
             self.assertIsNone(an.read_tg_answer(approval_id),
                               "a stranger must not be able to approve")
         finally:
-            an.remove_tg_pending(approval_id)
+            _remove_pending("tg-pending", approval_id)
             an.remove_tg_answer(approval_id)
 
 

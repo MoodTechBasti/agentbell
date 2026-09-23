@@ -1,8 +1,9 @@
 """Regression tests for the approvals findings of the third audit round.
 
 APR-1  ntfy: a question whose publish raised or was retried may already be
-       on the phone; a reply is stale, never handed to an older ask
+       on the phone; a reply is not used, never handed to another ask
 APR-2  the same on Telegram (a send that errored, or needed a retry)
+       (both now under the one-candidate rule of audit 4, APR2-1/APR2-2)
 APR-3  a yes followed by a postponement or refusal denies
 APR-4  the quiet-hours drain keeps the queue time, so the 24 h expiry holds
 APR-5  a typed "APPROVED <id>" on Telegram goes to the ask it names
@@ -10,9 +11,8 @@ APR-6  (BOT-3, IW-11) "approve 2" / "deny bad idea" on ntfy is an answer,
        not another ask's button
 APR-7  a reply in the same second as the newest question is ambiguous
 APR-8  an ntfy marker that never got a time (older agentbell, killed ask)
-       does not hand its reply to an older ask
+       does not hand its reply to another ask
 S2     (D3, IW-6) one priority -> number helper for every site
-S8     newest_pending() takes the list it looks at
 """
 
 import contextlib
@@ -144,21 +144,32 @@ class ResettingNtfy:
 
 
 # ---------------------------------------------------------------------------
-# ntfy routing: APR-1, APR-6, APR-7, APR-8
+# ntfy routing: APR-1, APR-6, APR-7, APR-8 (under the one-candidate rule)
 # ---------------------------------------------------------------------------
+
+def _marker(name, approval_id):
+    """One read of a marker; {} when it is missing or caught mid-write."""
+    try:
+        with open(os.path.join(an.state_dir(), name, f"{approval_id}.json"),
+                  encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
 
 class TestNtfyUnplacedQuestions(unittest.TestCase):
     A, B = "a" * 16, "b" * 16
+    TWO_OPEN = "2 approval questions are open or just ended"
 
     def setUp(self):
         _clean_state()
         self.addCleanup(_clean_state)
         self.cfg = base.make_config("http://127.0.0.1:9", topic="apr1unit")
 
-    def _waiter(self, approval_id, question_time="unset", uncertain=False):
+    def _waiter(self, approval_id, question_time="unset"):
         an.write_ntfy_pending(approval_id, "Q?", 60)
         if question_time != "unset":
-            an.remember_ntfy_question(approval_id, question_time, uncertain=uncertain)
+            an.remember_ntfy_question(approval_id, question_time)
         return an.ApprovalWaiter(self.cfg, "apr1unit-responses", 60, approval_id=approval_id)
 
     def _got(self, waiter):
@@ -171,67 +182,61 @@ class TestNtfyUnplacedQuestions(unittest.TestCase):
         for waiter in waiters:
             waiter._offer(message_id, text, reply_time)
 
-    def test_reply_before_a_retried_question_is_stale_not_the_older_asks(self):
-        a = self._waiter(self.A, 1001)
-        b = self._waiter(self.B, 1004, uncertain=True)   # first copy stored at 1002
+    def test_reply_before_a_retried_question_is_not_used(self):
+        """APR-1: the recorded time is the copy that got through; a reply
+        typed under an earlier copy is older than that and is not used."""
+        b = self._waiter(self.B, 1004)                   # first copy stored at 1002
         mark = _history_mark()
-        self._offer_all((a, b), "r1", "yes", 1003)
-        self.assertEqual(self._got(a) + self._got(b), [])
-        self.assertIn("r1", a.seen)                       # decided, not held
-        self.assertEqual({r["approval_id"] for r in _stale(mark)}, {self.A, self.B})
-        # after the copy with the recorded time, the reply is B's
-        self._offer_all((a, b), "r2", "prod", 1005)
-        self.assertEqual(self._got(a), [])
+        b._offer("r1", "yes", 1003)
+        self.assertEqual(self._got(b), [])
+        self.assertIn("r1", b.seen)                       # decided, not held
+        self.assertEqual([(r["approval_id"], r["text"]) for r in _stale(mark)],
+                         [(self.B, "yes")])
+        b._offer("r2", "prod", 1005)
         self.assertEqual(self._got(b), ["prod"])
 
-    def test_failed_publish_makes_replies_to_older_asks_stale(self):
+    def test_failed_publish_blocks_typed_replies_for_other_asks(self):
         a = self._waiter(self.A, 1001)
-        an.write_ntfy_pending(self.B, "Q?", 60)
-        an.mark_ntfy_question_uncertain(self.B)           # every attempt "failed"
+        self._waiter(self.B, None)                        # every attempt "failed"
         mark = _history_mark()
         a._offer("r3", "yes", 1005)
         self.assertEqual(self._got(a), [])
-        self.assertEqual([r["approval_id"] for r in _stale(mark)], [self.A])
+        self.assertEqual([r["reason"] for r in _stale(mark)], [self.TWO_OPEN])
 
-    def test_failed_publish_of_an_older_ask_does_not_block_a_newer_one(self):
-        an.write_ntfy_pending(self.B, "Q?", 60)
-        an.mark_ntfy_question_uncertain(self.B)
+    def test_failed_publish_of_an_older_ask_blocks_a_newer_one(self):
+        """APR2-2: an older ask's copies can land after a newer question."""
+        self._waiter(self.B, None)
         _set_pending("ntfy-pending", self.B, created=time.time() - 30)
         a = self._waiter(self.A, 1001)
+        mark = _history_mark()
         a._offer("r4", "staging", 1002)
-        self.assertEqual(self._got(a), ["staging"])
-
-    def test_retried_question_older_than_the_owner_does_not_block_it(self):
-        b = self._waiter(self.B, 1002, uncertain=True)
-        _set_pending("ntfy-pending", self.B, created=time.time() - 30)
-        a = self._waiter(self.A, 1005)
-        a._offer("r5", "staging", 1006)
-        self.assertEqual(self._got(a), ["staging"])
-        self.assertEqual(self._got(b), [])
+        self.assertEqual(self._got(a), [])
+        self.assertEqual([r["reason"] for r in _stale(mark)], [self.TWO_OPEN])
 
     def test_same_second_as_the_newest_question_is_ambiguous(self):
-        """APR-7: whole-second times cannot order a reply and a question."""
+        """APR-7: two open questions: no typed reply is used, in any order."""
         a = self._waiter(self.A, 1001)
         b = self._waiter(self.B, 1010)
         mark = _history_mark()
         self._offer_all((a, b), "r6", "yes", 1010)
+        self._offer_all((b, a), "r7", "yes", 1011)
         self.assertEqual(self._got(a) + self._got(b), [])
-        self.assertEqual({r["approval_id"] for r in _stale(mark)}, {self.A, self.B})
+        # one record per reply, from the ask that claimed it first
+        self.assertEqual([r["text"] for r in _stale(mark)], ["yes", "yes"])
 
     def test_same_second_with_a_single_ask_still_answers_it(self):
         b = self._waiter(self.B, 1010)
         b._offer("r7", "staging", 1010)
         self.assertEqual(self._got(b), ["staging"])
 
-    def test_marker_that_never_got_a_time_blocks_older_asks_after_the_grace(self):
+    def test_marker_that_never_got_a_time_blocks_other_asks(self):
         """APR-8: an older agentbell (or a killed ask) never records the time."""
         a = self._waiter(self.A, 1001)
         an.write_ntfy_pending(self.B, "Q?", 60)            # no question_time, ever
         mark = _history_mark()
-        with unittest.mock.patch.object(an, "QUESTION_PUBLISH_GRACE_SECONDS", 0):
-            a._offer("r8", "yes", 1005)
+        a._offer("r8", "yes", 1005)
         self.assertEqual(self._got(a), [])
-        self.assertEqual([r["approval_id"] for r in _stale(mark)], [self.A])
+        self.assertEqual([r["reason"] for r in _stale(mark)], [self.TWO_OPEN])
 
     def test_typed_verdicts_without_a_full_id_are_answers(self):
         """APR-6 / BOT-3 / IW-11: ntfy reads them like Telegram does."""
@@ -275,7 +280,7 @@ class TestNtfyRetriedPublishEndToEnd(unittest.TestCase):
 
     def _ids(self):
         return [re.search(r"ID: ([0-9a-f]+)", r["body"]).group(1)
-                for r in self.ntfy.posts.get("apr1e2e", [])]
+                for r in self.ntfy.posts.get("apr1e2e", []) if "ID: " in r["body"]]
 
     def test_reply_to_the_first_copy_does_not_approve_the_older_ask(self):
         cfg = base.make_config(self.ntfy.url, topic="apr1e2e")
@@ -288,28 +293,23 @@ class TestNtfyRetriedPublishEndToEnd(unittest.TestCase):
         first.start()
         _wait_for(lambda: len(self._ids()) == 1)
         a_id = self._ids()[0]
-        _wait_for(lambda: an.open_pendings("ntfy-pending")
-                  and an.open_pendings("ntfy-pending")[0].get("question_time") is not None)
+        # one read per check: the ask rewrites the marker meanwhile (WIN-1)
+        _wait_for(lambda: _marker("ntfy-pending", a_id).get("question_time") is not None)
         second = threading.Thread(target=ask, args=("b", "Second?"), daemon=True)
         second.start()
         _wait_for(lambda: len(self._ids()) == 3)          # the reset copy and the retry
         b_id = self._ids()[1]
         first_copy, retry = self.ntfy.posts["apr1e2e"][1:3]
-        marker = os.path.join(an.state_dir(), "ntfy-pending", f"{b_id}.json")
-
-        def recorded():
-            try:
-                with open(marker, encoding="utf-8") as fh:
-                    return json.load(fh)
-            except (OSError, ValueError):
-                return {}
-        _wait_for(lambda: recorded().get("question_time") == retry["time"])
-        self.assertTrue(recorded().get("question_uncertain"))
+        _wait_for(lambda: _marker("ntfy-pending", b_id).get("question_time") == retry["time"])
         mark = _history_mark()
         # typed on the first copy: after it, before the recorded retry
         self.ntfy.add("apr1e2e-responses", "yes", at=first_copy["time"])
-        _wait_for(lambda: {r.get("approval_id") for r in _stale(mark)} >= {a_id, b_id},
-                  message="the reply was not dropped as stale by both asks")
+        _wait_for(lambda: _stale(mark), message="the reply was not refused")
+        [entry] = _stale(mark)
+        self.assertEqual(entry["reason"], "2 approval questions are open or just ended")
+        self.assertEqual(entry["notice"], "sent")
+        notices = [r["body"] for r in self.ntfy.posts["apr1e2e"] if "was not used" in r["body"]]
+        self.assertEqual(len(notices), 1, notices)
         self.assertTrue(first.is_alive())
         self.assertTrue(second.is_alive())
         self.ntfy.add("apr1e2e-responses", f"DENIED {a_id}")
@@ -333,39 +333,32 @@ class TestTelegramUnplacedQuestions(base._TelegramFixture):
         self.addCleanup(_clean_state)
         self.cfg = self._tg_cfg()
 
-    def _ask(self, approval_id, question_message_id=None, uncertain=False):
+    def _ask(self, approval_id, question_message_id=None):
         an.write_tg_pending(approval_id, f"{approval_id[:1]}?", 60)
         if question_message_id is not None:
-            an.remember_tg_question_message(approval_id, question_message_id,
-                                            uncertain=uncertain)
+            an.remember_tg_question_message(approval_id, question_message_id)
 
     def _reply(self, message_id, text):
         an.handle_bot_update(self.cfg, {"update_id": message_id, "message": {
             "message_id": message_id, "chat": {"id": 42}, "text": text}})
 
-    def test_reply_while_a_newer_question_is_being_sent_is_stale(self):
+    def test_reply_while_a_newer_question_is_being_sent_is_not_used(self):
         self._ask(self.A, 1)
         self._ask(self.B)                              # sendMessage still running
         mark = _history_mark()
+        before = len(self.tg.requests)
         self._reply(3, "yes")
-        self.assertIsNone(an.read_tg_answer(self.A))
-        stale = _stale(mark)
-        self.assertEqual([(r["approval_id"], r["reason"]) for r in stale],
-                         [(self.B, "a newer question may be in the chat")])
-
-    def test_reply_before_a_retried_question_is_stale(self):
-        self._ask(self.A, 1)
-        self._ask(self.B, 4, uncertain=True)           # first copy was message 2
-        mark = _history_mark()
-        self._reply(3, "yes")
+        self._reply(5, "prod")                         # after both: still two open
         self.assertIsNone(an.read_tg_answer(self.A))
         self.assertIsNone(an.read_tg_answer(self.B))
-        self.assertEqual(len(_stale(mark)), 1)
-        self._reply(5, "prod")
-        self.assertEqual(an.read_tg_answer(self.B), "prod")
-        self.assertIsNone(an.read_tg_answer(self.A))
+        self.assertEqual([(r["text"], r["reason"], r["notice"]) for r in _stale(mark)],
+                         [("yes", "2 approval questions are open or just ended", "sent"),
+                          ("prod", "2 approval questions are open or just ended", "sent")])
+        notices = [r["body"] for r in self.tg.requests[before:] if r["method"] == "sendMessage"]
+        self.assertEqual([n["reply_to_message_id"] for n in notices], [3, 5])
+        self.assertIn("Reply on the question", notices[0]["text"])
 
-    def test_retried_send_is_recorded_as_uncertain(self):
+    def test_retried_send_records_the_copy_that_got_through(self):
         calls = []
 
         def send_ask(channel, *args, **kwargs):
@@ -382,11 +375,13 @@ class TestTelegramUnplacedQuestions(base._TelegramFixture):
                 r=an.run_ask(self.cfg, "Drop prod DB?", timeout_seconds=20,
                              print_status=False)), daemon=True)
             thread.start()
-            _wait_for(lambda: an.open_pendings("tg-pending")
-                      and an.open_pendings("tg-pending")[0].get("question_message_id"))
-            marker = an.open_pendings("tg-pending")[0]
+            markers = []
+            _wait_for(lambda: markers.extend(an.pending_markers("tg-pending")) or any(
+                m.get("question_message_id") for m in markers))
+            marker = next(m for m in markers if m.get("question_message_id"))
             self.assertEqual(marker["question_message_id"], 4)
-            self.assertTrue(marker["question_uncertain"])
+            self._reply(3, "yes")                     # under the first copy: older
+            self.assertIsNone(an.read_tg_answer(marker["approval_id"]))
             an.write_tg_answer(marker["approval_id"], "no")
             thread.join(timeout=10)
         self.assertTrue(results["r"]["denied"])
@@ -408,6 +403,7 @@ class TestTelegramUnplacedQuestions(base._TelegramFixture):
         self.assertIsNone(an.read_tg_answer(self.B))
         self.assertEqual([(r["approval_id"], r["reason"]) for r in _stale(mark)],
                          [(closed, "verdict for a question that is no longer open")])
+        an.close_pending("tg-pending", self.A, answered=True)
         self._reply(5, "approve 2")                  # no full id: free text for B
         self.assertEqual(an.read_tg_answer(self.B), "approve 2")
 
@@ -567,14 +563,6 @@ class TestQueueAgeAndPriorities(unittest.TestCase):
                               "priority": ["high"]})
         self.assertEqual(an.drain_queue(cfg)["delivered"], 1)
         self.assertEqual(self._queue(), [])
-
-
-class TestNewestPending(unittest.TestCase):
-    def test_newest_pending_takes_the_list(self):
-        self.assertIsNone(an.newest_pending([]))
-        older, newer = {"created": 1}, {"created": 2}
-        self.assertIs(an.newest_pending([older, newer]), newer)
-        self.assertIs(an.newest_pending([newer, older]), newer)
 
 
 if __name__ == "__main__":

@@ -127,10 +127,20 @@ APPROVAL_ID_BYTES = 8
 PRIME_ATTEMPTS = 3
 PRIME_RETRY_SECONDS = 0.2
 
-# A typed ntfy reply is not attributed while a parallel ask is still
-# publishing its question (it may be that question's answer). Longer than
-# the publish retries can take; after it the reply is dropped as stale.
+# A typed ntfy reply is not attributed while the one ask it could answer is
+# still publishing its question. Longer than the publish retries can take;
+# after it the question's place is unknown and the reply is not used.
 QUESTION_PUBLISH_GRACE_SECONDS = 60
+
+# An ended ask's marker stays as a tombstone at least this long: its
+# question may still be on the phone (see reply_candidates).
+PENDING_TOMBSTONE_GRACE_SECONDS = 60
+
+# A marker that cannot be read is read once more after this pause: it may
+# be caught mid-rewrite. One that still cannot counts as an open question
+# of unknown place for this long, then it is deleted.
+PENDING_REREAD_SECONDS = 0.05
+PENDING_UNREADABLE_MAX_AGE_SECONDS = WEBHOOK_ASK_MAX_TIMEOUT + 60
 
 # Topics shorter than this are considered guessable on public servers.
 MIN_GUESSABLE_TOPIC_LEN = 16
@@ -1030,7 +1040,7 @@ class TelegramChannel:
     def _api(self, method, body=None, timeout=10.0):
         return self._call(self._token(), method, body, timeout)
 
-    def send(self, message, title=None, priority=3, timeout=10.0):
+    def send(self, message, title=None, priority=3, timeout=10.0, reply_to=None):
         text = html.escape(clamp_message(message, 3800))
         if title:
             text = f"<b>{html.escape(_sendable_text(title))}</b>\n{text}"
@@ -1038,9 +1048,10 @@ class TelegramChannel:
             text = "\U0001f515 " + text
         elif int(priority) >= 4:
             text = "\U0001f534 " + text
-        self._api("sendMessage",
-                  {"chat_id": self.tg.get("chat_id"), "text": text, "parse_mode": "HTML"},
-                  timeout)
+        body = {"chat_id": self.tg.get("chat_id"), "text": text, "parse_mode": "HTML"}
+        if reply_to is not None:
+            body.update(reply_to_message_id=reply_to, allow_sending_without_reply=True)
+        self._api("sendMessage", body, timeout)
         return {"channel": "telegram", "ok": True}
 
     def send_ask(self, message, approval_id, yes_label, no_label, buttons=True, timeout=10.0):
@@ -1259,7 +1270,7 @@ def _parse_hhmm(value):
 def suppressed_by_quiet_hours(cfg, priority, force):
     if force:
         return False
-    if int(priority) >= int(cfg.data.get("quiet_hours_min_priority", 3)):
+    if int(priority) >= priority_number(cfg.data.get("quiet_hours_min_priority", 3)):
         return False
     return in_quiet_hours(cfg.data.get("quiet_hours") or [])
 
@@ -1638,8 +1649,11 @@ def _pending_dir(name):
 
 
 def write_pending(name, approval_id, message, timeout_seconds):
-    """Register an open ask so free-text replies can be attributed to the
-    newest question (deterministic cross-talk handling, see DECISIONS.md)."""
+    """Register an ask on one channel before its question goes out.
+
+    A typed reply that names no question is used only when exactly one
+    question can be on the phone (place_typed_reply, DECISIONS.md).
+    """
     directory = ensure_state_dir(_pending_dir(name))
     with open_private(os.path.join(directory, f"{approval_id}.json"), "w") as fh:
         json.dump({
@@ -1650,103 +1664,188 @@ def write_pending(name, approval_id, message, timeout_seconds):
         }, fh)
 
 
-def remove_pending(name, approval_id):
+def _pending_path(name, approval_id):
+    return os.path.join(_pending_dir(name), f"{approval_id}.json")
+
+
+def close_pending(name, approval_id, answered):
+    """Turn an ended ask's marker into a tombstone until it expires.
+
+    Its question may still be on the phone. Unanswered, it keeps counting
+    when a typed reply is placed, so a "yes" typed under it never goes to
+    another ask; answered, it no longer does. A marker that was never
+    written (the ask failed before) stays absent.
+    """
+    path = _pending_path(name, approval_id)
+    data = _read_marker(path)
+    if data is None:
+        return
+    if not data:
+        data = {"approval_id": approval_id, "created": time.time(), "expires": 0}
+    data.update(closed=True, answered=bool(answered),
+                expires=max(data["expires"], time.time() + PENDING_TOMBSTONE_GRACE_SECONDS))
     try:
-        os.remove(os.path.join(_pending_dir(name), f"{approval_id}.json"))
-    except OSError:
-        pass
+        with open_private(path, "w") as fh:
+            json.dump(data, fh)
+    except OSError as exc:
+        sys.stderr.write(f"{PROG}: cannot close the question in {name} "
+                         f"({type(exc).__name__}); typed replies are not used "
+                         "until it expires\n")
 
 
-def open_pendings(name):
-    """Every unexpired open ask of one channel.
+def _read_marker(path):
+    """A pending marker; None when it is gone; {} when it cannot be read.
+
+    A rewrite truncates the file before it fills it again, so a failed
+    read is tried once more a moment later (WIN-1).
+    """
+    for attempt in range(2):
+        if attempt:
+            time.sleep(PENDING_REREAD_SECONDS)
+        try:
+            data = _read_json_object(path)
+            data["created"] = float(data.get("created", 0))
+            data["expires"] = float(data.get("expires", 0))
+            return data
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, TypeError):
+            continue
+    return {}
+
+
+def pending_markers(name):
+    """Every unexpired marker of one channel: open asks and tombstones.
 
     Expired markers are deleted on the way: a killed `ask` would otherwise
-    leave one behind that keeps stealing answers until it expires.
+    leave one behind that blocks typed replies for good. A marker that
+    cannot be read counts as an open ask whose question's place is unknown
+    ({"unreadable": True}) until it is old: skipping it would hand a typed
+    reply to another ask (WIN-1).
     """
     directory = _pending_dir(name)
     if not os.path.isdir(directory):
         return []
-    pendings = []
+    markers = []
     now = time.time()
-    for entry in os.listdir(directory):
+    for entry in sorted(os.listdir(directory)):
         if not entry.endswith(".json"):
             continue
         path = os.path.join(directory, entry)
-        try:
-            data = _read_json_object(path)
-        except (OSError, ValueError):
+        data = _read_marker(path)
+        if data is None:
             continue
-        if float(data.get("expires", 0)) < now:
+        if not data:
+            try:
+                created = os.stat(path).st_mtime
+            except OSError:
+                continue
+            data = {"approval_id": entry[:-len(".json")], "unreadable": True,
+                    "created": created,
+                    "expires": created + PENDING_UNREADABLE_MAX_AGE_SECONDS}
+        if data["expires"] < now:
             try:
                 os.remove(path)
             except OSError:
                 pass
             continue
-        pendings.append(data)
-    return pendings
+        markers.append(data)
+    return markers
 
 
-def newest_pending(pendings):
-    """Most recent open ask by local creation time."""
-    return max(pendings, key=lambda data: float(data.get("created", 0)), default=None)
+def pending_is_open(name, approval_id):
+    """Whether an ask still waits for its answer on this channel."""
+    return any(data.get("approval_id") == approval_id and not data.get("closed")
+               for data in pending_markers(name))
 
 
 def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def question_owner(pendings, key, position, strict):
-    """The newest open question that was already out when a reply was written.
+def reply_candidates(markers):
+    """The asks a typed reply that names no question may be meant for:
+    every open one, and every ended one that got no answer, because its
+    question may still be on the phone."""
+    return [data for data in markers if not (data.get("closed") and data.get("answered"))]
 
-    `key` names where each marker stores its question's place in the reply
-    stream (a Telegram message id, an ntfy server time); `position` is the
-    reply's place in that same stream. A marker without one is a question
-    still being sent: nothing can have answered it yet. `strict` means an
-    equal position predates the question (unique message ids); with
-    whole-second times a tie goes to the newer question. A reply sent
-    between two questions answers the older one; it used to vanish,
-    because it predates the newer one and the older one deferred to it.
+
+REPLY_PREDATES = "reply predates the question"
+
+
+def place_typed_reply(markers, key, position, strict):
+    """The ask a typed reply that names no question answers.
+
+    Returns (marker, None, None), or (None, reason, approval id or None)
+    when no ask may use it. `key` names where each marker stores its
+    question's place in the reply stream (a Telegram message id, an ntfy
+    server time); `position` is the reply's place in that stream. `strict`:
+    an equal place predates the question (unique message ids); with
+    whole-second times it does not.
+
+    The reply is used only when there is exactly one candidate
+    (reply_candidates), that ask is still open, and its question is known
+    to be out before the reply. Choosing among several questions by their
+    places kept approving the wrong one: a send that failed or needed a
+    retry, or a question that had just ended, can sit anywhere on the
+    phone. A misrouted approval is worse than a lost reply; the buttons,
+    a typed "APPROVED <id>" and Telegram's Reply still name their question.
+    A reply older than every candidate's question is a replay (a restarted
+    bot, a reply sent before the question): stale, as before.
     """
-    best = None
-    for data in pendings:
-        mark = data.get(key)
-        if not _is_number(mark) or mark > position or (strict and mark == position):
-            continue
-        if best is None or (mark, float(data.get("created", 0))) > (
-                best[key], float(best.get("created", 0))):
-            best = data
-    return best
+    candidates = reply_candidates(markers)
+    about = candidates[0].get("approval_id") if len(candidates) == 1 else None
+    marks = [data.get(key) for data in candidates]
+    if (candidates and _is_number(position) and all(_is_number(mark) for mark in marks)
+            and all(position < mark or (strict and position == mark) for mark in marks)):
+        return None, REPLY_PREDATES, about
+    if len(candidates) > 1:
+        return None, f"{len(candidates)} approval questions are open or just ended", None
+    if not candidates:
+        return None, "no approval question is open", None
+    only = candidates[0]
+    if only.get("closed"):
+        return None, "that question is no longer open", about
+    if not _is_number(position) or not _is_number(only.get(key)):
+        return None, "that question's place in the chat is unknown", about
+    return only, None, None
 
 
-def unplaced_after(pendings, owner, key):
-    """An open question sent after `owner` whose place in the reply stream
-    is unknown, or None.
+def refuse_typed_reply(cfg, channel, text, reason, about=None, reply_to=None):
+    """Record a typed reply that no ask used, and say so on its channel.
 
-    Its send is still running, failed, or needed a retry: an attempt that
-    reported an error may still have reached the phone, earlier than the
-    position that was recorded. A reply that looks like the owner's may
-    be that question's answer. Handing it to the older ask could approve
-    the wrong thing, so the caller drops the reply as stale instead.
+    The person who typed "yes" has to learn that it did not count; a
+    notice that cannot be sent is recorded with the reply.
     """
-    created = float(owner.get("created", 0))
-    for data in pendings:
-        if data is owner or float(data.get("created", 0)) <= created:
-            continue
-        mark = data.get(key)
-        if not _is_number(mark) or (data.get("question_uncertain") and mark > owner[key]):
-            return data
-    return None
+    how = ("tap a button, or answer with Reply on the question" if channel == "telegram"
+           else "tap a button, or send APPROVED <id> or DENIED <id> with the question's ID")
+    shown = _sendable_text(text)
+    shown = shown if len(shown) <= 60 else shown[:59] + "…"
+    notice = f'Your reply "{shown}" was not used: {reason}. Please {how}.'
+    entry = {"event": "stale_answer", "approval_id": about, "channel": channel,
+             "text": text[:120], "reason": reason}
+    try:
+        if channel == "telegram":
+            TelegramChannel(cfg).send(notice, reply_to=reply_to)
+        else:
+            NtfyChannel(cfg).publish(cfg.data["ntfy"]["topic"], notice,
+                                     title="Reply not used", priority=PRIORITIES["high"],
+                                     tags=["warning"])
+        entry["notice"] = "sent"
+    except (RuntimeError, ValueError, KeyError) as exc:
+        entry["notice"] = f"failed: {exc}"[:200]
+    write_history(entry)
 
 
 def _remember_question(name, approval_id, fields):
     """Store where a question sits in its reply stream on its pending marker.
 
-    Only an existing marker is updated: a finished ask removed its marker,
-    and recreating it would leave a question open that nobody waits on.
-    A failure is reported, because free text would then never be accepted
-    for this question.
+    Only an existing marker is updated: recreating one that was never
+    written would leave a question open that nobody waits on. A failure is
+    reported, because typed replies would then never be used for this
+    question.
     """
-    path = os.path.join(_pending_dir(name), f"{approval_id}.json")
+    path = _pending_path(name, approval_id)
     try:
         data = _read_json_object(path)
         data.update(fields)
@@ -1763,105 +1862,67 @@ def write_tg_pending(approval_id, message, timeout_seconds):
     write_pending("tg-pending", approval_id, message, timeout_seconds)
 
 
-def remember_tg_question_message(approval_id, message_id, uncertain=False):
+def remember_tg_question_message(approval_id, message_id):
     """Record the Telegram message id of the question we just sent.
 
     Free-text replies are ordered against this id, not against the local
     clock. Message ids increase inside one chat. A restarted bot replays
     about a day of updates; a lower id was written before this question
-    existed, whatever the two clocks say (DECISIONS §16i, §22).
-    `uncertain`: the send needed a retry, so an earlier copy may be in
-    the chat below this id (see unplaced_after).
+    existed, whatever the two clocks say (DECISIONS §16i, §22). After a
+    retried send it is the copy that got through: a reply to an earlier
+    copy counts as older and is not used.
     """
     try:
         message_id = int(message_id)
     except (TypeError, ValueError):
         return
-    fields = {"question_message_id": message_id}
-    if uncertain:
-        fields["question_uncertain"] = True
-    _remember_question("tg-pending", approval_id, fields)
-
-
-def remove_tg_pending(approval_id):
-    remove_pending("tg-pending", approval_id)
+    _remember_question("tg-pending", approval_id, {"question_message_id": message_id})
 
 
 def write_ntfy_pending(approval_id, message, timeout_seconds):
     write_pending("ntfy-pending", approval_id, message, timeout_seconds)
 
 
-def remember_ntfy_question(approval_id, server_time, uncertain=False):
+def remember_ntfy_question(approval_id, server_time):
     """Record the ntfy server time of the question we just published.
 
     The ntfy twin of the Telegram message id: every reply carries the same
     server's `time`, so replies are ordered against the questions without
-    the local clock (DECISIONS §16i). None means "published, but the server
-    sent no time"; replies are then attributed to the newest ask.
-    `uncertain`: the publish needed a retry, so an earlier copy may have
-    reached the phone before this time (see unplaced_after).
+    the local clock (DECISIONS §16i). None means its place is unknown: the
+    server sent no time, or every publish attempt failed although one may
+    have been stored. Typed replies are then not used for it.
     """
-    fields = {"question_time": server_time if _is_number(server_time) else None}
-    if uncertain:
-        fields["question_uncertain"] = True
-    _remember_question("ntfy-pending", approval_id, fields)
+    _remember_question("ntfy-pending", approval_id,
+                       {"question_time": server_time if _is_number(server_time) else None})
 
 
-def mark_ntfy_question_uncertain(approval_id):
-    """Every publish attempt failed, but one may still have been stored."""
-    _remember_question("ntfy-pending", approval_id, {"question_uncertain": True})
-
-
-def remove_ntfy_pending(approval_id):
-    remove_pending("ntfy-pending", approval_id)
-
-
-def ntfy_reply_is_for(approval_id, reply_time):
-    """Whether a free-text ntfy reply answers this ask: True, False, or
-    None while that cannot be decided yet.
+def ntfy_reply_route(reply_time):
+    """Where a typed ntfy reply goes, as place_typed_reply() says, or None
+    while that cannot be decided yet.
 
     Every parallel ask sees every reply on the shared response topic, so
-    they all have to reach the same verdict. With server times on both
-    sides, the reply belongs to the newest question published at or before
-    it. While a question is still being published its time is unknown and
-    the reply may be its answer, so nobody decides; the poller offers the
-    reply again. Once that takes longer than any publish can (a killed ask,
-    an older agentbell that never records the time), or when the publish
-    failed or needed a retry, the reply is stale for everyone rather than
-    handed to an older ask (unplaced_after). So is a reply stamped in the
-    same second as the newest question while an older one is open: nobody
-    answers a question within the second it arrived, but the order is
-    unknown. Without times (a server that sends no `time`), the newest open
-    ask takes the reply, as before.
+    they all have to reach the same verdict from the same markers. While
+    the one ask it could answer is still publishing, its question's time is
+    unknown and the reply may be its answer: nobody decides, and the poller
+    offers the reply again. Past QUESTION_PUBLISH_GRACE_SECONDS (a killed
+    ask, an older agentbell) the place stays unknown and it is not used.
     """
-    pendings = open_pendings("ntfy-pending")
-    timed = _is_number(reply_time) and all(
-        _is_number(data.get("question_time"))
-        for data in pendings if "question_time" in data)
-    if timed:
-        now = time.time()
-        if any("question_time" not in data and not data.get("question_uncertain")
-               and now - float(data.get("created", 0)) < QUESTION_PUBLISH_GRACE_SECONDS
-               for data in pendings):
-            return None
-        owner = question_owner(pendings, "question_time", reply_time, strict=False)
-        if owner is None or unplaced_after(pendings, owner, "question_time"):
-            return False
-        if owner["question_time"] == reply_time and any(
-                data is not owner and _is_number(data.get("question_time"))
-                and data["question_time"] <= reply_time for data in pendings):
-            return False
-        return owner.get("approval_id") == approval_id
-    newest = newest_pending(pendings)
-    return newest is None or newest.get("approval_id") == approval_id
+    markers = pending_markers("ntfy-pending")
+    candidates = reply_candidates(markers)
+    if (len(candidates) == 1 and not candidates[0].get("closed")
+            and "question_time" not in candidates[0]
+            and time.time() - candidates[0]["created"] < QUESTION_PUBLISH_GRACE_SECONDS):
+        return None
+    return place_typed_reply(markers, "question_time", reply_time, strict=False)
 
 
 # A free-text reply belongs to exactly one ask, but on ntfy every parallel ask
 # polls the same response topic and sees it. The winner records the claim here
-# *before* its pending marker is removed, so a slower poller that finds the
-# marker already gone - and would otherwise conclude it is now the newest open
-# question itself - still sees the claim and leaves the reply alone. Bounded
-# like history.jsonl: only replies from the recent past can still be offered.
+# *before* its marker becomes an answered tombstone, so a slower poller that
+# no longer counts that ask - and would otherwise conclude it is now the only
+# open question itself - still sees the claim and leaves the reply alone. A
+# reply no ask may use is claimed too, so it is announced once. Bounded like
+# history.jsonl: only replies from the recent past can still be offered.
 CONSUMED_KEEP_LINES = 200
 CONSUMED_LOCK_TIMEOUT_SECONDS = 2.0
 CONSUMED_LOCK_STALE_SECONDS = 30.0
@@ -1968,10 +2029,6 @@ def _trim_consumed(path):
 
 def claim_ntfy_message(message_id):
     return claim_consumed("ntfy", message_id)
-
-
-def _tg_pending_path(approval_id):
-    return os.path.join(_pending_dir("tg-pending"), f"{approval_id}.json")
 
 
 def _bot_state_path():
@@ -2840,6 +2897,22 @@ _DENIAL_STANDALONE = frozenset({
     "not", "nicht",
 })
 
+# What may sit between an approval word and what follows it ("yes, wait",
+# "yes? wait", "yes (wait)", "ok → later"). Typographic punctuation is
+# ASCII by then (_ascii_punct): a phone turns "..." into "…" as you type.
+_REPLY_SEP = r"[\s,.:;!?()\"'\-\u2192\u21d2\u27a1\ufe0f\U0001f449]*"
+
+# Smart quotes, ellipsis and dashes as their ASCII twins.
+_ASCII_PUNCT = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u201e": '"',
+    "\u2026": "...", "\u2013": "-", "\u2014": "-", "\u2212": "-",
+})
+
+
+def _ascii_punct(text):
+    return (text or "").translate(_ASCII_PUNCT)
+
+
 # A leading mark is a denial, including a skin tone or a gender ZWJ sequence.
 # ✋ and ⛔ sit with the other stop marks: "not now" was a denial and the
 # raised hand / no-entry mark for the same reply was not. ⏸ ⏳ ⌛ are the
@@ -2848,7 +2921,7 @@ _DENIAL_MARK_RE = re.compile(
     r"^(?:\U0001f44e|\u274c|\U0001f6d1|\U0001f6ab|\u274e|\u2716|\u2715"
     r"|\U0001f645|\u270b|\u26d4|\u23f8|\u23f3|\u231b)"
     r"(?:[\U0001f3fb-\U0001f3ff]|\ufe0f|\u200d[\u2640\u2642\U0001f9d1]*)*"
-    r"[\s,.:!-]*(.*)\Z",
+    + _REPLY_SEP + r"(.*)\Z",
     re.S,
 )
 
@@ -2865,13 +2938,12 @@ def _denial_reason(text, no_label):
     built-in list ("Abort", "Hold").
     """
     phrases = list(_DENIAL_PHRASES)
-    extra = _strip_trailing_punct((no_label or "").strip())
-    extra = extra.replace("\u2019", "'").replace("\u2018", "'")
+    extra = _strip_trailing_punct(_ascii_punct(no_label).strip())
     if extra:
         phrases.append(extra)
     for phrase in sorted(set(phrases), key=len, reverse=True):
         match = re.match(
-            r"^" + re.escape(phrase) + r"(?!\w)[\s,.:!-]*(.*)\Z",
+            r"^" + re.escape(phrase) + r"(?!\w)" + _REPLY_SEP + r"(.*)\Z",
             text, re.I | re.S)
         if match:
             return match.group(1).strip()
@@ -2890,8 +2962,8 @@ def _after_approval(text, words):
     while True:
         for word in ordered:
             match = re.match(
-                re.escape(word) + r"(?!\w)(?:[\U0001f3fb-\U0001f3ff]|\ufe0f)*[\s,.:;!-]*"
-                r"(?:(?:but|aber|doch)(?!\w)[\s,.:;!-]*)?(.+)\Z",
+                re.escape(word) + r"(?!\w)(?:[\U0001f3fb-\U0001f3ff]|\ufe0f)*" + _REPLY_SEP
+                + r"(?:(?:but|aber|doch)(?!\w)" + _REPLY_SEP + r")?(.+)\Z",
                 text, re.I | re.S)
             if match:
                 text = rest = match.group(1)
@@ -2923,10 +2995,9 @@ def _parse_answer(text, yes_label="Approve", no_label="Deny", approval_id=None):
     body = re.fullmatch(r"(approved?|denied?)\s+([0-9a-f]+)", cleaned, re.I)
     if body and (approval_id is None or body.group(2).lower() == approval_id):
         return ("approved" if body.group(1)[0] in "aA" else "denied"), ""
-    normalized = cleaned.replace("\u2019", "'").replace("\u2018", "'")
+    normalized = _ascii_punct(cleaned)
     standalone = _strip_trailing_punct(normalized)
-    yes = _strip_trailing_punct((yes_label or "").strip())
-    yes = yes.replace("\u2019", "'").replace("\u2018", "'")
+    yes = _strip_trailing_punct(_ascii_punct(yes_label).strip())
     if yes and standalone.casefold() == yes.casefold():
         return "approved", ""
     mark = _DENIAL_MARK_RE.match(normalized)
@@ -3051,25 +3122,28 @@ class ApprovalWaiter:
                     self._log_stale(text)
                     return
             else:
-                # free-text: attribute to the newest question that was out
-                # when the reply was written, so parallel asks do not
-                # cross-talk (same rule as Telegram, documented)
-                verdict = ntfy_reply_is_for(self.approval_id, reply_time)
-                if verdict is None:
+                # free text names no question: it is used only when one
+                # question alone can be on the phone (same rule as Telegram)
+                route = ntfy_reply_route(reply_time)
+                if route is None:
                     # a question is still going out: decide on a later poll
                     with self.lock:
                         self.seen.discard(message_id)
                     return
-                if not verdict:
+                owner, reason, about = route
+                if owner is None:
+                    self._refuse(message_id, text, reason, about)
+                    return
+                if owner.get("approval_id") != self.approval_id:
                     self._log_stale(text)
                     return
                 # Claiming AFTER the check above is what closes the race: the
-                # ask that took this reply recorded its claim before dropping
-                # its pending marker, so "the newest marker is gone" and "the
-                # claim is on disk" can never both be missed. Without this, a
-                # poll that reaches the check late - slow runner, buffered
-                # stream - promotes itself to newest and answers the same
-                # reply a second time.
+                # ask that took this reply recorded its claim before its
+                # marker became an answered tombstone, so "that ask no longer
+                # counts" and "the claim is on disk" can never both be
+                # missed. Without this, a poll that reaches the check late -
+                # slow runner, buffered stream - finds itself the only open
+                # ask and answers the same reply a second time.
                 try:
                     claimed = claim_ntfy_message(message_id)
                 except OSError as exc:
@@ -3088,6 +3162,25 @@ class ApprovalWaiter:
                     self._log_stale(text)
                     return
         self.messages.put(text)
+
+    def _refuse(self, message_id, text, reason, about):
+        """A typed reply no ask may use. The ask that claims it first
+        records why and tells the phone; a reply older than every question
+        is only logged, as a replay nobody waits on."""
+        if reason == REPLY_PREDATES:
+            self._log_stale(text)
+            return
+        try:
+            first = claim_ntfy_message(message_id)
+        except OSError as exc:
+            self._record_error(f"cannot claim approval answer ({type(exc).__name__})")
+            first = True                # a second notice beats none
+        if not first:
+            return
+        try:
+            refuse_typed_reply(self.cfg, "ntfy", text, reason, about)
+        except OSError as exc:
+            self._record_error(f"cannot record an unused reply ({type(exc).__name__})")
 
     def _record_error(self, message):
         with self.lock:
@@ -3335,7 +3428,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
     if "ntfy" in channels:
         ntfy_waiter = ApprovalWaiter(cfg, resp_topic, timeout_seconds, approval_id=approval_id)
 
-    def _publish_ntfy_question(tries):
+    def _publish_ntfy_question():
         server = NtfyChannel(cfg).server()
         actions = (ask_actions(server, resp_topic, approval_id, yes_label, no_label, ntfy)
                    if buttons else None)
@@ -3346,7 +3439,6 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                      "or type a custom answer.")
 
         def publish():
-            tries.append(None)
             return NtfyChannel(cfg).publish(
                 ntfy.get("topic"),
                 f"{message}\n\nID: {approval_id}\n{hint}",
@@ -3386,27 +3478,25 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                 ntfy_waiter.stop_event.set()
                 return
             write_ntfy_pending(approval_id, message, timeout_seconds)
-        tries = []
         try:
-            sent = _publish_ntfy_question(tries)
+            sent = _publish_ntfy_question()
         except RuntimeError as exc:
             wrapped = RuntimeError(f"ntfy: {exc}")
             _note_ntfy_failure(wrapped, str(wrapped))
             ntfy_waiter.stop_event.set()
             # the server may have stored the question before the error (a
-            # timeout, a reset): keep the marker so a reply is never handed
-            # to an older ask in its place
+            # timeout, a reset): its place is unknown, and the marker keeps
+            # counting, so a reply is never handed to another ask
             with arm_lock:
                 if not ask_closed.is_set():
-                    mark_ntfy_question_uncertain(approval_id)
+                    remember_ntfy_question(approval_id, None)
             return
         with arm_lock:
             if ask_closed.is_set():
                 ntfy_waiter.stop_event.set()
                 return
             remember_ntfy_question(
-                approval_id, sent.get("time") if isinstance(sent, dict) else None,
-                uncertain=len(tries) > 1)
+                approval_id, sent.get("time") if isinstance(sent, dict) else None)
             waiters.append(("ntfy", ntfy_waiter))
 
     if print_status:
@@ -3416,9 +3506,10 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         )
         sys.stderr.flush()
 
+    answered = False
     try:
         # register the open question only now, so the finally below always
-        # cleans it up again. The ntfy marker is written by _arm_ntfy, after
+        # closes it again. The ntfy marker is written by _arm_ntfy, after
         # a successful prime and before that publish.
         if "telegram" in channels:
             write_tg_pending(approval_id, message, timeout_seconds)
@@ -3432,10 +3523,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
 
         telegram_error = None
         if "telegram" in channels:
-            tg_tries = []
-
             def send_tg():
-                tg_tries.append(None)
                 return TelegramChannel(cfg).send_ask(
                     message, approval_id, yes_label, no_label,
                     buttons=buttons and bot_heartbeat_fresh(),
@@ -3444,8 +3532,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                 sent = publish_with_retry(send_tg)
                 message_id = sent.get("message_id") if isinstance(sent, dict) else None
                 if message_id:
-                    remember_tg_question_message(approval_id, message_id,
-                                                 uncertain=len(tg_tries) > 1)
+                    remember_tg_question_message(approval_id, message_id)
             except RuntimeError as exc:
                 telegram_error = exc
                 sys.stderr.write(f"{PROG}: telegram: {exc}\n")
@@ -3467,6 +3554,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                        "timeout": timeout_seconds, "buttons": buttons, "channels": channels})
 
         result = wait_first(waiters, timeout_seconds, print_status)
+        answered = not result.get("timeout")
         # A response topic we cannot read (403, wrong auth, DNS) otherwise
         # looks exactly like "nobody answered" for the whole timeout.
         if result.get("timeout"):
@@ -3479,15 +3567,16 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         # stop the poller/stream threads first: in a long-lived process (MCP
         # server, webhook server) an abandoned waiter would keep polling ntfy
         # every few seconds for the rest of the process's life. The lock
-        # keeps _arm_ntfy from writing a pending marker after we removed it.
+        # keeps _arm_ntfy from writing to the marker after we closed it. The
+        # markers stay as tombstones: the question may still be on the phone.
         with arm_lock:
             ask_closed.set()
             if ntfy_waiter is not None:
                 ntfy_waiter.stop_event.set()
             for _, pending_waiter in waiters:
                 pending_waiter.stop_event.set()
-            remove_ntfy_pending(approval_id)
-            remove_tg_pending(approval_id)
+            close_pending("ntfy-pending", approval_id, answered)
+            close_pending("tg-pending", approval_id, answered)
             remove_tg_answer(approval_id)
 
     if print_status:
@@ -7222,8 +7311,8 @@ def handle_bot_update(cfg, update):
         match = TG_CALLBACK_RE.match(data)
         if match:
             approval_id, answer = match.groups()
-            if not os.path.exists(_tg_pending_path(approval_id)):
-                # expired / unknown request: never let a stale button answer
+            if not pending_is_open("tg-pending", approval_id):
+                # ended / unknown request: never let a stale button answer
                 # leak into a newer ask
                 write_history({"event": "stale_answer", "approval_id": approval_id,
                                "answer": answer})
@@ -7256,13 +7345,18 @@ def handle_bot_update(cfg, update):
         return
     if str((message.get("chat") or {}).get("id")) != chat_id:
         return
-    pendings = open_pendings("tg-pending")
-    if not pendings:
+    markers = pending_markers("tg-pending")
+    if not markers:
         return
-    owner, reason, about = _tg_reply_owner(pendings, message)
+    owner, reason, about = _tg_reply_owner(markers, message)
     if owner is None:
-        write_history({"event": "stale_answer", "approval_id": about,
-                       "text": text[:120], "reason": reason})
+        if reason == REPLY_PREDATES:
+            # a replayed backlog message: nobody is waiting on it
+            write_history({"event": "stale_answer", "approval_id": about,
+                           "text": text[:120], "reason": reason})
+        else:
+            refuse_typed_reply(cfg, "telegram", text, reason, about,
+                               reply_to=message.get("message_id"))
         return
     write_tg_answer(owner["approval_id"], text)
 
@@ -7272,53 +7366,44 @@ def handle_bot_update(cfg, update):
 _TG_QUESTION_ID_RE = re.compile(r"^ID: ([0-9a-f]{8,32})$", re.M)
 
 
-def _tg_reply_owner(pendings, message):
-    """Which open ask a typed Telegram reply answers.
+def _tg_reply_owner(markers, message):
+    """Which ask a typed Telegram reply answers.
 
-    Returns (pending, None, None), or (None, reason, approval id) when the
-    reply is stale.
-    A typed button body ("APPROVED <id>") and answering a question with
-    Telegram's "Reply" pick that question, and a reply to a question that
-    is no longer open is stale rather than handed to another one.
-    Otherwise the reply belongs to the newest question sent before it,
-    unless a newer question's place in the chat is unknown
-    (unplaced_after): then it is stale. Telegram retains undelivered
-    updates for ~24h, so a restarted daemon replays a backlog. Message ids
-    increase inside the chat, so an id at or below a question's id was
-    written before that question existed. Comparing clocks instead reopens
-    that window whenever the local clock is behind Telegram, and drops a
-    live reply when the local clock is ahead.
+    Returns (marker, None, None), or (None, reason, approval id or None)
+    when no ask may use it. A typed button body ("APPROVED <id>") and
+    answering a question with Telegram's "Reply" name their question: it
+    gets the reply while it is open, and a reply to an ended one is not
+    used. Any other reply goes through place_typed_reply(), against message
+    ids: they increase inside the chat, so an id at or below a question's
+    id was written before that question existed. Telegram retains
+    undelivered updates for ~24h, so a restarted daemon replays a backlog.
+    Comparing clocks instead reopens that window whenever the local clock
+    is behind Telegram, and drops a live reply when the local clock is
+    ahead.
     """
     verdict = VERDICT_ID_RE.fullmatch((message.get("text") or "").strip())
     if verdict:
         # a typed button body names its question, like on ntfy
         named = verdict.group(2).lower()
-        for data in pendings:
-            if data.get("approval_id") == named:
+        for data in markers:
+            if data.get("approval_id") == named and not data.get("closed"):
                 return data, None, None
         return None, "verdict for a question that is no longer open", named
     replied = message.get("reply_to_message") or {}
     if replied:
         quoted = _TG_QUESTION_ID_RE.findall(replied.get("text") or "")
         replied_id = replied.get("message_id")
-        for data in pendings:
-            if ((quoted and data.get("approval_id") == quoted[-1])
-                    or (replied_id is not None
-                        and data.get("question_message_id") == replied_id)):
-                return data, None, None
-        if quoted:
-            return None, "reply to a question that is no longer open", quoted[-1]
-    reply_id = message.get("message_id")
-    owner = None
-    if _is_number(reply_id):
-        owner = question_owner(pendings, "question_message_id", reply_id, strict=True)
-    if owner is None:
-        newest = newest_pending(pendings)
-        return None, "reply predates the question", newest.get("approval_id")
-    unplaced = unplaced_after(pendings, owner, "question_message_id")
-    if unplaced is not None:
-        return None, "a newer question may be in the chat", unplaced.get("approval_id")
-    return owner, None, None
+        named = next((data for data in markers
+                      if (quoted and data.get("approval_id") == quoted[-1])
+                      or (replied_id is not None
+                          and data.get("question_message_id") == replied_id)), None)
+        if named is not None and not named.get("closed"):
+            return named, None, None
+        if named is not None or quoted:
+            return (None, "reply to a question that is no longer open",
+                    named.get("approval_id") if named is not None else quoted[-1])
+    return place_typed_reply(markers, "question_message_id", message.get("message_id"),
+                             strict=True)
 
 
 def bot_poll_once(cfg, offset=None, poll_timeout=25):
@@ -7521,10 +7606,7 @@ def print_bot_status(cfg):
               "- a new bot can start")
     else:
         print("lock:      none")
-    pending = []
-    directory = _pending_dir("tg-pending")
-    if os.path.isdir(directory):
-        pending = [n for n in os.listdir(directory) if n.endswith(".json")]
+    pending = [data for data in pending_markers("tg-pending") if not data.get("closed")]
     print(f"pending:   {len(pending)} open approval question(s)")
     queue_overview = _queue_overview(queue_dir())
     if queue_overview:
@@ -7678,7 +7760,7 @@ def doctor_checks(cfg, send=False):
         window = ", ".join(f"{w.get('start')}-{w.get('end')}" for w in quiet)
         mode = cfg.data.get("quiet_hours_mode") or "suppress"
         if in_quiet_hours(quiet):
-            min_prio = cfg.data.get("quiet_hours_min_priority", 3)
+            min_prio = priority_number(cfg.data.get("quiet_hours_min_priority", 3))
             checks.append(_check(
                 WARN, "quiet hours",
                 f"ACTIVE right now ({window}, mode '{mode}') - notifications below priority "
@@ -9742,7 +9824,9 @@ CONFIG_SETTERS = {
     "quiet_hours": ("HH:MM-HH:MM[,HH:MM-HH:MM] ('none' clears it)",
                     lambda v: _coerce_quiet_hours(v)),
     "quiet_hours_mode": ("suppress or defer", lambda v: _one_of(v, ("suppress", "defer"))),
-    "quiet_hours_min_priority": ("1-5", lambda v: _one_of(int(v), (1, 2, 3, 4, 5))),
+    "quiet_hours_min_priority": ("1-5 or min, low, normal, high, urgent",
+                                 lambda v: PRIORITIES.get(v.strip().lower())
+                                 or _one_of(int(v), (1, 2, 3, 4, 5))),
     "channels": ("comma-separated: ntfy,telegram,os",
                  lambda v: [_one_of(c.strip(), ("ntfy", "telegram", "os"))
                             for c in v.split(",") if c.strip()]),

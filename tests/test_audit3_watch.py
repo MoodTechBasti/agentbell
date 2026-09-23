@@ -323,8 +323,8 @@ class TestWatchKeepsTheExitCode(unittest.TestCase):
         self.assertIn("failed (exit 3)", self.ntfy.posts["w4-state"][-1]["body"])
 
     def test_a_config_value_of_the_wrong_kind(self):
-        for key, value, error in (("quiet_hours_min_priority", "high", "ValueError"),
-                                  ("channels", 5, "TypeError")):
+        # a priority name no longer is one (audit 4, APR2-4)
+        for key, value, error in (("channels", 5, "TypeError"),):
             with self.subTest(key=key):
                 cfg = base.make_config(self.ntfy.url, topic="hr3")
                 cfg.data[key] = value

@@ -360,7 +360,7 @@ class TestTypedApproveIsNotAButton(base._TelegramFixture):
         # the pending marker learns the question's message id right after send
         pending = None
         while time.monotonic() < deadline:
-            pending = an.newest_pending(an.open_pendings("tg-pending"))
+            pending = next(iter(an.pending_markers("tg-pending")), None)
             if pending and pending.get("question_message_id"):
                 break
             time.sleep(0.05)
