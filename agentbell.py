@@ -129,7 +129,7 @@ PRIME_RETRY_SECONDS = 0.2
 
 # A typed ntfy reply is not attributed while a parallel ask is still
 # publishing its question (it may be that question's answer). Longer than
-# the publish retries can take; a marker older than this is a killed ask.
+# the publish retries can take; after it the reply is dropped as stale.
 QUESTION_PUBLISH_GRACE_SECONDS = 60
 
 # Topics shorter than this are considered guessable on public servers.
@@ -167,6 +167,11 @@ def priority_name(number):
         if value == number:
             return name
     return str(number)
+
+
+def priority_number(value):
+    """ntfy's number for a stored priority: a name, a legacy number, or junk."""
+    return PRIORITIES.get(priority_name(value or "normal"), PRIORITIES["normal"])
 
 
 AGENT_LABELS = {
@@ -1669,13 +1674,9 @@ def open_pendings(name):
     return pendings
 
 
-def newest_pending(name, pendings=None):
+def newest_pending(pendings):
     """Most recent open ask by local creation time."""
-    best = None
-    for data in open_pendings(name) if pendings is None else pendings:
-        if best is None or float(data.get("created", 0)) > float(best.get("created", 0)):
-            best = data
-    return best
+    return max(pendings, key=lambda data: float(data.get("created", 0)), default=None)
 
 
 def _is_number(value):
@@ -1705,7 +1706,27 @@ def question_owner(pendings, key, position, strict):
     return best
 
 
-def _remember_question(name, approval_id, key, value):
+def unplaced_after(pendings, owner, key):
+    """An open question sent after `owner` whose place in the reply stream
+    is unknown, or None.
+
+    Its send is still running, failed, or needed a retry: an attempt that
+    reported an error may still have reached the phone, earlier than the
+    position that was recorded. A reply that looks like the owner's may
+    be that question's answer. Handing it to the older ask could approve
+    the wrong thing, so the caller drops the reply as stale instead.
+    """
+    created = float(owner.get("created", 0))
+    for data in pendings:
+        if data is owner or float(data.get("created", 0)) <= created:
+            continue
+        mark = data.get(key)
+        if not _is_number(mark) or (data.get("question_uncertain") and mark > owner[key]):
+            return data
+    return None
+
+
+def _remember_question(name, approval_id, fields):
     """Store where a question sits in its reply stream on its pending marker.
 
     Only an existing marker is updated: a finished ask removed its marker,
@@ -1719,7 +1740,7 @@ def _remember_question(name, approval_id, key, value):
             data = json.load(fh)
         if not isinstance(data, dict):
             return
-        data[key] = value
+        data.update(fields)
         with open_private(path, "w") as fh:
             json.dump(data, fh)
     except FileNotFoundError:
@@ -1733,19 +1754,24 @@ def write_tg_pending(approval_id, message, timeout_seconds):
     write_pending("tg-pending", approval_id, message, timeout_seconds)
 
 
-def remember_tg_question_message(approval_id, message_id):
+def remember_tg_question_message(approval_id, message_id, uncertain=False):
     """Record the Telegram message id of the question we just sent.
 
     Free-text replies are ordered against this id, not against the local
     clock. Message ids increase inside one chat. A restarted bot replays
     about a day of updates; a lower id was written before this question
     existed, whatever the two clocks say (DECISIONS §16i, §22).
+    `uncertain`: the send needed a retry, so an earlier copy may be in
+    the chat below this id (see unplaced_after).
     """
     try:
         message_id = int(message_id)
     except (TypeError, ValueError):
         return
-    _remember_question("tg-pending", approval_id, "question_message_id", message_id)
+    fields = {"question_message_id": message_id}
+    if uncertain:
+        fields["question_uncertain"] = True
+    _remember_question("tg-pending", approval_id, fields)
 
 
 def remove_tg_pending(approval_id):
@@ -1756,16 +1782,25 @@ def write_ntfy_pending(approval_id, message, timeout_seconds):
     write_pending("ntfy-pending", approval_id, message, timeout_seconds)
 
 
-def remember_ntfy_question(approval_id, server_time):
+def remember_ntfy_question(approval_id, server_time, uncertain=False):
     """Record the ntfy server time of the question we just published.
 
     The ntfy twin of the Telegram message id: every reply carries the same
     server's `time`, so replies are ordered against the questions without
     the local clock (DECISIONS §16i). None means "published, but the server
     sent no time"; replies are then attributed to the newest ask.
+    `uncertain`: the publish needed a retry, so an earlier copy may have
+    reached the phone before this time (see unplaced_after).
     """
-    _remember_question("ntfy-pending", approval_id, "question_time",
-                       server_time if _is_number(server_time) else None)
+    fields = {"question_time": server_time if _is_number(server_time) else None}
+    if uncertain:
+        fields["question_uncertain"] = True
+    _remember_question("ntfy-pending", approval_id, fields)
+
+
+def mark_ntfy_question_uncertain(approval_id):
+    """Every publish attempt failed, but one may still have been stored."""
+    _remember_question("ntfy-pending", approval_id, {"question_uncertain": True})
 
 
 def remove_ntfy_pending(approval_id):
@@ -1781,9 +1816,14 @@ def ntfy_reply_is_for(approval_id, reply_time):
     sides, the reply belongs to the newest question published at or before
     it. While a question is still being published its time is unknown and
     the reply may be its answer, so nobody decides; the poller offers the
-    reply again. A marker stuck that way longer than any publish can take
-    belongs to a killed ask and is ignored. Without times (a server that
-    sends no `time`), the newest open ask takes the reply, as before.
+    reply again. Once that takes longer than any publish can (a killed ask,
+    an older agentbell that never records the time), or when the publish
+    failed or needed a retry, the reply is stale for everyone rather than
+    handed to an older ask (unplaced_after). So is a reply stamped in the
+    same second as the newest question while an older one is open: nobody
+    answers a question within the second it arrived, but the order is
+    unknown. Without times (a server that sends no `time`), the newest open
+    ask takes the reply, as before.
     """
     pendings = open_pendings("ntfy-pending")
     timed = _is_number(reply_time) and all(
@@ -1791,13 +1831,19 @@ def ntfy_reply_is_for(approval_id, reply_time):
         for data in pendings if "question_time" in data)
     if timed:
         now = time.time()
-        if any("question_time" not in data
+        if any("question_time" not in data and not data.get("question_uncertain")
                and now - float(data.get("created", 0)) < QUESTION_PUBLISH_GRACE_SECONDS
                for data in pendings):
             return None
         owner = question_owner(pendings, "question_time", reply_time, strict=False)
-        return owner is not None and owner.get("approval_id") == approval_id
-    newest = newest_pending("ntfy-pending", pendings)
+        if owner is None or unplaced_after(pendings, owner, "question_time"):
+            return False
+        if owner["question_time"] == reply_time and any(
+                data is not owner and _is_number(data.get("question_time"))
+                and data["question_time"] <= reply_time for data in pendings):
+            return False
+        return owner.get("approval_id") == approval_id
+    newest = newest_pending(pendings)
     return newest is None or newest.get("approval_id") == approval_id
 
 
@@ -2105,9 +2151,8 @@ def publish_with_retry(fn, attempts=None, deadline=None):
 def _publish_channel(cfg, channel, item, timeout=10.0):
     message = item.get("message") or ""
     title = item.get("title")
-    priority = priority_name(item.get("priority") or "normal")
     tags = item.get("tags")
-    prio_num = PRIORITIES.get(priority, PRIORITIES["normal"])
+    prio_num = priority_number(item.get("priority"))
     if channel == "ntfy":
         return NtfyChannel(cfg).publish(
             cfg.data["ntfy"]["topic"], message, title=title,
@@ -2269,8 +2314,13 @@ def enqueue_item(cfg, item):
 
 
 def defer_item(cfg, message, title=None, priority="normal", tags=None,
-               channels=None, event="notify"):
-    """Hold a notification until the current quiet window ends."""
+               channels=None, event="notify", queued_at=None):
+    """Hold a notification until the current quiet window ends.
+
+    `queued_at`: the offline queue's time for an item moved here from the
+    queue. Back in the queue it keeps that age, so a channel that stays
+    down still expires it instead of cycling it through every night.
+    """
     created_ns = time.time_ns()
     created = created_ns / 1_000_000_000
     deliver_after = next_quiet_end(cfg.data.get("quiet_hours") or []) or created
@@ -2286,6 +2336,8 @@ def defer_item(cfg, message, title=None, priority="normal", tags=None,
         "channels": channels if channels is not None else cfg.channels(),
         "event": event,
     }
+    if queued_at is not None:
+        item["queued_at"] = queued_at
     directory = ensure_state_dir(deferred_dir())
     with open_private(os.path.join(directory, f"{item['id']}.json"), "w") as fh:
         json.dump(item, fh)
@@ -2327,16 +2379,18 @@ def drain_queue(cfg, limit=None, timeout=QUEUE_TIMEOUT, deadline=None):
                                "original_event": item.get("event"),
                                "queued_at": item.get("created")})
                 continue
-            prio_num = PRIORITIES.get(item.get("priority") or "normal", PRIORITIES["normal"])
-            if suppressed_by_quiet_hours(cfg, prio_num, bool(item.get("force"))):
+            if suppressed_by_quiet_hours(cfg, priority_number(item.get("priority")),
+                                         bool(item.get("force"))):
                 # Queued before the quiet window (the network was down) and
                 # retried inside it: pushing it now is what quiet hours are
                 # there to prevent. Suppress mode would drop a message that
                 # was already accepted, so it is deferred in either mode.
                 deferred_id = defer_item(
                     cfg, item.get("message"), title=item.get("title"),
-                    priority=item.get("priority") or "normal", tags=item.get("tags"),
-                    channels=item.get("channels"), event=item.get("event") or "notify")
+                    priority=priority_name(item.get("priority") or "normal"),
+                    tags=item.get("tags"),
+                    channels=item.get("channels"), event=item.get("event") or "notify",
+                    queued_at=item.get("created"))
                 stats["deferred"] += 1
                 write_history({"event": "queue_deferred", "message": item.get("message"),
                                "original_event": item.get("event"),
@@ -2411,8 +2465,7 @@ def flush_deferred(cfg, timeout=10.0, deadline=None):
         else:
             stats["kept"] += 1
     for name, item in list(due):
-        prio_num = PRIORITIES.get(item.get("priority") or "normal", PRIORITIES["normal"])
-        if suppressed_by_quiet_hours(cfg, prio_num, False):
+        if suppressed_by_quiet_hours(cfg, priority_number(item.get("priority")), False):
             # quiet hours moved/returned: re-defer instead of buzzing now
             stats["kept"] += 1
             due.remove((name, item))
@@ -2528,6 +2581,8 @@ def _flush_due_items(cfg, directory, due, timeout, stats=None, deadline=None):
                 stats["kept"] += 1
                 queued = {k: item.get(k) for k in ("message", "title", "priority", "tags", "event")}
                 queued["channels"] = list(outcome["transient"])
+                if item.get("queued_at") is not None:
+                    queued["created"] = item["queued_at"]
                 enqueue_item(cfg, queued)
                 write_history({"event": "deferred_queued", "message": item.get("message"),
                                "error": outcome["transient"]})
@@ -2594,7 +2649,7 @@ def send_notification(cfg, message, title=None, priority="normal", tags=None,
     # The webhook and MCP also get ntfy's own numbers (4 = high). Stored raw,
     # a number was sent as "normal" and crashed `history` and `queue list`.
     priority = priority_name(priority or "normal")
-    prio_num = PRIORITIES.get(priority, PRIORITIES["normal"])
+    prio_num = priority_number(priority)
     explicit_channels = channels is not None
     channels = channels if explicit_channels else cfg.channels()
     if isinstance(channels, str):
@@ -2714,11 +2769,11 @@ def ask_actions(server, resp_topic, approval_id, yes_label, no_label, ntfy_cfg):
 
 
 # A verdict carrying a request id: the body an action button posts, or the
-# same thing typed by hand. It MUST be matched exactly as case-insensitively
-# as _parse_answer() does below - a case-sensitive check here let
-# "approved <someone else's id>" slip past the id check as free text and
-# answer the wrong question.
-VERDICT_ID_RE = re.compile(r"(approved?|denied?|deny)\s+([0-9a-f]+)\b", re.I)
+# same thing typed by hand. Only the whole reply with a full-length id
+# counts, in any case, as in _parse_answer(): "approve 2" or "deny bad
+# idea" is an answer to the question, not another ask's button.
+VERDICT_ID_RE = re.compile(
+    r"(approved?|denied?|deny)\s+([0-9a-f]{%d})" % (2 * APPROVAL_ID_BYTES), re.I)
 
 
 # Standalone affirmations. Anything with more words ("yes, but use staging")
@@ -2794,6 +2849,28 @@ def _denial_reason(text, no_label):
     return None
 
 
+def _after_approval(text, words):
+    """The rest of a reply that opens with approval words, or None.
+
+    "yes, but wait", "ok, later", "👍⏳": the rest decides. A connecting
+    "but" / "aber" / "doch" is skipped. A loop, not recursion: "y y y ..."
+    must not exhaust the stack.
+    """
+    rest = None
+    ordered = sorted(words, key=len, reverse=True)
+    while True:
+        for word in ordered:
+            match = re.match(
+                re.escape(word) + r"(?!\w)(?:[\U0001f3fb-\U0001f3ff]|\ufe0f)*[\s,.:;!-]*"
+                r"(?:(?:but|aber|doch)(?!\w)[\s,.:;!-]*)?(.+)\Z",
+                text, re.I | re.S)
+            if match:
+                text = rest = match.group(1)
+                break
+        else:
+            return rest
+
+
 def _parse_answer(text, yes_label="Approve", no_label="Deny", approval_id=None):
     """Classify an answer as approved / denied / free text.
 
@@ -2801,7 +2878,8 @@ def _parse_answer(text, yes_label="Approve", no_label="Deny", approval_id=None):
     or the button body `APPROVED <id>`. "yes, but use staging" keeps its
     text and is not an approval. A negation, a postponement ("wait",
     "später"), a no-mark (👎 ❌ 🛑 ✋ ⛔ ⏳), or the no button's label
-    denies even with a reason after it. The yes
+    denies even with a reason after it, and so does a yes followed by
+    one ("yes, but wait", "ok, später"). The yes
     label is checked before that list: the hint says to reply with it,
     and a label such as "Stop it" would otherwise match the denial "stop".
     Anything else is free text: exit 0, the text in `answer`, and
@@ -2837,6 +2915,11 @@ def _parse_answer(text, yes_label="Approve", no_label="Deny", approval_id=None):
         return "approved", ""
     if re.fullmatch(r"\U0001f44d(?:[\U0001f3fb-\U0001f3ff]|\ufe0f)*[.!]*", normalized):
         return "approved", ""
+    # a yes that then postpones or refuses is a "not now" as well, or
+    # `ask && deploy` runs on "yes, but wait"
+    rest = _after_approval(normalized, words)
+    if rest is not None and _parse_answer(rest, yes_label="", no_label=no_label)[0] == "denied":
+        return "denied", cleaned
     return "answer", cleaned
 
 
@@ -2932,9 +3015,9 @@ class ApprovalWaiter:
             self.seen.add(message_id)
         text = body or ""
         if self.approval_id:
-            match = VERDICT_ID_RE.match(text.strip())
+            match = VERDICT_ID_RE.fullmatch(text.strip())
             if match:
-                if match.group(2) != self.approval_id:
+                if match.group(2).lower() != self.approval_id:
                     # a verdict for another ask; keep waiting
                     self._log_stale(text)
                     return
@@ -3223,7 +3306,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
     if "ntfy" in channels:
         ntfy_waiter = ApprovalWaiter(cfg, resp_topic, timeout_seconds, approval_id=approval_id)
 
-    def _publish_ntfy_question():
+    def _publish_ntfy_question(tries):
         server = NtfyChannel(cfg).server()
         actions = (ask_actions(server, resp_topic, approval_id, yes_label, no_label, ntfy)
                    if buttons else None)
@@ -3232,14 +3315,18 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         hint = (f"Tap {yes_label} or {no_label}, or type a custom answer." if actions
                 else f"Reply '{yes_label}' or '{no_label}' in the ntfy app, "
                      "or type a custom answer.")
-        return publish_with_retry(lambda: NtfyChannel(cfg).publish(
-            ntfy.get("topic"),
-            f"{message}\n\nID: {approval_id}\n{hint}",
-            title="\u2753 Approval requested",
-            priority=PRIORITIES["high"],
-            tags=["question", "approval"],
-            actions=actions,
-        ))
+
+        def publish():
+            tries.append(None)
+            return NtfyChannel(cfg).publish(
+                ntfy.get("topic"),
+                f"{message}\n\nID: {approval_id}\n{hint}",
+                title="\u2753 Approval requested",
+                priority=PRIORITIES["high"],
+                tags=["question", "approval"],
+                actions=actions,
+            )
+        return publish_with_retry(publish)
 
     def _note_ntfy_failure(exc, detail):
         """Record an ntfy failure. With another channel still up, warn and go on."""
@@ -3270,23 +3357,27 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                 ntfy_waiter.stop_event.set()
                 return
             write_ntfy_pending(approval_id, message, timeout_seconds)
+        tries = []
         try:
-            sent = _publish_ntfy_question()
+            sent = _publish_ntfy_question(tries)
         except RuntimeError as exc:
             wrapped = RuntimeError(f"ntfy: {exc}")
             _note_ntfy_failure(wrapped, str(wrapped))
             ntfy_waiter.stop_event.set()
-            # no question went out, so no reply can be for it: an open marker
-            # would only keep other asks' free text away from them
+            # the server may have stored the question before the error (a
+            # timeout, a reset): keep the marker so a reply is never handed
+            # to an older ask in its place
             with arm_lock:
-                remove_ntfy_pending(approval_id)
+                if not ask_closed.is_set():
+                    mark_ntfy_question_uncertain(approval_id)
             return
         with arm_lock:
             if ask_closed.is_set():
                 ntfy_waiter.stop_event.set()
                 return
             remember_ntfy_question(
-                approval_id, sent.get("time") if isinstance(sent, dict) else None)
+                approval_id, sent.get("time") if isinstance(sent, dict) else None,
+                uncertain=len(tries) > 1)
             waiters.append(("ntfy", ntfy_waiter))
 
     if print_status:
@@ -3312,14 +3403,20 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
 
         telegram_error = None
         if "telegram" in channels:
-            try:
-                sent = publish_with_retry(lambda: TelegramChannel(cfg).send_ask(
+            tg_tries = []
+
+            def send_tg():
+                tg_tries.append(None)
+                return TelegramChannel(cfg).send_ask(
                     message, approval_id, yes_label, no_label,
                     buttons=buttons and bot_heartbeat_fresh(),
-                ))
+                )
+            try:
+                sent = publish_with_retry(send_tg)
                 message_id = sent.get("message_id") if isinstance(sent, dict) else None
                 if message_id:
-                    remember_tg_question_message(approval_id, message_id)
+                    remember_tg_question_message(approval_id, message_id,
+                                                 uncertain=len(tg_tries) > 1)
             except RuntimeError as exc:
                 telegram_error = exc
                 sys.stderr.write(f"{PROG}: telegram: {exc}\n")
@@ -7153,16 +7250,26 @@ def _tg_reply_owner(pendings, message):
 
     Returns (pending, None, None), or (None, reason, approval id) when the
     reply is stale.
-    Answering a question with Telegram's "Reply" picks that question, and
-    a reply to a question that is no longer open is stale rather than
-    handed to another one. Otherwise the reply belongs to the newest
-    question sent before it. Telegram retains undelivered updates for ~24h,
-    so a restarted daemon replays a backlog. Message ids increase inside
-    the chat, so an id at or below a question's id was written before that
-    question existed. Comparing clocks instead reopens that window whenever
-    the local clock is behind Telegram, and drops a live reply when the
-    local clock is ahead.
+    A typed button body ("APPROVED <id>") and answering a question with
+    Telegram's "Reply" pick that question, and a reply to a question that
+    is no longer open is stale rather than handed to another one.
+    Otherwise the reply belongs to the newest question sent before it,
+    unless a newer question's place in the chat is unknown
+    (unplaced_after): then it is stale. Telegram retains undelivered
+    updates for ~24h, so a restarted daemon replays a backlog. Message ids
+    increase inside the chat, so an id at or below a question's id was
+    written before that question existed. Comparing clocks instead reopens
+    that window whenever the local clock is behind Telegram, and drops a
+    live reply when the local clock is ahead.
     """
+    verdict = VERDICT_ID_RE.fullmatch((message.get("text") or "").strip())
+    if verdict:
+        # a typed button body names its question, like on ntfy
+        named = verdict.group(2).lower()
+        for data in pendings:
+            if data.get("approval_id") == named:
+                return data, None, None
+        return None, "verdict for a question that is no longer open", named
     replied = message.get("reply_to_message") or {}
     if replied:
         quoted = _TG_QUESTION_ID_RE.findall(replied.get("text") or "")
@@ -7179,8 +7286,11 @@ def _tg_reply_owner(pendings, message):
     if _is_number(reply_id):
         owner = question_owner(pendings, "question_message_id", reply_id, strict=True)
     if owner is None:
-        newest = newest_pending("tg-pending", pendings)
+        newest = newest_pending(pendings)
         return None, "reply predates the question", newest.get("approval_id")
+    unplaced = unplaced_after(pendings, owner, "question_message_id")
+    if unplaced is not None:
+        return None, "a newer question may be in the chat", unplaced.get("approval_id")
     return owner, None, None
 
 

@@ -241,13 +241,20 @@ class TestTelegramReplyRouting(base._TelegramFixture):
         self.assertEqual(an.read_tg_answer(self.B), "prod")
         self.assertIsNone(an.read_tg_answer(self.A))
 
-    def test_question_that_was_never_sent_does_not_swallow_replies(self):
-        """A failed send leaves a marker without a message id for the whole ask."""
+    def test_question_whose_send_failed_makes_replies_stale(self):
+        """A failed send may still have reached the chat (audit 3, APR-2).
+
+        Its marker has no message id for the whole ask. The reply may be
+        its answer: stale, never handed to the older ask.
+        """
         self._ask(self.A, 100)
-        self._ask(self.C)                    # newer, but no question in the chat
+        self._ask(self.C)                    # newer, send "failed"
+        mark = _history_mark()
         self._reply(103, "prod")
-        self.assertEqual(an.read_tg_answer(self.A), "prod")
+        self.assertIsNone(an.read_tg_answer(self.A))
         self.assertIsNone(an.read_tg_answer(self.C))
+        stale = [r for r in _history_since(mark) if r.get("event") == "stale_answer"]
+        self.assertEqual([r["approval_id"] for r in stale], [self.C])
 
     def test_telegram_reply_to_a_question_answers_that_question(self):
         self._ask(self.A, 100)
@@ -325,7 +332,7 @@ class TestNtfyReplyRouting(unittest.TestCase):
         a = self._waiter(self.A, 1000)
         b = self._waiter(self.B, 1002)
         for waiter in (a, b):
-            waiter._offer("r2", "prod", 1002)     # same second: the newer one
+            waiter._offer("r2", "prod", 1003)
         self.assertEqual(self._got(a), [])
         self.assertEqual(self._got(b), ["prod"])
 
@@ -493,8 +500,9 @@ class TestNtfyFailureInTwoChannelAsk(base._TelegramFixture):
         _clean_state()
         self.addCleanup(_clean_state)
 
-    def test_failed_ntfy_question_leaves_no_open_marker(self):
-        """Its marker would hold other asks' typed replies back for the whole ask."""
+    def test_failed_ntfy_question_keeps_an_uncertain_marker(self):
+        """A failed publish may still have been stored (audit 3, APR-1): its
+        marker stays, without a time, so no reply goes to an older ask."""
         ntfy = base.MockNtfy(post_503_count=1000)
         self.addCleanup(ntfy.stop)
         cfg = self._tg_cfg(ntfy_url=ntfy.url, channels=("ntfy", "telegram"))
@@ -511,14 +519,24 @@ class TestNtfyFailureInTwoChannelAsk(base._TelegramFixture):
             approval_id = re.search(r"ID: ([0-9a-f]+)", sent["body"]["text"]).group(1)
             # every publish attempt has failed ...
             _wait_for(lambda: ntfy.post_503_count <= 1000 - an.RETRY_ATTEMPTS)
-            # ... and the marker written before the first one is gone again
-            _wait_for(lambda: not os.path.exists(_pending_path("ntfy-pending", approval_id)),
-                      message="the failed ntfy question kept its pending marker")
+            # ... and the marker written before the first one says so
+            marker = _pending_path("ntfy-pending", approval_id)
+
+            def uncertain():
+                try:
+                    with open(marker, encoding="utf-8") as fh:
+                        return json.load(fh).get("question_uncertain")
+                except (OSError, ValueError):       # caught mid-write
+                    return False
+            _wait_for(uncertain, message="the failed ntfy question is not marked uncertain")
+            with open(marker, encoding="utf-8") as fh:
+                self.assertNotIn("question_time", json.load(fh))
             self.assertTrue(thread.is_alive())               # Telegram still carries it
             an.write_tg_answer(approval_id, "approved")
             thread.join(timeout=10)
         self.assertTrue(holder["result"]["approved"])
         self.assertEqual(holder["result"]["channel"], "telegram")
+        self.assertFalse(os.path.exists(marker))
 
 
 # ---------------------------------------------------------------------------
