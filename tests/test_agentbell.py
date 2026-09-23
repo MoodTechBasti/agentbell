@@ -816,7 +816,7 @@ class TestHooks(unittest.TestCase):
         self.assertIn("Notification", data["hooks"])
         stop_hooks = [h for g in data["hooks"]["Stop"] for h in g["hooks"]]
         # shape-independent: on Windows the binary is quoted ('C:\...\agentbell')
-        self.assertTrue(any(an._contains_our_hook(h)
+        self.assertTrue(any(an._is_our_hook_command(h["command"])
                             and "hook run_completed --agent claude" in h["command"]
                             for h in stop_hooks), stop_hooks)
         # idempotent
@@ -923,7 +923,7 @@ class TestHooks(unittest.TestCase):
             data = json.load(fh)
         self.assertIn("AfterAgent", data["hooks"])
         hook = data["hooks"]["AfterAgent"][0]["hooks"][0]
-        self.assertTrue(an._contains_our_hook(hook), hook)
+        self.assertTrue(an._is_our_hook_command(hook["command"]), hook)
         self.assertIn("hook run_completed --agent gemini", hook["command"])
         an.install_hooks("gemini", add=False)
         with open(path) as fh:
@@ -1436,7 +1436,7 @@ class TestHooks(unittest.TestCase):
                 for hook in group["hooks"]:
                     self.assertTrue(hook.get("async"), f"{event} hook must be async")
         stop_hooks = [h for g in data["hooks"]["Stop"] for h in g["hooks"]]
-        self.assertTrue(any(an._contains_our_hook(h)
+        self.assertTrue(any(an._is_our_hook_command(h["command"])
                             and "hook run_completed --agent qwen-code" in h["command"]
                             for h in stop_hooks), stop_hooks)
         self.assertFalse(an.install_hooks("qwen-code")["changed"])
@@ -5986,8 +5986,10 @@ class TestAgentbellBinary(unittest.TestCase):
         finally:
             sys.argv, an.shutil.which = original_argv, original_which
         self.assertEqual(manifest["binary"], os.path.abspath(an.__file__))
-        smoke = shlex.split(manifest["commands"]["smoke"])
-        self.assertEqual(smoke[0], manifest["binary"])
+        # agentbell.py runs through the interpreter, as generated hooks do
+        smoke = [part.replace("\\", "/") for part in shlex.split(manifest["commands"]["smoke"])]
+        self.assertEqual(smoke[:2], [part.replace("\\", "/")
+                                     for part in (sys.executable, manifest["binary"])])
 
 
 class TestIntegrationGuide(unittest.TestCase):
@@ -6009,11 +6011,11 @@ class TestIntegrationGuide(unittest.TestCase):
         for step in manifest["verification"]["steps"]:
             commands += step["commands"]
         self.assertGreaterEqual(len(commands), 12)
+        prefix = manifest["command_prefix"] + " "   # the binary, or python + agentbell.py
         for command in commands:
-            parts = shlex.split(command)
-            self.assertEqual(parts[0], manifest["binary"], command)
+            self.assertTrue(command.startswith(prefix), command)
             try:
-                args = parser.parse_args(parts[1:])
+                args = parser.parse_args(shlex.split(command[len(prefix):]))
             except SystemExit as exc:   # pragma: no cover - the assertion message matters
                 self.fail(f"guide command does not parse: {command} ({exc})")
             self.assertTrue(callable(getattr(args, "func", None)), command)

@@ -283,7 +283,7 @@ class TestInitHookLoop(_ProjectCase):
         finally:
             os.chdir(cwd)
         text = out.getvalue()
-        self.assertIn(f"installed hooks for cline -> {os.path.join('.', '.clinerules')}", text)
+        self.assertIn(f"installed hooks for cline: {os.path.join('.', '.clinerules')}", text)
         self.assertIn(b"--agent cline", self._read(".clinerules"))
         self.assertIn("hooks for aider NOT installed (nothing changed)", text)
         self.assertIn("note: aider: AGENTS.md already holds an agentbell block", text)

@@ -141,7 +141,7 @@ class TestUserWrittenHooksSurvive(_HomeCase):
         self.assertTrue(an.install_hooks("claude")["changed"])
         commands = self._commands(path)
         ours = [c for _e, _m, c in commands if c.startswith(new)]
-        self.assertEqual(len(ours), 4, commands)       # one per event, the stale ones replaced
+        self.assertEqual(len(ours), 5, commands)       # one per hook, the stale ones replaced
         self.assertFalse([c for _e, _m, c in commands if c.startswith(old)])
         self.assertEqual(sorted(c for _e, _m, c in commands if c not in ours),
                          self._user_commands())
@@ -290,7 +290,7 @@ class TestJsoncSettingsAreRefused(_HomeCase):
         os.environ[an.CONFIG_DIR_ENV] = os.path.join(self.tmp, "config")
         args = base._init_args(non_interactive=False, no_hooks=False, no_test=True,
                                topic="audit2-json-hooks-topic")
-        out = io.StringIO()
+        out, err = io.StringIO(), io.StringIO()
         try:
             with unittest.mock.patch.object(an.sys.stdin, "isatty", lambda: True), \
                     unittest.mock.patch.object(builtins, "input", lambda *_a: ""), \
@@ -298,14 +298,15 @@ class TestJsoncSettingsAreRefused(_HomeCase):
                     unittest.mock.patch.object(
                         an, "install_hooks",
                         unittest.mock.Mock(side_effect=RuntimeError("settings.json refused"))), \
-                    contextlib.redirect_stdout(out):
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 an.cmd_init(args)
         finally:
             if old_config is None:
                 os.environ.pop(an.CONFIG_DIR_ENV, None)
             else:
                 os.environ[an.CONFIG_DIR_ENV] = old_config
-        self.assertIn("hooks for claude not installed: settings.json refused", out.getvalue())
+        self.assertIn("hooks for claude not changed: settings.json refused", err.getvalue())
+        self.assertIn("NEXT STEPS", out.getvalue())
 
 
 @unittest.skipUnless(CAN_SYMLINK, "os.symlink requires admin or developer mode on Windows")

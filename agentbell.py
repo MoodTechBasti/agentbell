@@ -3457,7 +3457,7 @@ def agentbell_command(binary=None):
 # a verbatim cmd line both read. Codex's cmd fallback cannot run a quoted
 # path; a plain one runs everywhere. Elsewhere it is sh.
 WINDOWS_HOOK_SHELLS = {"gemini": "powershell", "codex": "powershell", "qwen-code": "powershell"}
-_WINDOWS_BARE_ARG = re.compile(r"[A-Za-z0-9_.:/~-]+$")
+_WINDOWS_BARE_ARG = re.compile(r"[\w.:/~-]+$")      # \w: C:/Users/Jörg runs bare too
 
 
 def _windows_command_line(argv, shell):
@@ -3493,16 +3493,11 @@ def _hook_command(event, agent):
     return f"{_hook_prefix(agent)} hook {event} --agent {agent}"
 
 
-def _contains_our_hook(entry):
-    return _is_our_hook_command(entry.get("command") or "")
-
-
 def _command_stem(token):
     return os.path.splitext(os.path.basename(token.replace("\\", "/")))[0].lower()
 
 
 _HOOK_WORD = re.compile(r"[A-Za-z0-9_.-]+$")
-_PYTHON_STEM = re.compile(r"(python[0-9.]*|py)w?$")
 
 
 def _parse_our_hook_command(command):
@@ -3526,7 +3521,8 @@ def _parse_our_hook_command(command):
             continue
         if parts[:1] == ["&"]:
             parts = parts[1:]
-        if len(parts) > 1 and _PYTHON_STEM.match(_command_stem(parts[0])):
+        # any interpreter (python3, pypy3, python3.13t.exe) before agentbell.py
+        if len(parts) > 1 and parts[1].lower().endswith(".py") and _command_stem(parts[1]) == PROG:
             parts = parts[1:]
         if (len(parts) < 5 or _command_stem(parts[0]) != PROG or parts[1] != "hook"
                 or parts[3] != "--agent"
@@ -3547,6 +3543,18 @@ def _parse_our_hook_command(command):
 
 def _is_our_hook_command(command):
     return _parse_our_hook_command(command) is not None
+
+
+def _with_tuned_min_duration(new, commands, agent):
+    """`new` (a hook command or block) with the --min-duration the user set in
+    agentbell's own run_completed hook for `agent` among `commands`, so a
+    reinstall does not reset it to the default."""
+    for command in commands:
+        match = re.search(r" --min-duration (\d+)", command)
+        if match and _parse_our_hook_command(command) == ("run_completed", agent):
+            return new.replace(f" --min-duration {HOOK_MIN_DURATION}",
+                               f" --min-duration {match.group(1)}")
+    return new
 
 
 # Status probe over raw settings text. Deliberately looser than
@@ -3600,7 +3608,7 @@ def _has_user_wrapped_hook(path):
 def _matcher_key(group):
     # an omitted matcher, "" and "*" all match every occurrence of the event
     matcher = group.get("matcher")
-    return "*" if matcher in (None, "", "*") else matcher
+    return "*" if matcher in (None, "", "*") else _freeze_json(matcher)   # a list stays hashable
 
 
 def _group_entries(group):
@@ -3679,12 +3687,14 @@ def _load_hook_settings(path, event_hooks, add):
     stops there, and a rewrite would drop every comment, so the file is
     refused and left exactly as it is.
     """
-    with open(path, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    if not text.strip():
-        return {}
     try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        if not text.strip():
+            return {}
         data = json.loads(text)
+    except UnicodeDecodeError:
+        problem = "is not UTF-8 text (saved in a legacy encoding?)"
     except ValueError as exc:
         problem = ("has comments that a rewrite would drop" if jsonc_has_comments(text)
                    else f"is not valid JSON ({exc})")
@@ -3714,6 +3724,13 @@ def _merge_json_hooks(path, event_hooks, add=True):
     if not isinstance(hooks, dict):
         raise RuntimeError(f"{path}: \"hooks\" is not an object - not touching it")
     owner_keys = _json_hook_owner_keys(event_hooks)
+    if add:
+        owned = [entry["command"] for event, group, entry in _iter_json_hooks(hooks)
+                 if _is_owned_json_hook(event, group, entry, owner_keys)]
+        for _event, _group, entry in _iter_json_hooks(event_hooks):
+            parsed = _parse_our_hook_command(entry["command"])
+            if parsed:
+                entry["command"] = _with_tuned_min_duration(entry["command"], owned, parsed[1])
     wanted_keys = ({_hook_key(entry) for _event, _group, entry in _iter_json_hooks(event_hooks)}
                    if add else set())
     changed = False
@@ -3777,7 +3794,11 @@ def claude_event_hooks():
                                     "command": _hook_command("run_failed", "claude")}]}],
         "Notification": [{"matcher": "agent_needs_input",
                           "hooks": [{"type": "command", "async": True,
-                                     "command": _hook_command("input_required", "claude")}]}],
+                                     "command": _hook_command("input_required", "claude")}]},
+                         # "A permission dialog is shown" (code.claude.com/docs/en/hooks.md)
+                         {"matcher": "permission_prompt",
+                          "hooks": [{"type": "command", "async": True,
+                                     "command": _hook_command("permission_required", "claude")}]}],
     }
 
 
@@ -3903,13 +3924,14 @@ def _write_text_atomic(path, text, newline=None, mode=None, errors="strict"):
     leave a dotfiles checkout holding the old hooks. Rule files still
     refuse a symlink destination before they call this. Without `mode`,
     keep the mode the destination already had, so a 0600 Codex or Kimi
-    config stays 0600 (0644 for a new file). `newline` and `errors` are
+    config stays 0600 (a new file gets 0666 minus the umask, as open()
+    would give it). `newline` and `errors` are
     open()'s: `newline=""` writes `text` as is (text read with newline=""
     keeps its CRLFs on every OS), and rule files pass the values
     `_read_rule_file` read them with.
 
-    A destination that cannot be written (a link into a read-only Nix
-    store) raises an OSError that says which file and what to do.
+    A destination that cannot be written raises an OSError that says which
+    file; a link into a read-only Nix store also says what to do.
     """
     destination = os.path.realpath(path) if os.path.islink(path) else path
     tmp = destination + ".tmp"
@@ -3922,11 +3944,11 @@ def _write_text_atomic(path, text, newline=None, mode=None, errors="strict"):
             try:
                 mode = os.stat(destination).st_mode & 0o777
             except OSError:
-                mode = 0o644
+                pass
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         for _attempt in range(2):
             try:
-                handle = os.open(tmp, flags, mode)
+                handle = os.open(tmp, flags, 0o666 if mode is None else mode)
                 break
             except OSError as exc:
                 if exc.errno not in (errno.EEXIST, errno.ELOOP):
@@ -3936,15 +3958,19 @@ def _write_text_atomic(path, text, newline=None, mode=None, errors="strict"):
         if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
             raise
         where = path if destination == path else f"{path} (a symlink to {destination})"
-        raise OSError(f"cannot write {where}: {exc.strerror}. agentbell left it unchanged. "
-                      "If a tool generates this file (Nix/home-manager, a dotfiles "
-                      "manager), make the change in its source instead") from exc
+        message = f"cannot write {where}: {exc.strerror}. agentbell left it unchanged"
+        if destination != path or exc.errno == errno.EROFS:
+            # a link into a store or a read-only mount: a tool generates it
+            message += (". If a tool generates this file (Nix/home-manager, a dotfiles "
+                        "manager), make the change in its source instead")
+        raise OSError(message) from exc
     if handle is None:
         raise OSError(errno.EEXIST, "cannot create temp file", tmp)
     try:
         with os.fdopen(handle, "w", encoding="utf-8", errors=errors, newline=newline) as fh:
             fh.write(text)
-        os.chmod(tmp, mode)
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, destination)
     except Exception:
         try:
@@ -4291,7 +4317,9 @@ def install_codex_hooks():
                 return {"changed": False,
                         "notes": ["codex: found an agentbell marker without its end marker; "
                                   "skipped to avoid breaking config"]}
-            new_text, _present, replaced = _replace_toml_block(text, codex_hooks_block())
+            block = _with_tuned_min_duration(
+                codex_hooks_block(), map(_toml_unquote, _toml_command_values(text)), "codex")
+            new_text, _present, replaced = _replace_toml_block(text, block)
             # Self-heal an install from <=1.3.0rc1, where the feature flag was
             # appended at EOF and therefore belonged to the last table.
             if (_codex_features_need_note(new_text) != "conflict"
@@ -4857,7 +4885,9 @@ def install_kimi_hooks():
                 return {"changed": False,
                         "notes": ["kimi: found an agentbell marker without its end marker; "
                                   "skipped to avoid breaking config"]}
-            new_text, _present, replaced = _replace_toml_block(text, kimi_hooks_block())
+            block = _with_tuned_min_duration(
+                kimi_hooks_block(), map(_toml_unquote, _toml_command_values(text)), "kimi")
+            new_text, _present, replaced = _replace_toml_block(text, block)
             if replaced:
                 _write_toml(path, new_text, eol)
                 return {"changed": True,
@@ -5251,6 +5281,30 @@ def _hooks_in_place(agent, project=None):
         return bool(AGENT_SPECS[agent]["status"](project))
     except OSError:
         return False
+
+
+def _install_and_report(agent, project=None, add=True, indent=""):
+    """Install (or remove) `agent`'s hooks and print what happened; False
+    when its config refused the change. One config agentbell cannot
+    rewrite must not stop the other agents."""
+    try:
+        result = install_hooks(agent, project=project, add=add)
+    except (OSError, RuntimeError) as exc:
+        print(f"{indent}{PROG}: hooks for {agent} not changed: {exc}", file=sys.stderr)
+        return False
+    ok = True
+    if not add:
+        print(f"{indent}{'removed' if result['changed'] else 'nothing to remove'} for {agent}")
+    elif result["changed"]:
+        print(f"{indent}installed hooks for {agent}: {result['path']}")
+    else:
+        print(indent + _unchanged_install_line(agent, project))
+        # a refused config (TOML clash, stray rule-file marker) fails like a
+        # refused JSONC settings.json does
+        ok = _hooks_in_place(agent, project)
+    for note in result.get("notes", []):
+        print(f"{indent}  note: {note}")
+    return ok
 
 
 def hooks_status(project=None):
@@ -5834,10 +5888,16 @@ def mcp_snippet(binary):
 
 def integration_manifest(agent=None, project=None):
     binary = agentbell_binary()
-    # every advertised command embeds the shell-quoted binary: a Windows
-    # path (backslashes) or a path with spaces would otherwise not survive
-    # the shell split the host applies before executing it
-    qbinary = shlex.quote(binary)
+    # every advertised command starts the way generated hooks do (the
+    # interpreter for agentbell.py, quoted for the shell). On Windows that
+    # is cmd's form: plain when the path allows, and then PowerShell and
+    # Git Bash run it too; a quoted path gets a PowerShell prefix of its own
+    argv = agentbell_command()
+    if os.name == "nt":
+        qbinary = _windows_command_line(argv, "cmd")
+        powershell = _windows_command_line(argv, "powershell")
+    else:
+        qbinary = powershell = " ".join(shlex.quote(part) for part in argv)
     slug = agent or INTEGRATE_PLACEHOLDER
     status_rows = hooks_status(project=project)
     detected = set(find_agents())
@@ -5880,6 +5940,8 @@ def integration_manifest(agent=None, project=None):
         "agentbell_version": VERSION,
         "changes_nothing": True,
         "binary": binary,
+        "command_prefix": qbinary,
+        "powershell_command_prefix": None if powershell == qbinary else powershell,
         "binary_on_path": bool(shutil.which(PROG)),
         "path_fix": None if shutil.which(PROG) else _path_fix_hint(),
         "platform": platform.system(),
@@ -5933,7 +5995,9 @@ def integration_manifest(agent=None, project=None):
             "hook": "0 even when sending fails - a notification problem must "
                     "never fail your turn; sole exception: an invalid --agent "
                     "slug is a usage error (exit 2)",
-            "ask": {"0": "approved / answered (answer text on stdout)",
+            "ask": {"0": "approved, or a free-text answer (printed on stdout) - "
+                         "a free-text answer is NOT an approval: with --json "
+                         'check "approved": true',
                     "1": "denied", "2": "timeout",
                     "3": "configuration, publication or answer-channel error",
                     "rule": "treat any non-zero exit as NO (fail closed)"},
@@ -6088,15 +6152,18 @@ def integration_guide(manifest):
     out("   Call agentbell by ABSOLUTE path - host configs do not inherit your")
     out(f"   shell PATH:  {binary}")
     if m["platform"] == "Windows":
-        out('   Windows: quote the path if it contains spaces; if the .exe is')
-        out("   missing, use `py -m agentbell` as the command.")
+        out("   Windows: the commands below run in cmd and Git Bash as printed;")
+        if m["powershell_command_prefix"]:
+            out("   in PowerShell start them with this instead of the first part:")
+            out(f"     {m['powershell_command_prefix']}")
+        out("   If the .exe is missing, use `py -m agentbell` as the command.")
     if not m["binary_on_path"]:
         out(f"   (not on the user's PATH right now; fix: {m['path_fix']})")
     out("   Events - fire and forget: `hook` exits 0 even when sending fails")
     out("   (sole exception: an invalid --agent slug is a usage error, exit 2):")
     for event in m["events"]:
         out(f"     {event['name']:20s} when {event['when']}")
-    out(f"     command: {shlex.quote(binary)} hook <event> --agent {slug}")
+    out(f"     command: {m['command_prefix']} hook <event> --agent {slug}")
     out("   Anti-spam (wire BOTH lines or NEITHER):")
     out(f"     turn start: {m['commands']['started_silent']}")
     out(f"     turn end:   {m['commands']['completed_min_duration']}")
@@ -6105,8 +6172,9 @@ def integration_guide(manifest):
     out(f"     {m['commands']['notify']}")
     out(f"     {m['commands']['ask']}")
     out("     (notify/ask take no --agent flag - only `hook` and MCP notify do)")
-    out(f"     ask exit codes: 0 approved/answered, 1 denied, 2 timeout -")
-    out(f"     {m['exit_codes']['ask']['rule']}.")
+    out("     ask exit codes: 0 approved or answered, 1 denied, 2 timeout, 3 setup")
+    out(f"     or channel error - {m['exit_codes']['ask']['rule']}. A free-text")
+    out('     answer also exits 0 and is NOT an approval: use --json, check "approved".')
     out("   MCP (mechanism 2.2): tools notify + ask_approval; canonical entry:")
     out("     " + json.dumps(m["mcp"]["canonical_config"]))
     out(f"     other client formats: {m['mcp']['other_formats']}")
@@ -6443,7 +6511,9 @@ def _agent_hook_entries():
         entries.append({
             "kind": "hooks", "label": f"{agent} hooks in {path}",
             "action": "remove the agentbell hooks (your other settings stay)",
-            "apply": lambda a=agent, s=spec: s["install"](None, add=False)["changed"],
+            "apply": lambda s=spec: s["install"](None, add=False),
+            # hooks the user wrote still run agentbell after the removal
+            "still": lambda s=spec: s["status"](None),
         })
     return entries
 
@@ -6707,13 +6777,21 @@ def cmd_uninstall(args):
         print(f"run '{command} uninstall --yes' to delete everything listed above")
         print("not removed automatically: " + "; ".join(PURGE_NOT_REMOVED))
         return
-    failures = locked = 0
+    failures = locked = kept = 0
     for entry in entries:
         try:
-            if entry["apply"]():
+            result = entry["apply"]()
+            if not isinstance(result, dict):
+                result = {"changed": result}
+            if entry.get("still") and entry["still"]():
+                kept += 1
+                print(f"kept     {entry['label']}: hooks you wrote still run agentbell")
+            elif result["changed"]:
                 print(f"removed  {entry['label']}")
             else:
                 print(f"nothing  {entry['label']} (already gone)")
+            for note in result.get("notes", []):
+                print(f"         note: {note}")
         except Exception as exc:  # noqa: BLE001
             failures += 1
             print(f"failed   {entry['label']}: {exc}")
@@ -6735,6 +6813,10 @@ def cmd_uninstall(args):
         rerun = "; re-run 'agentbell uninstall --yes'" if failures > locked else ""
         print(f"{failures} step(s) failed - see above{rerun}")
         raise SystemExit(1)
+    if kept:
+        print(f"Not done: {kept} agent config(s) still run agentbell from hooks you wrote "
+              "(see 'kept' above). Remove them by hand, or the agent runs a missing command.")
+        return
     print("Done. Fresh start:")
     print("  pipx install agentbell && agentbell init   (or ./install.sh from a checkout)")
 
@@ -8071,9 +8153,13 @@ def print_next_steps(cfg):
     print("     agentbell test")
     print('     agentbell ask "Did this reach my phone?" --timeout 60')
     print()
-    print("3) Wire up your agents (works in every repo):")
+    print("3) Wire up your agents:")
     print("     agentbell hooks install " + (" ".join(missing) if missing else "all"))
     print("     agentbell mcp add        # Claude/ChatGPT Desktop, Cursor, VS Code, ...")
+    per_repo = [agent for agent in (missing or AGENTS) if AGENT_SPECS[agent]["scope"] == "project"]
+    if per_repo:
+        print(f"   {', '.join(per_repo)}: a rule file in the current repo only -")
+        print("   run `agentbell hooks install <agent>` in each repo (the others are global).")
     print()
     if cfg.telegram_ready() and premium_enabled(cfg):
         print("4) Telegram Approve/Deny buttons need the answer daemon running:")
@@ -8268,17 +8354,7 @@ def cmd_init(args):
             print(f"\nDetected agents: {', '.join(detected)}")
             for agent in detected:
                 if ask(f"Install hooks for {agent}? (y/n)", "y").lower().startswith("y"):
-                    try:
-                        result = install_hooks(agent)
-                    except (OSError, RuntimeError) as exc:
-                        print(f"  hooks for {agent} not installed: {exc}")
-                        continue
-                    if result["changed"]:
-                        print(f"  installed hooks for {agent} -> {result['path']}")
-                    else:
-                        print(f"  {_unchanged_install_line(agent)}")
-                    for note in result.get("notes", []):
-                        print(f"  note: {note}")
+                    _install_and_report(agent, indent="  ")
 
     if not args.no_test:
         print(f"\nSending a test notification to '{ntfy['topic']}'...")
@@ -9240,29 +9316,8 @@ def cmd_hooks(args):
                   "and will not add a second hook")
         return
     agents = AGENTS if "all" in args.agent else args.agent
-    failed = []
-    for agent in agents:
-        try:
-            result = install_hooks(agent, project=project, add=args.sub == "install")
-        except (OSError, RuntimeError) as exc:
-            # one config agentbell cannot rewrite must not stop the others
-            print(f"{PROG}: hooks for {agent} not changed: {exc}", file=sys.stderr)
-            failed.append(agent)
-            continue
-        if args.sub == "install":
-            if result["changed"]:
-                print(f"installed hooks for {agent}: {result['path']}")
-            else:
-                print(_unchanged_install_line(agent, project))
-                if not _hooks_in_place(agent, project):
-                    # a refused config (TOML clash, stray rule-file marker)
-                    # fails like a refused JSONC settings.json does
-                    failed.append(agent)
-        else:
-            print(f"{'removed' if result['changed'] else 'nothing to remove'} for {agent}")
-        for note in result.get("notes", []):
-            print(f"  note: {note}")
-    if failed:
+    results = [_install_and_report(agent, project, add=args.sub == "install") for agent in agents]
+    if not all(results):
         raise SystemExit(1)
 
 
