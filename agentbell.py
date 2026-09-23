@@ -10067,6 +10067,37 @@ def cmd_config(args):
     print(json.dumps(redacted_config(cfg.data), indent=2))
 
 
+ASK_EPILOG = """\
+exit codes:
+  0  approved, or answered with free text (printed on stdout). Free text
+     is NOT an approval: with --json, check "approved".
+  1  denied, or a "not now" reply such as "wait" or "later"
+     (also when the config file cannot be read)
+  2  no answer before the timeout
+  3  not configured, the question could not be sent, or no answer
+     channel is left
+Treat any non-zero exit as no.
+
+Only an explicit yes (the approve button, or a reply such as yes or ok)
+approves. The buttons, Telegram's Reply and a typed APPROVED <id> or
+DENIED <id> always reach their own question. Any other typed reply is used
+only when exactly one approval question can still be on the phone;
+otherwise it is refused, and a notice on the phone says so.
+"""
+
+WATCH_EPILOG = """\
+exit code: the command's own. 128+N when signal N ended it (not on
+Windows); 127 when it could not be started (not found, or on Windows an
+argument a .bat/.cmd cannot receive safely: %, " or a line break);
+1 when no command was given. The push never changes the exit code; with
+an unreadable config the command still runs, without a push.
+
+Ctrl-C and the other terminal signals go to the command; watch waits for
+it to end and then sends the push. Ctrl-C or SIGTERM while that send hangs
+queues the push and ends watch.
+"""
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -10076,31 +10107,47 @@ def build_parser():
     sub = parser.add_subparsers(dest="command")
 
     p_init = sub.add_parser("init", help="one-command setup wizard")
-    p_init.add_argument("--non-interactive", action="store_true")
-    p_init.add_argument("--server")
-    p_init.add_argument("--topic")
+    p_init.add_argument("--non-interactive", action="store_true",
+                        help="never prompt: use the flags and the existing config "
+                             "(the default when stdin is not a terminal)")
+    p_init.add_argument("--server",
+                        help=f"ntfy server URL (default: the configured one, "
+                             f"else {DEFAULT_NTFY_SERVER})")
+    p_init.add_argument("--topic",
+                        help="ntfy topic (default: the configured one, else a random one)")
     p_init.add_argument("--ntfy-auth", help="user:pass for self-hosted ntfy")
-    p_init.add_argument("--telegram-token")
-    p_init.add_argument("--telegram-chat")
+    p_init.add_argument("--telegram-token", help="Telegram bot token (premium)")
+    p_init.add_argument("--telegram-chat", help="Telegram chat id")
     p_init.add_argument("--license", help="premium license key (AB1-...)")
-    p_init.add_argument("--quiet-hours", help="e.g. '22:00-07:30' or '22:00-07:30,13:00-14:00'")
+    p_init.add_argument("--quiet-hours",
+                        help="windows that hold back pushes below quiet_hours_min_priority "
+                             "(default: normal), e.g. '22:00-07:30' or "
+                             "'22:00-07:30,13:00-14:00'")
     p_init.add_argument("--quiet-hours-mode", choices=["suppress", "defer"],
                         help="suppress (drop) or defer (deliver after) during quiet hours")
-    p_init.add_argument("--no-test", action="store_true")
-    p_init.add_argument("--no-wait", action="store_true")
-    p_init.add_argument("--no-hooks", action="store_true")
+    p_init.add_argument("--no-test", action="store_true",
+                        help="skip the test notification at the end")
+    p_init.add_argument("--no-wait", action="store_true",
+                        help="send the test notification without waiting for "
+                             "delivery confirmation")
+    p_init.add_argument("--no-hooks", action="store_true",
+                        help="do not offer to install hooks for detected agents")
     p_init.set_defaults(func=cmd_init)
 
     p_notify = sub.add_parser("notify", help="send a notification")
     p_notify.add_argument("message")
     p_notify.add_argument("--title")
-    p_notify.add_argument("--priority", choices=list(PRIORITIES), default="normal")
+    p_notify.add_argument("--priority", choices=list(PRIORITIES), default="normal",
+                          help="(default: normal)")
     p_notify.add_argument("--tags", help="comma-separated")
-    p_notify.add_argument("--channel", action="append", choices=["ntfy", "telegram", "os"])
+    p_notify.add_argument("--channel", action="append", choices=["ntfy", "telegram", "os"],
+                          help="send on this channel only (repeatable; "
+                               "default: the configured channels)")
     p_notify.add_argument("--force", action="store_true", help="ignore quiet hours")
     p_notify.add_argument("--defer", action="store_true",
                           help="defer until after quiet hours instead of suppressing")
-    p_notify.add_argument("--json", action="store_true")
+    p_notify.add_argument("--json", action="store_true",
+                          help="print the result as JSON")
     p_notify.add_argument("--quiet", action="store_true",
                           help="no stdout output (failures still go to stderr, exit 3)")
     p_notify.set_defaults(func=cmd_notify)
@@ -10112,8 +10159,12 @@ def build_parser():
     p_hook.add_argument("event", metavar="event",
                         help="one of: " + ", ".join(HOOK_EVENTS)
                              + " (aliases: " + ", ".join(EVENT_ALIASES) + ")")
-    p_hook.add_argument("--agent", default="custom")
-    p_hook.add_argument("--cwd")
+    p_hook.add_argument("--agent", default="custom",
+                        help="agent slug the event is attributed to (default: custom)")
+    p_hook.add_argument("--cwd",
+                        help="project dir shown in the push and recorded for verify "
+                             "(default: the cwd in the host's hook payload, "
+                             "else the current dir)")
     p_hook.add_argument("--duration", type=float,
                         help="elapsed seconds, appended to run_completed/run_failed")
     p_hook.add_argument("--silent", action="store_true",
@@ -10121,21 +10172,32 @@ def build_parser():
     p_hook.add_argument("--min-duration", type=float, default=None,
                         help="run_completed: stay silent for turns shorter than this many "
                              "seconds (failures and unknown durations always notify)")
-    p_hook.add_argument("--force", action="store_true")
+    p_hook.add_argument("--force", action="store_true",
+                        help="send anyway: ignore quiet hours, --min-duration and the "
+                             "duplicate check")
     p_hook.set_defaults(func=cmd_hook)
 
-    p_ask = sub.add_parser("ask", help="ask a question and wait for the user's answer (approval flow)")
+    p_ask = sub.add_parser(
+        "ask", help="ask a question and wait for the user's answer (approval flow)",
+        epilog=ASK_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p_ask.add_argument("message")
-    p_ask.add_argument("--timeout", type=int, help="seconds to wait")
-    p_ask.add_argument("--yes-label", default="Approve")
-    p_ask.add_argument("--no-label", default="Deny")
+    p_ask.add_argument("--timeout", type=int,
+                       help=f"seconds to wait (default: approval_timeout from the config, "
+                            f"else {DEFAULT_APPROVAL_TIMEOUT})")
+    p_ask.add_argument("--yes-label", default="Approve",
+                       help="label of the approve button (default: Approve)")
+    p_ask.add_argument("--no-label", default="Deny",
+                       help="label of the deny button (default: Deny)")
     p_ask.add_argument("--no-buttons", action="store_true", help="plain notification, no action buttons")
     p_ask.add_argument("--channel", action="append", choices=list(ASK_CHANNELS),
                        help="ask on this channel only (repeatable; default: all configured)")
-    p_ask.add_argument("--json", action="store_true")
+    p_ask.add_argument("--json", action="store_true",
+                       help="print the outcome as JSON (approved, denied, timeout, answer)")
     p_ask.set_defaults(func=cmd_ask)
 
-    p_watch = sub.add_parser("watch", help="run a command and notify on completion")
+    p_watch = sub.add_parser(
+        "watch", help="run a command and notify on completion",
+        epilog=WATCH_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p_watch.add_argument("--title")
     p_watch.add_argument("--priority", choices=list(PRIORITIES),
                          help="priority on success (default: normal)")
@@ -10143,8 +10205,10 @@ def build_parser():
                          help="priority on failure (default: urgent)")
     p_watch.add_argument("--tags", help="comma-separated")
     p_watch.add_argument("--force", action="store_true", help="ignore quiet hours")
-    p_watch.add_argument("--json", action="store_true")
-    p_watch.add_argument("--quiet", action="store_true", help="no stdout output")
+    p_watch.add_argument("--json", action="store_true",
+                         help="print the result as JSON (exit_code, message, notification)")
+    p_watch.add_argument("--quiet", action="store_true",
+                         help="no stdout output (problems still go to stderr)")
     p_watch.add_argument("cmd", nargs=argparse.REMAINDER,
                          help="command to run (prefix with '--' to avoid flag parsing)")
     p_watch.set_defaults(func=cmd_watch)
@@ -10153,7 +10217,8 @@ def build_parser():
         "doctor", help="check everything (config, server, hooks, MCP, license) and print fixes")
     p_doctor.add_argument("--send", action="store_true",
                           help="also send a real test notification and confirm delivery")
-    p_doctor.add_argument("--json", action="store_true")
+    p_doctor.add_argument("--json", action="store_true",
+                          help="print the checks as JSON")
     p_doctor.set_defaults(func=cmd_doctor)
 
     p_integrate = sub.add_parser(
@@ -10176,25 +10241,37 @@ def build_parser():
                           help=f"observation window, e.g. 30m, 12h, 7d "
                                f"(default {VERIFY_WINDOW_DEFAULT})")
     p_verify.add_argument("--project", default=None,
-                          help="project dir for rule-file install checks")
-    p_verify.add_argument("--json", action="store_true")
+                          help="project dir for the rule-file install checks; also counts "
+                               "only events from this dir and its subdirs "
+                               "(default: checks in the current dir, events from all dirs)")
+    p_verify.add_argument("--json", action="store_true",
+                          help="print the report as JSON")
     p_verify.set_defaults(func=cmd_verify)
 
     p_test = sub.add_parser("test", help="send a real test notification and verify delivery")
     p_test.add_argument("--no-wait", action="store_true", help="skip delivery verification")
     p_test.set_defaults(func=cmd_test)
 
-    p_hooks = sub.add_parser("hooks", help="install/uninstall agent hooks")
+    p_hooks = sub.add_parser(
+        "hooks", help="show (bare `hooks` = status), install or uninstall agent hooks",
+        description="Without a subcommand, `agentbell hooks` shows the status.")
     p_hooks_sub = p_hooks.add_subparsers(dest="sub")
-    for verb in ("install", "uninstall"):
-        p = p_hooks_sub.add_parser(verb)
-        p.add_argument("agent", nargs="+", default=["all"], choices=AGENTS + ["all"])
+    for verb, what in (("install", "install agent hooks and rule files"),
+                       ("uninstall", "remove agentbell's hooks and rule files "
+                                     "(hooks you wrote stay)")):
+        p = p_hooks_sub.add_parser(verb, help=what)
+        p.add_argument("agent", nargs="+", choices=AGENTS + ["all"],
+                       help="agents to change, or 'all' (every supported agent)")
         p.add_argument("--project", default=None,
-                       help="install project-scoped rules (Cursor/Windsurf/Cline/Continue/Zed/Aider) "
-                            "in this project instead of the current dir; OpenCode stays global")
+                       help="project dir for the rule files (Cursor, Windsurf, Cline, "
+                            "Continue, Zed, Aider) and the OpenCode plugin "
+                            "(<dir>/.opencode/); default: rule files in the current "
+                            "dir, OpenCode global")
         p.set_defaults(func=cmd_hooks)
-    p_status = p_hooks_sub.add_parser("status")
-    p_status.add_argument("--project", default=None)
+    p_status = p_hooks_sub.add_parser("status", help="show which agents are wired")
+    p_status.add_argument("--project", default=None,
+                          help="project dir to check for rule files and the OpenCode "
+                               "plugin (default: current dir, OpenCode global)")
     p_status.set_defaults(func=cmd_hooks)
     # bare `agentbell hooks` = status
     p_hooks.set_defaults(func=cmd_hooks, sub=None, project=None)
@@ -10202,27 +10279,39 @@ def build_parser():
     p_server = sub.add_parser("server", help="run the local webhook server")
     p_server.set_defaults(func=cmd_server)
 
-    p_bot = sub.add_parser("bot", help="run the Telegram answer daemon (premium)")
+    p_bot = sub.add_parser(
+        "bot", help="run the Telegram answer daemon (premium; bare `bot` = `bot run`)",
+        description="Without a subcommand, `agentbell bot` runs the bot in the foreground.")
     p_bot_sub = p_bot.add_subparsers(dest="sub")
-    p_bot_run = p_bot_sub.add_parser("run", help="run the bot in the foreground")
+    p_bot_run = p_bot_sub.add_parser(
+        "run", help="run the bot in the foreground (one bot per state dir; "
+                    "SIGTERM ends it with exit 0)")
     p_bot_run.set_defaults(func=cmd_bot)
     p_bot_status = p_bot_sub.add_parser("status", help="show premium/bot status")
     p_bot_status.set_defaults(func=cmd_bot)
     p_bot_service = p_bot_sub.add_parser(
-        "install-service", help="keep the bot running in the background (systemd/launchd)")
+        "install-service", help="keep the bot running in the background (systemd user "
+                                "unit or launchd; not on Windows; `uninstall` removes it)")
     p_bot_service.set_defaults(func=cmd_bot)
     p_bot.set_defaults(func=cmd_bot)
 
-    p_mcp = sub.add_parser("mcp", help="stdio MCP server / register MCP in agents")
+    p_mcp = sub.add_parser(
+        "mcp", help="stdio MCP server (bare `mcp` = `mcp run`) / register MCP in agents",
+        description="Without a subcommand, `agentbell mcp` runs the stdio MCP server; "
+                    "that is the command `mcp add` registers.")
     p_mcp_sub = p_mcp.add_subparsers(dest="sub")
     p_mcp_add = p_mcp_sub.add_parser("add", help="register the MCP server in agent configs")
     p_mcp_add.add_argument("client", nargs="*", default=[],
-                           help=f"clients to register ({', '.join(MCP_CLIENTS)}, or 'all'; default: all)")
+                           help=f"clients to register ({', '.join(MCP_CLIENTS)}); "
+                                f"default and 'all': every client found on this machine")
     p_mcp_add.add_argument("--project", default=None,
-                           help="register cursor/opencode project-scoped in this dir "
+                           help="write the project config in this dir for cursor, opencode, "
+                                "qwen-code and kimi; the others stay global "
                                 "(default: global config, valid in every repo)")
     p_mcp_add.add_argument("--print", dest="print_only", action="store_true",
-                           help="print the JSON snippet instead of writing any config")
+                           help="print ready-to-paste snippets (JSON for most clients, "
+                                "VS Code and Zed; TOML for Codex and ChatGPT Desktop) "
+                                "instead of writing any config")
     p_mcp_add.set_defaults(func=cmd_mcp)
     p_mcp_run = p_mcp_sub.add_parser("run", help="run the stdio MCP server")
     p_mcp_run.set_defaults(func=cmd_mcp)
@@ -10231,8 +10320,9 @@ def build_parser():
     p_mcp.set_defaults(func=cmd_mcp, sub=None)
 
     p_history = sub.add_parser("history", help="show recent events")
-    p_history.add_argument("--limit", type=int, default=50)
-    p_history.add_argument("--json", action="store_true")
+    p_history.add_argument("--limit", type=int, default=50,
+                           help="how many of the newest records (default: 50)")
+    p_history.add_argument("--json", action="store_true", help="print the records as JSON")
     p_history.set_defaults(func=cmd_history)
 
     p_queue = sub.add_parser("queue", help="offline queue & deferred notifications")
@@ -10242,7 +10332,7 @@ def build_parser():
     p_queue_flush.set_defaults(func=cmd_queue)
     p_queue_list = p_queue_sub.add_parser(
         "list", help="list queued and deferred notifications (age, priority, message)")
-    p_queue_list.add_argument("--json", action="store_true")
+    p_queue_list.add_argument("--json", action="store_true", help="print the list as JSON")
     p_queue_list.set_defaults(func=cmd_queue)
     p_queue_status = p_queue_sub.add_parser("status", help="show queue and deferred counts")
     p_queue_status.set_defaults(func=cmd_queue)
@@ -10250,19 +10340,24 @@ def build_parser():
 
     p_uninstall = sub.add_parser(
         "uninstall",
-        help="remove agentbell (binary, hooks, MCP, config, state); dry-run unless --yes",
+        help="remove agentbell (bot service, binary, hooks, MCP, config, state); "
+             "dry-run unless --yes",
     )
     p_uninstall.add_argument("--yes", action="store_true",
                              help="delete everything listed (required for removal)")
     p_uninstall.add_argument("--project", default=".",
-                             help="project dir for cursor/opencode hooks and MCP files")
+                             help="project dir whose agentbell files go too: rule files "
+                                  "and AGENTS.md blocks, the OpenCode plugin, and the "
+                                  "Qwen Code, Kimi Code, Cursor and OpenCode MCP entries "
+                                  "(default: current dir)")
     p_uninstall.set_defaults(func=cmd_uninstall)
 
-    p_config = sub.add_parser("config", help="show config")
+    p_config = sub.add_parser("config", help="show, change or locate the config")
     p_config_sub = p_config.add_subparsers(dest="sub")
-    p_config_show = p_config_sub.add_parser("show")
+    p_config_show = p_config_sub.add_parser(
+        "show", help="print the config with credentials redacted")
     p_config_show.set_defaults(func=cmd_config)
-    p_config_path = p_config_sub.add_parser("path")
+    p_config_path = p_config_sub.add_parser("path", help="print the config file path")
     p_config_path.set_defaults(func=cmd_config)
     p_config_set = p_config_sub.add_parser(
         "set", help="change one setting (e.g. ntfy.topic) without re-running init")
@@ -10278,7 +10373,8 @@ def build_parser():
     p_license_status = p_license_sub.add_parser("status", help="show license status")
     # -v as well: doctor's fix line for an unverifiable build prints it, and a
     # 'fix:' command that argparse rejects is worse than no fix at all
-    p_license_status.add_argument("-v", "--verbose", action="store_true")
+    p_license_status.add_argument("-v", "--verbose", action="store_true",
+                                  help="also show the start of the key and the customer")
     p_license_status.set_defaults(func=cmd_license)
 
     return parser
