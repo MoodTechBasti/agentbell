@@ -5818,8 +5818,12 @@ def _codex_mcp_table(text):
 
 
 def _is_our_mcp_argv(argv):
-    """[.../agentbell, "mcp"], behind a Python interpreter or not: what mcp add writes."""
-    if len(argv) == 3 and _PYTHON_STEM.match(_command_stem(argv[0])):
+    """[.../agentbell, "mcp"], behind a Python interpreter or not: what mcp add writes.
+
+    Any interpreter counts (python3, pypy3, python3.13t.exe), the same rule
+    as _parse_our_hook_command: the script itself must be agentbell.py.
+    """
+    if len(argv) == 3 and argv[1].lower().endswith(".py") and _command_stem(argv[1]) == PROG:
         argv = argv[1:]
     return len(argv) == 2 and _command_stem(argv[0]) == PROG and argv[1] == "mcp"
 
@@ -6281,7 +6285,7 @@ def integration_guide(manifest):
     out(f"   Native installers exist for: {reserved}.")
     installed = [a["name"] for a in m["known_agents"] if a["installed"]]
     if installed:
-        out(f"   Already wired here (do not add anything for these): "
+        out("   Already wired here (do not add anything for these): "
             + ", ".join(installed))
     out("   If you are one of these: run `agentbell hooks install <name>` and")
     out("   STOP - the installer is idempotent, re-running it never duplicates")
