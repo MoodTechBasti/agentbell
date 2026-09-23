@@ -3649,7 +3649,7 @@ def _codex_insert_features_flag(text):
             + "".join(lines[index:]))
 
 
-def _write_text_atomic(path, text, newline=None, mode=None):
+def _write_text_atomic(path, text, newline=None, mode=None, errors="strict"):
     """Replace `path` without following a symlink planted at the temp name.
 
     A hostile repo can ship `AGENTS.md.tmp` as a symlink to `~/.bashrc`.
@@ -3663,8 +3663,10 @@ def _write_text_atomic(path, text, newline=None, mode=None):
     leave a dotfiles checkout holding the old hooks. Rule files still
     refuse a symlink destination before they call this. Without `mode`,
     keep the mode the destination already had, so a 0600 Codex or Kimi
-    config stays 0600 (0644 for a new file). `newline=""` writes `text` as
-    is: text read with newline="" keeps its CRLFs on every OS.
+    config stays 0600 (0644 for a new file). `newline` and `errors` are
+    open()'s: `newline=""` writes `text` as is (text read with newline=""
+    keeps its CRLFs on every OS), and rule files pass the values
+    `_read_rule_file` read them with.
 
     A destination that cannot be written (a link into a read-only Nix
     store) raises an OSError that says which file and what to do.
@@ -3700,7 +3702,7 @@ def _write_text_atomic(path, text, newline=None, mode=None):
     if handle is None:
         raise OSError(errno.EEXIST, "cannot create temp file", tmp)
     try:
-        with os.fdopen(handle, "w", encoding="utf-8", newline=newline) as fh:
+        with os.fdopen(handle, "w", encoding="utf-8", errors=errors, newline=newline) as fh:
             fh.write(text)
         os.chmod(tmp, mode)
         os.replace(tmp, destination)
@@ -4108,6 +4110,11 @@ def _instructions_text(agent):
 # turn's duration is measured from the user's prompt (message.updated with
 # role "user") so `--min-duration` can keep short turns silent; without a
 # seen prompt the duration is unknown and agentbell notifies, as always.
+# OpenCode (1.18.32) re-sends a prompt after its turn: the diff summary runs
+# in the background and updates the user message, often after session.idle.
+# A prompt created before the last idle therefore never starts a turn, and
+# every idle - one the dedupe swallows too - ends one. Otherwise the next
+# turn was timed from the old prompt and counted the user's reading time.
 OPENCODE_PLUGIN = """// agentbell: phone notifications for OpenCode.
 // Installed by `agentbell hooks install opencode`.
 // Remove with   `agentbell hooks uninstall opencode`.
@@ -4116,6 +4123,7 @@ const MIN_DURATION = __MIN_DURATION__   // seconds; shorter turns stay silent
 const IDLE_DEDUPE_MS = 10000            // one turn end per session per 10 s
 const childSessions = new Set()
 const turnStarted = new Map()           // sessionID -> ms of the prompt that began the turn
+const turnEnded = new Map()             // sessionID -> ms of the last idle, reported or not
 const lastIdle = new Map()              // sessionID -> ms of the last turn end reported
 let lastPermission = 0
 
@@ -4139,20 +4147,29 @@ export const AgentBell = async ({ $ }) => {
       }
       if (sid && childSessions.has(sid)) return
       if (event.type === "message.updated") {
-        // the user's prompt starts the turn; assistant updates stream all turn long
-        if (info.role === "user" && sid && !turnStarted.has(sid)) turnStarted.set(sid, Date.now())
+        // the user's prompt starts the turn; assistant updates stream all turn long.
+        // A prompt created before the last idle is the previous turn's, re-sent.
+        const created = info.time && info.time.created
+        const resent = typeof created === "number" && created <= (turnEnded.get(sid) || 0)
+        if (info.role === "user" && sid && !resent && !turnStarted.has(sid)) {
+          turnStarted.set(sid, Date.now())
+        }
         return
       }
       if (event.type === "session.idle") {
         const now = Date.now()
+        const started = sid ? turnStarted.get(sid) : undefined
+        if (sid) {
+          turnStarted.delete(sid)
+          if (turnEnded.size > 500) turnEnded.clear()
+          turnEnded.set(sid, now)
+        }
         // the same session can report idle twice for one turn - one push, not two
         if (sid && now - (lastIdle.get(sid) || 0) < IDLE_DEDUPE_MS) return
         if (sid) {
           if (lastIdle.size > 500) lastIdle.clear()
           lastIdle.set(sid, now)
         }
-        const started = sid ? turnStarted.get(sid) : undefined
-        if (sid) turnStarted.delete(sid)
         const args = ["hook", "run_completed", "--agent", "opencode"]
         if (started) {
           args.push("--duration", String(Math.round((now - started) / 1000)),
@@ -4190,26 +4207,56 @@ def _is_symlink_refused(path):
     return False
 
 
-def _open_nofollow(path, mode="w"):
+def _open_nofollow(path, mode="w", newline=None):
     """open() that refuses to follow a symlink at the syscall level.
 
     Closes the gap between the islink() check and the write. O_NOFOLLOW exists
     on Linux and macOS; where it does not, the islink() check is what we have.
+    surrogateescape writes back the non-UTF-8 bytes `_read_rule_file` kept.
     """
     flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == "a" else os.O_TRUNC)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    return os.fdopen(os.open(path, flags, 0o644), mode, encoding="utf-8")
+    return os.fdopen(os.open(path, flags, 0o644), mode, encoding="utf-8",
+                     errors="surrogateescape", newline=newline)
 
 
-def _install_block_file(path, content, add=True, replace_stale=False):
+def _read_rule_file(path):
+    """A shared rule file's text, so that writing it back changes only our block.
+
+    AGENTS.md belongs to the user and may be cp1252 or latin-1, with CRLF
+    line ends. A strict UTF-8 read crashed `hooks status`, `doctor` and
+    `verify`; universal newlines turned every CRLF into LF on the next write.
+    surrogateescape keeps each byte that is not UTF-8 and newline="" keeps
+    each line end. Write with the same two settings.
+    """
+    with open(path, "r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+        return fh.read()
+
+
+def _line_ending(text):
+    """The line end most of `text` uses; the platform's for a file without one."""
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    if not crlf and not lf:
+        return os.linesep
+    return "\r\n" if crlf > lf else "\n"
+
+
+def _install_block_file(path, content, add=True, replace_stale=False, notes=None):
+    """Add, repair or remove our marked block in a rule file others share.
+
+    Returns True when the file changed. A file left alone although the block
+    is not in place gets its reason appended to `notes`.
+    """
+    notes = [] if notes is None else notes
+    name = os.path.basename(path)
     exists = os.path.exists(path)
     if os.path.lexists(path) and _is_symlink_refused(path):
         return False
     if not add:
         if not exists:
             return False
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
+        text = _read_rule_file(path)
         if BLOCK_START not in text:
             return False
         pattern = re.compile(
@@ -4230,46 +4277,64 @@ def _install_block_file(path, content, add=True, replace_stale=False):
         new_text = text
         for match in reversed(matches):
             new_text = new_text[:match.start()] + new_text[match.end():]
+        eol = _line_ending(new_text)
         new_text = new_text.strip()
         if not new_text:
             os.remove(path)
         else:
-            with _open_nofollow(path, "w") as fh:
-                fh.write(new_text + "\n")
+            with _open_nofollow(path, "w", newline="") as fh:
+                fh.write(new_text + eol)
         return True
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if exists:
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-        if BLOCK_START in text:
-            if not replace_stale:
-                return False
-            pattern = re.compile(
-                re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END), re.S
-            )
-            matches = list(pattern.finditer(text))
-            # An unmatched or duplicated marker is ambiguous. Never guess which
-            # surrounding user text belongs to agentbell.
-            if len(matches) != 1:
-                return False
-            match = matches[0]
-            # The lone block may belong to a different agent's integration
-            # (e.g. a not-yet-migrated marker). Never guess and overwrite it.
-            owner = re.search(r"--agent ([^\s`]+)", content)
-            if owner and owner.group(0) not in match.group(0):
-                return False
-            replacement = f"{BLOCK_START}\n{content.rstrip()}\n{BLOCK_END}"
-            if match.group(0) == replacement:
-                return False
-            new_text = text[:match.start()] + replacement + text[match.end():]
-            _write_text_atomic(path, new_text)
-            return True
-    else:
-        text = ""
-    block = f"{BLOCK_START}\n{content.rstrip()}\n{BLOCK_END}\n"
-    with _open_nofollow(path, "a") as fh:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as exc:
+        # e.g. `.clinerules` is a dangling symlink where the folder belongs
+        notes.append(f"cannot create {os.path.dirname(path)} ({exc.strerror}); "
+                     "nothing was written")
+        return False
+    text = _read_rule_file(path) if exists else ""
+    if "\0" in text:
+        # UTF-16 (what `echo > AGENTS.md` writes in Windows PowerShell 5.1):
+        # a UTF-8 block appended to it would be unreadable, and so would the file
+        notes.append(f"{name} is saved as UTF-16 (or is not text); left it unchanged. "
+                     "Save it as UTF-8, then run this again")
+        return False
+    if BLOCK_START in text:
+        if not replace_stale:
+            return False
+        pattern = re.compile(
+            re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END), re.S
+        )
+        matches = list(pattern.finditer(text))
+        # An unmatched or duplicated marker is ambiguous. Never guess which
+        # surrounding user text belongs to agentbell.
+        if len(matches) != 1:
+            notes.append(f"{name} does not hold exactly one complete agentbell block "
+                         "(a stray marker or a second block); left it unchanged so none "
+                         "of your text is lost. Remove the extra marker or block, then "
+                         "run this again")
+            return False
+        match = matches[0]
+        # The lone block may belong to a different agent's integration
+        # (e.g. a not-yet-migrated marker). Never guess and overwrite it.
+        owner = re.search(r"--agent ([^\s`]+)", content)
+        if owner and owner.group(0) not in match.group(0):
+            notes.append(f"{name} already holds an agentbell block for another agent; "
+                         "left it unchanged. Remove that block, then run this again")
+            return False
+        # our block takes the line end of the user's text around it
+        eol = _line_ending(text[:match.start()] + text[match.end():])
+        replacement = f"{BLOCK_START}\n{content.rstrip()}\n{BLOCK_END}".replace("\n", eol)
+        if match.group(0) == replacement:
+            return False
+        new_text = text[:match.start()] + replacement + text[match.end():]
+        _write_text_atomic(path, new_text, newline="", errors="surrogateescape")
+        return True
+    eol = _line_ending(text)
+    block = f"{BLOCK_START}\n{content.rstrip()}\n{BLOCK_END}\n".replace("\n", eol)
+    with _open_nofollow(path, "a", newline="") as fh:
         if text and not text.endswith("\n"):
-            fh.write("\n")
+            fh.write(eol)
         fh.write(block)
     return True
 
@@ -4338,21 +4403,36 @@ def _windsurf_rule_result(project, add):
 
 def _block_file_result(agent, project, relpath, content, add, replace_stale=False):
     path = os.path.join(_project_dir(project), relpath)
-    return {"agent": agent,
-            "changed": _install_block_file(path, content, add=add,
-                                             replace_stale=replace_stale),
-            "path": path}
+    notes = []
+    changed = _install_block_file(path, content, add=add, replace_stale=replace_stale,
+                                  notes=notes)
+    return {"agent": agent, "changed": changed, "path": path,
+            "notes": [f"{agent}: {note}" for note in notes]}
 
 
 def _block_file_status(relpath, project):
     return _file_contains(os.path.join(_project_dir(project), relpath), BLOCK_START)
 
 
+def _cline_relpath(project):
+    """`.clinerules/agentbell.md`, or the `.clinerules` file older Cline used.
+
+    Cline reads a `.clinerules/` folder, and a single `.clinerules` file
+    where one exists. Creating the folder next to that file crashed with
+    FileExistsError; our marked block goes into the file instead, and
+    uninstall takes out only the block.
+    """
+    if os.path.isfile(os.path.join(_project_dir(project), ".clinerules")):
+        return ".clinerules"
+    return ".clinerules/agentbell.md"
+
+
 def aider_block_state(project=None):
     """Return absent/current/outdated for agentbell's Aider AGENTS.md block."""
     path = os.path.join(_project_dir(project), "AGENTS.md")
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        # the user's file: cp1252 must not crash status, doctor and verify
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except (FileNotFoundError, OSError):
         return "absent"
@@ -4740,12 +4820,11 @@ AGENT_SPECS = {
             ("cline",),
             (os.path.join(_home(), ".cline"), os.path.join(_home(), ".clinerules"),
              os.path.join(".", ".clinerules"))),
-        "path": lambda project: os.path.join(
-            _project_dir(project), ".clinerules", "agentbell.md"),
+        "path": lambda project: os.path.join(_project_dir(project), _cline_relpath(project)),
         "install": lambda project, add: _block_file_result(
-            "cline", project, ".clinerules/agentbell.md",
+            "cline", project, _cline_relpath(project),
             _instructions_text("cline"), add),
-        "status": lambda project: _block_file_status(".clinerules/agentbell.md", project),
+        "status": lambda project: _block_file_status(_cline_relpath(project), project),
     },
     "continue": {
         "scope": "project", "kind": "block", "reliability": "rule",
@@ -4856,6 +4935,22 @@ def install_hooks(agent, project=None, add=True):
     if spec is None:
         raise SystemExit(f"{PROG}: unknown agent '{agent}'. Choose from: {', '.join(AGENTS)}")
     return spec["install"](project, add)
+
+
+def _unchanged_install_line(agent, project=None):
+    """What an install that changed nothing means, by `hooks status`'s own check.
+
+    It always said "already installed". An Aider block left alone because
+    of a stray marker or another agent's block is not installed, and status
+    said so right after.
+    """
+    try:
+        installed = AGENT_SPECS[agent]["status"](project)
+    except OSError:
+        installed = False
+    if installed:
+        return f"hooks for {agent} already installed (nothing changed)"
+    return f"hooks for {agent} NOT installed (nothing changed)"
 
 
 def hooks_status(project=None):
@@ -7500,7 +7595,7 @@ def cmd_init(args):
                     if result["changed"]:
                         print(f"  installed hooks for {agent} -> {result['path']}")
                     else:
-                        print(f"  hooks for {agent} already installed (nothing changed)")
+                        print(f"  {_unchanged_install_line(agent)}")
                     for note in result.get("notes", []):
                         print(f"  note: {note}")
 
@@ -8243,7 +8338,7 @@ def cmd_hooks(args):
             if result["changed"]:
                 print(f"installed hooks for {agent}: {result['path']}")
             else:
-                print(f"hooks for {agent} already installed (nothing changed)")
+                print(_unchanged_install_line(agent, project))
         else:
             print(f"{'removed' if result['changed'] else 'nothing to remove'} for {agent}")
         for note in result.get("notes", []):
