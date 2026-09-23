@@ -215,6 +215,11 @@ HOOK_MIN_DURATION = 60
 # lifecycle event twice, or six parallel sessions failing on the same API
 # outage, is one piece of news, not six buzzes. 0 disables it.
 HOOK_DEDUPE_WINDOW_SECONDS = 5.0
+# Wall-clock budget for all sending a hook does (retries and the queue
+# drain included). Hosts kill slow hooks - Kimi after 10s, Gemini after 15s -
+# and three tries with backoff took up to 18s, so the push died unrecorded.
+# What the budget cannot deliver goes to the offline queue instead.
+HOOK_SEND_BUDGET_SECONDS = 6.0
 
 BLOCK_START = "<!-- agentbell:start -->"
 BLOCK_END = "<!-- agentbell:end -->"
@@ -600,8 +605,12 @@ class Config:
         if not os.path.exists(self.path):
             return default_config()
         try:
-            with open(self.path, "r", encoding="utf-8") as fh:
+            # utf-8-sig: Windows editors and PowerShell's `Set-Content
+            # -Encoding UTF8` start the file with a BOM
+            with open(self.path, "r", encoding="utf-8-sig") as fh:
                 data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError("not a JSON object")
         except (OSError, ValueError) as exc:
             raise SystemExit(f"{PROG}: cannot read config {self.path}: {exc}")
         merged = default_config()
@@ -789,26 +798,51 @@ def http_request(url, method="GET", headers=None, body=None, timeout=10.0):
 
 def clamp_message(text, limit=3900):
     text = text or ""
-    if len(text.encode("utf-8")) <= limit:
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
         return text
-    out = text
-    while len(out.encode("utf-8")) > limit and out:
-        out = out[:-1]
-    return out + "\u2026"
+    # Cut the bytes and drop the one character the cut may have split: the
+    # longest prefix that fits, in linear time. Trimming one character per
+    # re-encode took minutes on a few hundred KB.
+    return raw[:limit].decode("utf-8", "ignore") + "\u2026"
+
+
+_UNSENDABLE_RE = re.compile(r"[\x00\ud800-\udfff]")
+
+
+def _sendable_text(value):
+    """`value` as text every channel can carry.
+
+    A NUL fits in no process argument or environment block (notify-send,
+    osascript and the Windows toast raised ValueError), and a lone surrogate
+    - an undecodable byte in a path or argument, via surrogateescape - has no
+    UTF-8 form. Either used to raise out of the channel and lose the push.
+    NUL is dropped; a surrogate becomes U+FFFD.
+    """
+    if not value:
+        return value
+    return _UNSENDABLE_RE.sub(lambda m: "" if m.group() == "\x00" else "\ufffd", str(value))
 
 
 def _latin1_header(value):
-    """Make a value safe as an HTTP header.
+    """Make a value safe as an ntfy HTTP header.
 
     Newlines and control characters would make http.client raise
     'Invalid header value' - an exception nothing up the stack catches, so a
     title with a newline in it crashed the CLI.
+
+    http.client sends header bytes as Latin-1, but ntfy reads them as UTF-8:
+    an emoji or CJK title lost those characters, and even an umlaut arrived
+    as invalid UTF-8. Anything beyond ASCII goes out as one RFC 2047
+    encoded-word, which ntfy decodes in every header since v2.4.0.
     """
     if value is None:
         return ""
-    text = re.sub(r"[\r\n\t]+", " ", str(value))
-    text = "".join(ch for ch in text if ch >= " " and ch != "\x7f")
-    return text.encode("latin-1", "ignore").decode("latin-1").strip()
+    text = re.sub(r"[\r\n\t]+", " ", _sendable_text(str(value)))
+    text = "".join(ch for ch in text if ch >= " " and ch != "\x7f").strip()
+    if text.isascii():
+        return text
+    return "=?UTF-8?B?" + base64.b64encode(text.encode("utf-8")).decode("ascii") + "?="
 
 
 def toml_string(value):
@@ -851,7 +885,8 @@ class NtfyChannel:
         if actions:
             headers["Actions"] = _latin1_header(json.dumps(actions, separators=(",", ":")))
         url = f"{self.server()}/{topic}"
-        _, raw = http_request(url, "POST", headers, clamp_message(message), timeout)
+        _, raw = http_request(url, "POST", headers, clamp_message(_sendable_text(message)),
+                              timeout)
         result = {"channel": "ntfy", "ok": True}
         # ntfy answers with the stored message. Its `time` is the server's
         # clock, which `ask` orders free-text replies against.
@@ -949,9 +984,9 @@ class TelegramChannel:
         return self._call(self._token(), method, body, timeout)
 
     def send(self, message, title=None, priority=3, timeout=10.0):
-        text = html.escape(clamp_message(message, 3800))
+        text = html.escape(clamp_message(_sendable_text(message), 3800))
         if title:
-            text = f"<b>{html.escape(title)}</b>\n{text}"
+            text = f"<b>{html.escape(_sendable_text(title))}</b>\n{text}"
         if int(priority) <= 2:
             text = "\U0001f515 " + text
         elif int(priority) >= 4:
@@ -968,7 +1003,7 @@ class TelegramChannel:
         as plain text; the bot can still pick up free-text replies later.
         """
         text = ("\U0001f534 <b>Approval requested</b>\n"
-                + html.escape(clamp_message(message, 3800))
+                + html.escape(clamp_message(_sendable_text(message), 3800))
                 + f"\n\nID: {approval_id}")
         body = {"chat_id": self.tg.get("chat_id"), "parse_mode": "HTML"}
         if buttons:
@@ -1048,10 +1083,15 @@ def _applescript_string(value):
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def os_notify(title, message, priority=3):
+def os_notify(title, message, priority=3, timeout=None):
+    """Desktop notification. `timeout` caps the helper process (a hook's budget)."""
     system = platform.system()
-    title = str(title or "Notification")
-    message = str(message or "")
+    title = _sendable_text(str(title or "Notification"))
+    message = _sendable_text(str(message or ""))
+
+    def limit(default):
+        return default if timeout is None else min(default, timeout)
+
     try:
         if system == "Linux":
             if shutil.which("notify-send"):
@@ -1059,7 +1099,7 @@ def os_notify(title, message, priority=3):
                 subprocess.run(
                     # '--' stops a message starting with '-' being read as a flag
                     ["notify-send", "-u", urgency, "--", title, message],
-                    check=True, timeout=10, capture_output=True,
+                    check=True, timeout=limit(10), capture_output=True,
                 )
                 return {"channel": "os", "ok": True}
         elif system == "Darwin":
@@ -1068,7 +1108,7 @@ def os_notify(title, message, priority=3):
                 f"with title {_applescript_string(title)}"
             )
             subprocess.run(
-                ["osascript", "-e", script], check=True, timeout=10, capture_output=True
+                ["osascript", "-e", script], check=True, timeout=limit(10), capture_output=True
             )
             return {"channel": "os", "ok": True}
         elif system == "Windows":
@@ -1077,10 +1117,10 @@ def os_notify(title, message, priority=3):
             # PowerShell 5.1 treats typographic apostrophes (U+2018–U+201B)
             # as quotes, so a message containing ’ closed the string and the
             # rest ran as code. The script is constant; the text rides in the
-            # child environment. A NUL cannot live in an environment block.
+            # child environment (NUL-free: _sendable_text above).
             env = os.environ.copy()
-            env["AGENTBELL_OS_TITLE"] = title.replace("\x00", "")
-            env["AGENTBELL_OS_MESSAGE"] = message.replace("\x00", "")
+            env["AGENTBELL_OS_TITLE"] = title
+            env["AGENTBELL_OS_MESSAGE"] = message
             script = (
                 "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
                 "ContentType = WindowsRuntime] > $null;"
@@ -1096,7 +1136,7 @@ def os_notify(title, message, priority=3):
             )
             subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                check=True, timeout=15, capture_output=True, env=env,
+                check=True, timeout=limit(15), capture_output=True, env=env,
             )
             return {"channel": "os", "ok": True}
     except (OSError, subprocess.SubprocessError):
@@ -1219,8 +1259,15 @@ def write_history(entry):
     record = dict(entry)
     record.setdefault("ts", datetime.datetime.now().astimezone().isoformat(timespec="seconds"))
     path = history_path()
+    line = json.dumps(record, ensure_ascii=False)
+    try:
+        line.encode("utf-8")
+    except UnicodeEncodeError:
+        # a lone surrogate (an undecodable byte in a path or argument) has no
+        # UTF-8 form; as a \udcxx escape the record still gets written
+        line = json.dumps(record)
     with open_private(path, "a") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        fh.write(line + "\n")
     _rotate_history(path)
 
 
@@ -1342,7 +1389,8 @@ def _marker_scope(session_id=None, cwd=None):
         if not directory:
             return ""
         token = "c:" + directory
-    return hashlib.sha1(token.encode("utf-8")).hexdigest()[:16]
+    # surrogatepass: a directory with an undecodable byte is still a scope
+    return hashlib.sha1(token.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
 def _run_marker_path(agent, scope=""):
@@ -1434,7 +1482,7 @@ def _dedupe_path():
 
 
 def _dedupe_key(agent, event, message):
-    raw = f"{agent}\n{event}\n{message}".encode("utf-8")
+    raw = f"{agent}\n{event}\n{message}".encode("utf-8", "surrogatepass")
     return hashlib.sha1(raw).hexdigest()[:20]
 
 
@@ -2024,11 +2072,13 @@ def release_bot_lock(path):
         pass
 
 
-def publish_with_retry(fn, attempts=None):
+def publish_with_retry(fn, attempts=None, deadline=None):
     """Call fn(), retrying transient failures with backoff.
 
     TransientError is retried; any other RuntimeError (permanent) propagates
-    immediately. After `attempts` attempts the last TransientError is raised.
+    immediately. After `attempts` attempts the last TransientError is raised,
+    and so it is as soon as a backoff pause would reach the wall-clock
+    `deadline`: the caller queues the push instead of being killed mid-retry.
     """
     attempts = attempts if attempts is not None else RETRY_ATTEMPTS
     backoff = RETRY_BACKOFF_SECONDS
@@ -2039,7 +2089,10 @@ def publish_with_retry(fn, attempts=None):
         except TransientError as exc:
             last = exc
             if attempt + 1 < attempts:
-                time.sleep(backoff[min(attempt, len(backoff) - 1)])
+                pause = backoff[min(attempt, len(backoff) - 1)]
+                if deadline is not None and time.time() + pause >= deadline:
+                    break
+                time.sleep(pause)
     if last is not None:
         raise last
     raise TransientError("delivery failed")
@@ -2061,32 +2114,46 @@ def _publish_channel(cfg, channel, item, timeout=10.0):
             message, title=title, priority=prio_num, timeout=timeout,
         )
     if channel == "os":
-        return os_notify(title or "Agent notification", message, prio_num)
+        return os_notify(title or "Agent notification", message, prio_num, timeout)
     raise PermanentError(f"unknown channel '{channel}'")
 
 
-def _publish_item_channels(cfg, item, timeout=10.0):
+def _publish_item_channels(cfg, item, timeout=10.0, deadline=None):
     """Publish one notification item on each of its channels, with retries.
 
     Returns {"delivered": [...], "transient": {channel: error},
-             "permanent": {channel: error}}. Never raises (except coding bugs);
-    callers decide about queueing / reporting.
+             "permanent": {channel: error}}. Never raises; callers decide
+    about queueing / reporting. With a wall-clock `deadline` no attempt
+    outlives it: a channel it cuts short is transient, so it gets queued.
     """
     channels = item.get("channels") or cfg.channels()
     if isinstance(channels, str):
         channels = [c.strip() for c in channels.split(",") if c.strip()]
+
+    def attempt(channel):
+        wait = timeout
+        if deadline is not None:
+            # never below a useful minimum: that is at most 0.5s over budget
+            wait = min(timeout, max(0.5, deadline - time.time()))
+        return _publish_channel(cfg, channel, item, wait)
+
     delivered, transient, permanent = [], {}, {}
     for channel in channels:
         if channel == "telegram" and not premium_enabled(cfg):
             permanent[channel] = LICENSE_PREMIUM_MSG
             continue
+        if deadline is not None and time.time() >= deadline:
+            transient[channel] = "not tried: the send time budget was used up"
+            continue
         try:
-            publish_with_retry(lambda ch=channel: _publish_channel(cfg, ch, item, timeout))
+            publish_with_retry(lambda ch=channel: attempt(ch), deadline=deadline)
             delivered.append(channel)
         except TransientError as exc:
             transient[channel] = str(exc)
         except RuntimeError as exc:
             permanent[channel] = str(exc)
+        except Exception as exc:  # noqa: BLE001 - one channel's crash must not cost the others
+            permanent[channel] = f"{type(exc).__name__}: {exc}"
     return {"delivered": delivered, "transient": transient, "permanent": permanent}
 
 
@@ -2223,8 +2290,9 @@ def drain_queue(cfg, limit=None, timeout=QUEUE_TIMEOUT, deadline=None):
     """Deliver queued notifications (oldest first).
 
     limit=None drains everything; the auto-drain passes a small limit so a
-    regular notify stays fast, and the bot daemon passes a wall-clock
-    `deadline` so a long backlog can never stop it answering approvals.
+    regular notify stays fast, and the bot daemon and hooks pass a wall-clock
+    `deadline` - it bounds every send, too - so a long backlog can never stop
+    the bot answering approvals or outlive a host's hook timeout.
     Expired items are dropped, transient failures are kept for the next
     attempt, permanent failures are dropped and logged. During quiet hours
     an item that would be held now is moved to the deferred store, the same
@@ -2269,7 +2337,7 @@ def drain_queue(cfg, limit=None, timeout=QUEUE_TIMEOUT, deadline=None):
                                "deferred_id": deferred_id,
                                "queued_at": item.get("created")})
                 continue
-            outcome = _publish_item_channels(cfg, item, timeout=timeout)
+            outcome = _publish_item_channels(cfg, item, timeout=timeout, deadline=deadline)
             if outcome["delivered"]:
                 stats["delivered"] += 1
                 write_history({"event": "queued_delivered", "message": item.get("message"),
@@ -2317,7 +2385,7 @@ def drain_queue(cfg, limit=None, timeout=QUEUE_TIMEOUT, deadline=None):
     return stats
 
 
-def flush_deferred(cfg, timeout=10.0):
+def flush_deferred(cfg, timeout=10.0, deadline=None):
     """Deliver deferred notifications whose quiet window has ended.
 
     More than DEFER_BUNDLE_THRESHOLD due items are bundled into one summary
@@ -2354,14 +2422,14 @@ def flush_deferred(cfg, timeout=10.0):
         groups.setdefault(key, []).append((name, item))
     if len(groups) > 1:
         for group in groups.values():
-            part = _flush_due_items(cfg, directory, group, timeout)
+            part = _flush_due_items(cfg, directory, group, timeout, deadline=deadline)
             for key, value in part.items():
                 stats[key] = stats.get(key, 0) + value
         return stats
-    return _flush_due_items(cfg, directory, due, timeout, stats)
+    return _flush_due_items(cfg, directory, due, timeout, stats, deadline)
 
 
-def _flush_due_items(cfg, directory, due, timeout, stats=None):
+def _flush_due_items(cfg, directory, due, timeout, stats=None, deadline=None):
     """Deliver one channel-homogeneous batch of due deferred items."""
     stats = stats if stats is not None else {"processed": 0, "delivered": 0,
                                              "bundled": 0, "kept": 0}
@@ -2394,7 +2462,7 @@ def _flush_due_items(cfg, directory, due, timeout, stats=None):
             "event": "deferred_bundle",
         }
         try:
-            outcome = _publish_item_channels(cfg, bundle, timeout=timeout)
+            outcome = _publish_item_channels(cfg, bundle, timeout=timeout, deadline=deadline)
         except BaseException:
             for name, _, sending in claimed:      # give them back untouched
                 try:
@@ -2433,7 +2501,7 @@ def _flush_due_items(cfg, directory, due, timeout, stats=None):
             stats["kept"] += 1
             continue
         try:
-            outcome = _publish_item_channels(cfg, item, timeout=timeout)
+            outcome = _publish_item_channels(cfg, item, timeout=timeout, deadline=deadline)
             if outcome["delivered"]:
                 stats["delivered"] += 1
                 write_history({"event": "deferred_delivered", "message": item.get("message"),
@@ -2476,27 +2544,31 @@ def _flush_due_items(cfg, directory, due, timeout, stats=None):
     return stats
 
 
-def auto_drain(cfg):
+def auto_drain(cfg, deadline=None):
     """Drain queued + deferred items after a successful send.
 
     Best-effort, bounded, never raises: the regular notification flow must
-    not be slowed down or broken by background delivery.
+    not be slowed down or broken by background delivery. A wall-clock
+    `deadline` (a hook's budget) bounds it as well; what it cuts short stays
+    queued or deferred for the next send.
     """
     try:
         if os.path.isdir(queue_dir()) and os.listdir(queue_dir()):
-            drain_queue(cfg, limit=AUTO_DRAIN_LIMIT)
+            drain_queue(cfg, limit=AUTO_DRAIN_LIMIT, deadline=deadline)
     except Exception:  # noqa: BLE001
         pass
+    if deadline is not None and time.time() >= deadline:
+        return
     try:
         if os.path.isdir(deferred_dir()) and os.listdir(deferred_dir()):
-            flush_deferred(cfg)
+            flush_deferred(cfg, deadline=deadline)
     except Exception:  # noqa: BLE001
         pass
 
 
 def send_notification(cfg, message, title=None, priority="normal", tags=None,
                       channels=None, force=False, timeout=10.0, event="notify",
-                      defer=None, agent=None, project=None):
+                      defer=None, agent=None, project=None, deadline=None):
     def _hist(entry):
         # Attribution for `verify`: which agent fired this, what the original
         # hook event was when quiet hours / queueing rewrote it, and whether
@@ -2551,13 +2623,14 @@ def send_notification(cfg, message, title=None, priority="normal", tags=None,
         return {"ok": True, "suppressed": True, "results": results}
     item = {"message": message, "title": title, "priority": priority,
             "tags": tags, "channels": channels}
-    outcome = _publish_item_channels(cfg, item, timeout=timeout)
+    outcome = _publish_item_channels(cfg, item, timeout=timeout, deadline=deadline)
     results = [{"channel": ch, "ok": True} for ch in outcome["delivered"]]
     errors = [f"{ch}: {msg}" for ch, msg in outcome["permanent"].items()]
     queued = list(outcome["transient"])
     if queued:
         retry = {"message": message, "title": title, "priority": priority,
-                 "tags": tags, "channels": queued, "event": event}
+                 "tags": tags, "channels": queued, "event": event,
+                 "last_error": outcome["transient"]}
         if force:
             retry["force"] = True     # the retry ignores quiet hours too
         enqueue_item(cfg, retry)
@@ -2585,7 +2658,7 @@ def send_notification(cfg, message, title=None, priority="normal", tags=None,
     if errors:
         result["errors"] = errors
     if outcome["delivered"]:
-        auto_drain(cfg)
+        auto_drain(cfg, deadline=deadline)
     return result
 
 
@@ -7322,7 +7395,12 @@ def _history_ts(rec):
 
 
 def _normalized_project(project=None):
-    return os.path.normcase(os.path.realpath(os.path.abspath(project or os.getcwd())))
+    try:
+        return os.path.normcase(os.path.realpath(os.path.abspath(project or os.getcwd())))
+    except ValueError:
+        # A NUL - only a host's JSON payload can carry one - is in no real
+        # path, and resolving it raised: keep the text instead of losing the hook
+        return os.path.normcase(str(project))
 
 
 def _project_matches(recorded, requested):
@@ -7660,7 +7738,12 @@ def suggest_topic():
     Kept under ntfy's 64-char topic limit while being unguessable on public
     servers (see DECISIONS.md / README security note).
     """
-    user = getpass.getuser()
+    try:
+        user = getpass.getuser()
+    except (ImportError, KeyError, OSError):
+        # a container uid with no passwd entry and no USER/LOGNAME: the prefix
+        # is cosmetic, the random part is what protects the topic
+        user = ""
     clean = re.sub(r"[^a-z0-9_-]", "", user.lower())[:16] or "agent"
     return f"{clean}-{secrets.token_hex(16)}"
 
@@ -8150,6 +8233,7 @@ def _hook_session(payload):
 
 def run_hook(cfg, event, agent, cwd=None, duration=None, force=False, silent=False,
              min_duration=None, session_id=None):
+    deadline = time.time() + HOOK_SEND_BUDGET_SECONDS
     spec = HOOK_EVENTS[event]
     validate_agent_name(agent)
     project = _normalized_project(cwd)
@@ -8198,6 +8282,7 @@ def run_hook(cfg, event, agent, cwd=None, duration=None, force=False, silent=Fal
         event=f"hook.{event}",
         agent=agent,
         project=project,
+        deadline=deadline,
     )
 
 
@@ -8224,9 +8309,36 @@ def cmd_hook(args):
                  duration=args.duration, force=args.force, silent=args.silent,
                  min_duration=args.min_duration,
                  session_id=_hook_session(payload))
-    except Exception:  # noqa: BLE001 - a hook must never fail the agent's turn
-        pass
+    # A hook must never fail the agent's turn, and Config() reports an
+    # unreadable config as SystemExit - but the failure must stay visible.
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        _record_hook_error(event, args, exc)
     raise SystemExit(0)
+
+
+def _record_hook_error(event, args, exc):
+    """One history record and one stderr line for a hook that failed. Never raises."""
+    if isinstance(exc, SystemExit):
+        detail = str(exc.code).replace(f"{PROG}: ", "", 1)
+    else:
+        detail = f"{type(exc).__name__}: {exc}"
+    record = {"event": "hook.error", "agent": args.agent,
+              "source_event": f"hook.{event}", "error": detail}
+    if args.force:
+        record["forced"] = True
+    where = "recorded in 'agentbell history'"
+    try:
+        record["project"] = _normalized_project(args.cwd)
+    except Exception:  # noqa: BLE001 - e.g. the working directory was deleted
+        pass
+    try:
+        write_history(record)
+    except Exception as history_exc:  # noqa: BLE001
+        where = f"history not writable either: {type(history_exc).__name__}"
+    try:
+        sys.stderr.write(f"{PROG}: hook {event} failed: {detail} ({where})\n")
+    except Exception:  # noqa: BLE001 - no stderr left to complain on
+        pass
 
 
 def cmd_ask(args):
@@ -8417,6 +8529,8 @@ def run_watch(cfg, cmd, title=None, priority=None, fail_priority=None,
             title = title or "Command failed"
             prio = fail_priority or "urgent"
         notification = None
+        if cfg is None:     # unreadable config: cmd_watch has said so on stderr
+            return {"exit_code": exit_code, "message": message, "notification": None}
         try:
             notification = send_notification(
                 cfg, message, title=title, priority=prio, tags=tags,
@@ -8439,7 +8553,13 @@ def run_watch(cfg, cmd, title=None, priority=None, fail_priority=None,
 
 
 def cmd_watch(args):
-    cfg = Config()
+    try:
+        cfg = Config()
+    except SystemExit as exc:
+        # The command is what the user asked for; the push is extra. A broken
+        # config costs the push (said here), never the run or its exit code.
+        sys.stderr.write(f"{exc.code} - running the command without a notification\n")
+        cfg = None
     cmd = args.cmd
     if cmd and cmd[0] == "--":  # argparse.REMAINDER keeps the separator
         cmd = cmd[1:]
@@ -9101,7 +9221,26 @@ def build_parser():
     return parser
 
 
+def _safe_console():
+    """Replace what the console cannot show instead of crashing on it.
+
+    A Windows pipe or redirect gets the ANSI code page (cp1252 has no emoji),
+    and a lone surrogate (an undecodable byte in a path or argument) fits no
+    encoding: print() raised UnicodeEncodeError mid-command. Only streams
+    whose error handler can raise change; --json output is ASCII anyway.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if getattr(stream, "errors", None) not in ("strict", "surrogateescape",
+                                                   "surrogatepass"):
+            continue
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass      # not a reconfigurable text stream: leave it alone
+
+
 def main(argv=None):
+    _safe_console()
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
