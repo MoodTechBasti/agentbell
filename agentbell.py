@@ -1932,23 +1932,29 @@ def _read_bot_state():
 
 
 def _update_bot_state(**changes):
-    """Read-modify-write <state>/bot.json atomically. Keys set to None are removed."""
+    """Read-modify-write <state>/bot.json atomically. Keys set to None are removed.
+
+    A failed write costs one heartbeat, not the bot: Windows refuses to
+    replace a file that `ask` or `bot status` has open at that moment.
+    """
     data = _read_bot_state()
     for key, value in changes.items():
         if value is None:
             data.pop(key, None)
         else:
             data[key] = value
-    write_json_atomic(_bot_state_path(), data)
+    try:
+        write_json_atomic(_bot_state_path(), data)
+    except OSError as exc:
+        sys.stderr.write(f"{PROG}: could not update {_bot_state_path()}: {exc}\n")
     return data
 
 
 def write_bot_heartbeat(extra=None):
     now = time.time()
     state = _read_bot_state()
-    # `start` lets readers tell this bot from a later process with its pid
-    _update_bot_state(pid=os.getpid(), ts=now, start=_process_start_token() or None,
-                      started_at=state.get("started_at", now), **(extra or {}))
+    _update_bot_state(pid=os.getpid(), ts=now, started_at=state.get("started_at", now),
+                      **(extra or {}))
 
 
 def write_bot_error(message):
@@ -1963,109 +1969,12 @@ def bot_heartbeat_fresh(max_age=BOT_HEARTBEAT_MAX_AGE):
     A fresh timestamp is not enough: a daemon killed a second ago leaves one
     behind, and `ask` would attach buttons that nobody is listening for.
     """
-    data = _read_bot_state()
-    if not _bot_lock_is_live(data):
+    if not bot_running():
         return False
     try:
-        return (time.time() - float(data.get("ts", 0))) < max_age
+        return (time.time() - float(_read_bot_state().get("ts", 0))) < max_age
     except (ValueError, TypeError):
         return False
-
-
-def _pid_alive(pid):
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if os.name == "nt":
-        # os.kill(pid, 0) TERMINATES the process on Windows - it maps to
-        # TerminateProcess for every signal except CTRL_C/CTRL_BREAK_EVENT.
-        # Query the exit code instead.
-        try:
-            import ctypes
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
-            if not handle:
-                return False
-            try:
-                code = ctypes.c_ulong()
-                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                    return False
-                return code.value == 259  # STILL_ACTIVE
-            finally:
-                kernel32.CloseHandle(handle)
-        except Exception:  # noqa: BLE001 - never let a liveness probe raise
-            return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _process_start_token(pid=None):
-    """Start time of `pid` as an opaque string, or "" when this host has none.
-
-    It stays constant for the life of that process and changes when the
-    pid is reused, which a bare pid check cannot see. Linux: /proc/<pid>/stat
-    field 22. Windows: the creation time (Windows hands pids out again
-    quickly). macOS has none here, so the pid check alone decides there.
-    """
-    pid = os.getpid() if pid is None else pid
-    if os.name == "nt":
-        try:
-            import ctypes
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
-            if not handle:
-                return ""
-            try:
-                created, unused = ctypes.c_ulonglong(), ctypes.c_ulonglong()
-                if not kernel32.GetProcessTimes(handle, ctypes.byref(created),
-                                                ctypes.byref(unused), ctypes.byref(unused),
-                                                ctypes.byref(unused)):
-                    return ""
-                return str(created.value)
-            finally:
-                kernel32.CloseHandle(handle)
-        except Exception:  # noqa: BLE001 - never let a liveness probe raise
-            return ""
-    try:
-        with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8") as fh:
-            stat = fh.read()
-    except (OSError, ValueError):
-        return ""
-    # The command name is in parentheses and may itself contain spaces and
-    # parentheses, so the fields after the last ')' are what counts.
-    fields = stat.rpartition(")")[2].split()
-    # state is field 3, so field 22 is index 19 of what follows the comm.
-    if len(fields) <= 19:
-        return ""
-    return fields[19]
-
-
-def _bot_lock_is_live(data):
-    """True only when the recorded process is still that same process.
-
-    `data` is bot.lock or bot.json. The lock, `bot status`, `uninstall`,
-    `doctor` and `ask` all ask this; a bare pid check called a bot
-    "running" after its pid had gone to another program.
-    """
-    if not isinstance(data, dict):
-        return False
-    try:
-        pid = int(data.get("pid"))
-    except (TypeError, ValueError):
-        return False
-    if not _pid_alive(pid):
-        return False
-    recorded = data.get("start")
-    if not recorded:
-        return True
-    current = _process_start_token(pid)
-    if not current:
-        return True
-    return str(current) == str(recorded)
 
 
 def _bot_lock_path():
@@ -2081,48 +1990,90 @@ def _read_bot_lock(path=None):
     return data if isinstance(data, dict) else {}
 
 
+# What a lock held by someone else raises: EAGAIN/EWOULDBLOCK from flock,
+# EACCES from msvcrt.locking.
+_LOCK_BUSY = (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES)
+# Windows locks this byte, far past the pid record, so readers can still read it.
+_BOT_LOCK_BYTE = 1 << 20
+
+
+def _lock_bot_fd(fd, unlock=False):
+    """Take (or drop) the bot lock on `fd` without waiting; OSError when busy."""
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, _BOT_LOCK_BYTE, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def bot_running():
+    """Does an answer bot hold bot.lock right now? `bot status`, `uninstall`,
+    `doctor` and `ask` ask this; the pid in the file is only for people."""
+    try:
+        fd = os.open(_bot_lock_path(), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        _lock_bot_fd(fd)
+        _lock_bot_fd(fd, unlock=True)
+    except OSError as exc:
+        return exc.errno in _LOCK_BUSY
+    finally:
+        os.close(fd)
+    return False
+
+
 def acquire_bot_lock():
     """Exclusive lock so only one answer daemon polls getUpdates at a time.
 
-    Check and takeover run under a short mutex. Without it, two bots that
-    started together could both find the lock stale (or one found the
-    other's lock still empty), each removed the other's fresh lock, and
-    both ran.
+    A kernel lock on bot.lock, held until release_bot_lock() or the end of
+    the process, however it ends (SIGKILL, crash, power loss): it never goes
+    stale, and a pid that now belongs to another program cannot hold it.
+    Returns the descriptor that holds it.
     """
     ensure_state_dir()
     path = _bot_lock_path()
     try:
-        guard = _acquire_lock_dir(path + ".guard", "the bot lock")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as exc:
-        raise SystemExit(f"{PROG}: could not acquire bot lock at {path}: {exc}")
-    try:
-        data = _read_bot_lock()
-        if _bot_lock_is_live(data):
-            raise SystemExit(
-                f"{PROG}: another agentbell bot is already running (pid {data.get('pid')})"
-            )
-        # written whole in one step: a reader never sees an empty lock
-        write_json_atomic(path, {"pid": os.getpid(), "ts": time.time(),
-                                 "start": _process_start_token() or None}, mode=0o644)
-    except OSError as exc:
-        raise SystemExit(f"{PROG}: could not write bot lock {path}: {exc}")
-    finally:
+        raise SystemExit(f"{PROG}: could not open the bot lock {path}: {exc}")
+    deadline = time.monotonic() + 1.0      # bot_running() holds it for a moment
+    while True:
         try:
-            os.rmdir(guard)
-        except OSError:
-            pass
-    return path
-
-
-def release_bot_lock(path):
-    """Remove the lock if it is still ours; a later bot may own it by now."""
-    data = _read_bot_lock(path)
-    if (data.get("pid"), data.get("start")) != (os.getpid(), _process_start_token() or None):
-        return
+            _lock_bot_fd(fd)
+            break
+        except OSError as exc:
+            busy = exc.errno in _LOCK_BUSY
+            if busy and time.monotonic() < deadline:
+                time.sleep(0.05)
+                continue
+            os.close(fd)
+            if not busy:
+                raise SystemExit(f"{PROG}: could not lock the bot lock {path}: {exc}")
+            pid = _read_bot_lock(path).get("pid")
+            raise SystemExit(f"{PROG}: another agentbell bot is already running"
+                             + (f" (pid {pid})" if pid else ""))
     try:
-        os.remove(path)
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, json.dumps({"pid": os.getpid(), "ts": time.time()}).encode("utf-8"))
+    except OSError as exc:
+        release_bot_lock(fd)
+        raise SystemExit(f"{PROG}: could not write the bot lock {path}: {exc}")
+    return fd
+
+
+def release_bot_lock(fd):
+    """Let go of the bot lock. The emptied file stays: deleting it would let a
+    start that opened it a moment earlier lock a file nobody else can see."""
+    try:
+        os.ftruncate(fd, 0)            # `bot status`: stopped, not crashed
+        _lock_bot_fd(fd, unlock=True)
     except OSError:
-        pass
+        pass                           # closing the descriptor releases it too
+    os.close(fd)
 
 
 def publish_with_retry(fn, attempts=None, deadline=None):
@@ -6427,6 +6378,17 @@ def purge_report(project=None):
             "are NOT unset by this command (remove them from your shell rc yourself)"
         )
 
+    # 0. The bot service first: left enabled, it restarts the binary
+    #    removed below every 10 s
+    service = launchd_plist_path() if sys.platform == "darwin" else systemd_unit_path()
+    if os.path.exists(service):
+        entries.append({
+            "kind": "service", "label": f"bot service {service}",
+            "action": ("launchctl unload, then delete the plist" if sys.platform == "darwin"
+                       else "systemctl --user disable --now agentbell-bot, then delete the unit"),
+            "apply": lambda p=service: _remove_bot_service(p),
+        })
+
     # 1. CLI entry (pipx / pip --user / standalone copy)
     pipx = _pipx_installed(warnings)
     seen_paths = set()
@@ -6546,10 +6508,9 @@ def purge_report(project=None):
     entries.extend(_mcp_entries(project))
 
     # 5. A running bot would recreate state files; warn but do not kill it
-    lock = _read_bot_lock()
-    if _bot_lock_is_live(lock):
+    if bot_running():
         warnings.append(
-            f"an agentbell bot is running (pid {lock.get('pid')}); stop it first, "
+            f"an agentbell bot is running (pid {_read_bot_lock().get('pid')}); stop it first, "
             "otherwise it will recreate state files"
         )
 
@@ -6942,15 +6903,15 @@ def run_bot(cfg, poll_timeout=25):
     tg = cfg.data.get("telegram", {})
     if not cfg.telegram_ready():
         raise SystemExit(f"{PROG}: Telegram is not configured. Run 'agentbell init' first.")
-    lock_path = acquire_bot_lock()
+    lock = acquire_bot_lock()
     write_bot_heartbeat()
     print(f"{PROG}: Telegram answer bot running (chat {tg.get('chat_id')}). Ctrl-C to stop.")
     offset = None
     # A service stop (systemctl stop, launchctl unload, a plain kill) sends
     # SIGTERM. That is the same request as Ctrl-C: release the lock, exit 0.
-    # Without a handler the lock stayed behind; exiting 143 instead left the
-    # systemd unit "failed", and Restart=on-failure restarted the bot that
-    # had just been stopped on purpose.
+    # Exiting 143 instead left the systemd unit "failed", and
+    # Restart=on-failure restarted the bot that had just been stopped on
+    # purpose.
     term_installed = False
     previous_term = None
 
@@ -6974,20 +6935,21 @@ def run_bot(cfg, poll_timeout=25):
                 write_bot_error(message)
                 time.sleep(5)
             # The daemon is a natural drain point - but answering approvals
-            # comes first, so one cycle's drain is capped well inside the
-            # heartbeat window instead of blocking on a long backlog.
+            # comes first, so one cycle's drain (queued and deferred items
+            # together) is capped well inside the heartbeat window instead
+            # of blocking on a long backlog or a hung server.
             try:
-                drain_queue(cfg, limit=None,
-                            deadline=time.time() + BOT_DRAIN_BUDGET_SECONDS)
-                flush_deferred(cfg)
+                budget = time.time() + BOT_DRAIN_BUDGET_SECONDS
+                drain_queue(cfg, limit=None, deadline=budget)
+                if time.time() < budget:
+                    flush_deferred(cfg, deadline=budget)
             except Exception:  # noqa: BLE001
                 pass
             write_bot_heartbeat()
     except KeyboardInterrupt:
         print(f"\n{PROG}: bot stopped. Telegram buttons are inactive until you start it again.")
     finally:
-        # release the lock so the next start does not have to reclaim it
-        release_bot_lock(lock_path)
+        release_bot_lock(lock)
         if term_installed:
             try:
                 signal.signal(signal.SIGTERM, previous_term)
@@ -7079,31 +7041,29 @@ def print_bot_status(cfg):
         return
     print(f"telegram:  configured (chat {cfg.data['telegram'].get('chat_id')})")
     data = _read_bot_state()
+    running = bot_running()
     if data:
         pid = data.get("pid")
         age = time.time() - float(data.get("ts", 0))
-        pid_alive = _bot_lock_is_live(data)
-        if pid_alive and age < BOT_HEARTBEAT_MAX_AGE:
+        if running and age < BOT_HEARTBEAT_MAX_AGE:
             print(f"bot:       running (pid {pid}, heartbeat {int(age)}s ago)")
-        elif pid_alive:
+        elif running:
             print(f"bot:       running but heartbeat stale (pid {pid}, {int(age)}s ago)")
         else:
             print(f"bot:       NOT running (last heartbeat {int(age)}s ago, pid {pid})")
         if data.get("last_error"):
             print(f"last error: {data['last_error']}")
+    elif running:
+        print("bot:       running (no heartbeat yet)")
     else:
         print("bot:       NOT running (start with 'agentbell bot')")
-    lock_path = _bot_lock_path()
-    if os.path.exists(lock_path):
-        lock = _read_bot_lock(lock_path)
-        lock_pid = lock.get("pid")
-        if _bot_lock_is_live(lock):
-            if str(lock_pid) == str(data.get("pid")):
-                print(f"lock:      held by the running bot (pid {lock_pid})")
-            else:
-                print(f"lock:      held by another live process (pid {lock_pid})")
-        else:
-            print(f"lock:      stale (the bot with pid {lock_pid} is gone) - a new bot can start")
+    # a bot that stopped empties the lock file; one that died leaves its pid
+    lock_pid = _read_bot_lock().get("pid")
+    if running:
+        print(f"lock:      held by the running bot (pid {lock_pid})")
+    elif lock_pid:
+        print(f"lock:      stale (left by pid {lock_pid}, which no longer holds it) "
+              "- a new bot can start")
     else:
         print("lock:      none")
     pending = []
@@ -8868,14 +8828,17 @@ def cmd_watch(args):
     raise SystemExit(result["exit_code"])
 
 
+# Type=exec: `systemctl start` fails when the command cannot be executed.
+# Type=simple reported success, and the unit then restarted every 10 s.
 SYSTEMD_UNIT = """\
 [Unit]
 Description=agentbell Telegram answer daemon
 After=network-online.target
 
 [Service]
-Type=simple
-ExecStart="{binary}" bot run
+Type=exec
+ExecStart={command} bot run
+{environment}
 Restart=on-failure
 RestartSec=10
 
@@ -8891,7 +8854,8 @@ LAUNCHD_PLIST = """\
 <dict>
   <key>Label</key><string>com.agentbell.bot</string>
   <key>ProgramArguments</key>
-  <array><string>{binary}</string><string>bot</string><string>run</string></array>
+  <array>{arguments}<string>bot</string><string>run</string></array>
+  <key>EnvironmentVariables</key><dict>{environment}</dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
 </dict>
@@ -8907,6 +8871,11 @@ def systemd_unit_path():
 def launchd_plist_path():
     return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents",
                         "com.agentbell.bot.plist")
+
+
+def _systemd_quote(value):
+    """One quoted word of a unit file line (\\ and " escaped, % not a specifier)."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
 def _write_service_file(path, content):
@@ -8935,24 +8904,36 @@ def install_bot_service():
     (path, started, note): `note` is how to check on it, or, when the
     service did not start, what went wrong and what to do instead.
     """
-    binary = agentbell_binary()
+    # agentbell.py from a checkout is not executable: run it with python
+    command = agentbell_command()
     if sys.platform.startswith("win"):
         raise SystemExit(f"{PROG}: no service installer for Windows yet. Keep 'agentbell bot' "
                          "running in a terminal, or run it under WSL.")
+    # A service does not see this shell's AGENTBELL_* or XDG_* variables:
+    # pin the config and state it uses, or the bot reads another config and
+    # `ask` never sees its heartbeat.
+    environment = {CONFIG_FILE_ENV: os.path.abspath(config_path()),
+                   STATE_DIR_ENV: os.path.abspath(state_dir())}
     if sys.platform == "darwin":
         # a path with & or < in it would otherwise produce an invalid plist
         from xml.sax.saxutils import escape as xml_escape      # only macOS needs it
-        path, content = launchd_plist_path(), LAUNCHD_PLIST.format(binary=xml_escape(binary))
+        path, content = launchd_plist_path(), LAUNCHD_PLIST.format(
+            arguments="".join(f"<string>{xml_escape(arg)}</string>" for arg in command),
+            environment="".join(f"<key>{key}</key><string>{xml_escape(value)}</string>"
+                                for key, value in environment.items()))
     else:
-        path, content = systemd_unit_path(), SYSTEMD_UNIT.format(binary=binary)
+        path, content = systemd_unit_path(), SYSTEMD_UNIT.format(
+            command=" ".join(_systemd_quote(arg).replace("$", "$$") for arg in command),
+            environment="\n".join(f"Environment={_systemd_quote(f'{key}={value}')}"
+                                  for key, value in environment.items()))
     try:
         _write_service_file(path, content)
     except OSError as exc:
         raise SystemExit(f"{PROG}: could not write the service file {path}: {exc}")
     if sys.platform == "darwin":
         # unloading a job that is not loaded fails, and that is fine
-        subprocess.run(["launchctl", "unload", path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        _run_service_step(["launchctl", "unload", path],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         problem = _run_service_step(["launchctl", "load", path], stdout=subprocess.DEVNULL)
         if problem:
             return path, False, f"{problem}. The plist is in place; see the error above."
@@ -8962,13 +8943,43 @@ def install_bot_service():
     if not shutil.which("systemctl") or not os.path.isdir("/run/systemd/system"):
         return path, False, ("systemd is not running here (WSL without systemd, or a container). "
                              "Start the bot from your shell profile instead:\n"
-                             f"    nohup {shlex.quote(binary)} bot run >/dev/null 2>&1 &")
+                             f"    nohup {shlex.join(command)} bot run >/dev/null 2>&1 &")
+    # restart, not start: a bot that is already running (an older version,
+    # or the old unit) must run the unit just written
     problem = (_run_service_step(["systemctl", "--user", "daemon-reload"])
-               or _run_service_step(["systemctl", "--user", "enable", "--now", "agentbell-bot"]))
+               or _run_service_step(["systemctl", "--user", "enable", "agentbell-bot"])
+               or _run_service_step(["systemctl", "--user", "restart", "agentbell-bot"]))
     if problem:
         return path, False, (f"{problem}. The unit file is in place; after fixing the error "
                              "above, run:\n    systemctl --user enable --now agentbell-bot")
     return path, True, "systemctl --user status agentbell-bot"
+
+
+def _remove_bot_service(path):
+    """Stop and disable the bot service, then delete its file (uninstall).
+
+    Left in place, the enabled unit restarts a deleted binary every 10 s.
+    """
+    systemd = (sys.platform != "darwin" and shutil.which("systemctl")
+               and os.path.isdir("/run/systemd/system"))
+    problem = None
+    if sys.platform == "darwin":
+        # not loaded is fine: without its plist launchd never starts it again
+        _run_service_step(["launchctl", "unload", path],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif systemd:
+        problem = _run_service_step(["systemctl", "--user", "disable", "--now", "agentbell-bot"])
+    # the link `disable` removes, in case it could not run
+    wants = os.path.join(os.path.dirname(path), "default.target.wants", os.path.basename(path))
+    for leftover in (wants, path):
+        if os.path.lexists(leftover):
+            os.remove(leftover)
+    if systemd:
+        problem = problem or _run_service_step(["systemctl", "--user", "daemon-reload"])
+    if problem:
+        raise RuntimeError(f"{problem}; the service file is deleted, but a bot it started "
+                           "may still run: systemctl --user stop agentbell-bot")
+    return True
 
 
 def cmd_bot(args):
@@ -8982,6 +8993,10 @@ def cmd_bot(args):
         # licensed users to 'init' and unlicensed ones nowhere
         if not premium_enabled(cfg):
             raise SystemExit(f"{PROG}: {LICENSE_PREMIUM_MSG}")
+        if not check_license_key(cfg.data.get("license")):
+            # the key is only in this shell's environment
+            raise SystemExit(f"{PROG}: the service will not see {LICENSE_ENV}. Store the key "
+                             "in the config first: agentbell license activate <key>")
         if not cfg.telegram_ready():
             raise SystemExit(f"{PROG}: Telegram is not configured. Run: agentbell init")
         path, started, note = install_bot_service()

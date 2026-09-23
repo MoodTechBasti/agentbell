@@ -126,7 +126,7 @@ class TestSharedDirsM10(_UninstallFixture):
         an.write_start_marker("claude", session_id="s1")
         an.claim_hook_send("claude", "run_completed", "m", window=60)
         an.write_bot_heartbeat()
-        an.acquire_bot_lock()
+        an.release_bot_lock(an.acquire_bot_lock())
         an.write_tg_answer("a1", "yes")
         an.write_tg_pending("a1", "q?", 60)
         an.write_ntfy_pending("a2", "q?", 60)

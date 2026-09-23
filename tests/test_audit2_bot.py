@@ -110,7 +110,9 @@ class TestBotStopsCleanlyOnSigterm(unittest.TestCase):
             out, err = child.communicate(timeout=30)
             self.assertEqual(child.returncode, 0, f"stdout={out!r} stderr={err!r}")
             self.assertIn("bot stopped", out)
-            self.assertFalse(os.path.exists(os.path.join(state, "bot.lock")))
+            # released: the file stays, emptied (a clean stop, not a crash)
+            with open(os.path.join(state, "bot.lock"), encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "")
         finally:
             if "child" in locals() and child.poll() is None:
                 child.kill()
@@ -122,15 +124,16 @@ class TestBotStopsCleanlyOnSigterm(unittest.TestCase):
         # a non-zero exit (crash) restarts; the exit 0 of a requested stop
         # does not - under systemd and under launchd alike
         self.assertIn("Restart=on-failure", an.SYSTEMD_UNIT)
-        plist = plistlib.loads(
-            an.LAUNCHD_PLIST.format(binary="/opt/agentbell/bin/agentbell").encode("utf-8"))
+        plist = plistlib.loads(an.LAUNCHD_PLIST.format(
+            arguments="<string>/opt/agentbell/bin/agentbell</string>",
+            environment="").encode("utf-8"))
         self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
         self.assertTrue(plist["RunAtLoad"])
         self.assertEqual(plist["ProgramArguments"][1:], ["bot", "run"])
 
 
 class TestBotLivenessIgnoresReusedPids(base._TelegramFixture):
-    """A5: status, uninstall, doctor and ask use the lock's start token."""
+    """A5: status, uninstall, doctor and ask ask the bot lock, not a pid."""
 
     def setUp(self):
         super().setUp()
@@ -150,8 +153,8 @@ class TestBotLivenessIgnoresReusedPids(base._TelegramFixture):
             an.print_bot_status(self._tg_cfg())
         return out.getvalue()
 
-    @unittest.skipUnless(an._process_start_token(), "needs /proc start times (Linux)")
     def test_a_reused_pid_is_not_a_running_bot(self):
+        # the pid of a live process (this one) that holds no bot lock
         record = {"pid": os.getpid(), "ts": time.time(), "start": "not-this-process"}
         an.write_json_atomic(an._bot_state_path(), record)
         an.write_json_atomic(_lock_path(), record)
@@ -162,14 +165,13 @@ class TestBotLivenessIgnoresReusedPids(base._TelegramFixture):
         self.assertFalse(any("bot is running" in w for w in an.purge_report()["warnings"]))
 
     def test_the_live_bot_is_still_reported(self):
+        self.addCleanup(an.release_bot_lock, an.acquire_bot_lock())
         an.write_bot_heartbeat()
-        an.acquire_bot_lock()
         status = self._status()
         self.assertIn("bot:       running", status)
         self.assertIn("lock:      held by the running bot", status)
         self.assertTrue(an.bot_heartbeat_fresh())
         self.assertTrue(any("bot is running" in w for w in an.purge_report()["warnings"]))
-        self.assertEqual(an._read_bot_state().get("start"), an._process_start_token() or None)
 
 
 class TestBotLockRace(unittest.TestCase):
@@ -183,44 +185,20 @@ class TestBotLockRace(unittest.TestCase):
 
     def test_two_starts_over_a_stale_lock_do_not_both_win(self):
         an.write_json_atomic(_lock_path(), {"pid": 99999999, "start": "gone"})
-        real_is_live = an._bot_lock_is_live
-        results = []
-        other = []
+        first = an.acquire_bot_lock()
+        try:
+            with self.assertRaises(SystemExit) as refused:
+                an.acquire_bot_lock()
+            self.assertIn(f"already running (pid {os.getpid()})", str(refused.exception.code))
+        finally:
+            an.release_bot_lock(first)
 
-        def acquire(who):
-            try:
-                results.append((who, an.acquire_bot_lock()))
-            except SystemExit as exc:
-                results.append((who, exc))
-
-        def interleaved(data):
-            # the first start has just read the stale lock; the second one
-            # runs now, before the first decides and takes over
-            if not other:
-                other.append(threading.Thread(target=acquire, args=("second",)))
-                other[0].start()
-                other[0].join(timeout=0.5)
-            return real_is_live(data)
-
-        with unittest.mock.patch.object(an, "_bot_lock_is_live", side_effect=interleaved):
-            acquire("first")
-            other[0].join(timeout=10)
-        self.assertFalse(other[0].is_alive())
-        winners = [who for who, outcome in results if isinstance(outcome, str)]
-        losers = [outcome for _who, outcome in results if isinstance(outcome, SystemExit)]
-        self.assertEqual(len(winners), 1, results)
-        self.assertEqual(len(losers), 1, results)
-        self.assertFalse(os.path.exists(_lock_path() + ".guard"))
-
-    def test_release_keeps_a_lock_that_another_bot_took_over(self):
-        path = _lock_path()
-        an.write_json_atomic(path, {"pid": 99999999, "start": "someone-else"})
-        an.release_bot_lock(path)
-        self.assertTrue(os.path.exists(path))
-        os.remove(path)
-        path = an.acquire_bot_lock()
-        an.release_bot_lock(path)
-        self.assertFalse(os.path.exists(path))
+    def test_a_released_lock_lets_the_next_bot_start(self):
+        an.release_bot_lock(an.acquire_bot_lock())
+        with open(_lock_path(), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "")     # stopped, not crashed
+        self.assertFalse(an.bot_running())
+        an.release_bot_lock(an.acquire_bot_lock())
 
 
 @unittest.skipIf(os.name == "nt", "no service installer on Windows (by design)")
@@ -236,6 +214,7 @@ class TestInstallServiceReportsFailure(unittest.TestCase):
         for patch in (
             unittest.mock.patch.object(an, "Config", lambda *a, **k: cfg),
             unittest.mock.patch.object(an, "premium_enabled", lambda cfg: True),
+            unittest.mock.patch.object(an, "check_license_key", lambda key: True),
             # never the real systemctl/launchctl of this machine
             unittest.mock.patch.object(an.subprocess, "run", self._fake_run),
         ):
@@ -293,7 +272,7 @@ class TestInstallServiceReportsFailure(unittest.TestCase):
         with self._systemd(), unittest.mock.patch.object(an.subprocess, "run", run):
             code, _out, err = self._install()
         self.assertEqual(code, 1)
-        self.assertIn("enable --now agentbell-bot' failed (exit 1)", err)
+        self.assertIn("'systemctl --user enable agentbell-bot' failed (exit 1)", err)
 
     def test_missing_systemctl_binary_is_an_error(self):
         def run(cmd, *args, **kwargs):
@@ -336,7 +315,8 @@ class TestInstallServiceReportsFailure(unittest.TestCase):
             code, out, err = self._install()
         self.assertEqual(code, 0, err)
         self.assertIn("enabled and started", out)
-        self.assertIn(["systemctl", "--user", "enable", "--now", "agentbell-bot"], self.calls)
+        self.assertIn(["systemctl", "--user", "enable", "agentbell-bot"], self.calls)
+        self.assertIn(["systemctl", "--user", "restart", "agentbell-bot"], self.calls)
 
 
 class TestTypedApproveIsNotAButton(base._TelegramFixture):
@@ -477,7 +457,7 @@ class TestTelegram409IsReportedAccurately(base._TelegramFixture):
         self.assertIn("another program is polling this bot token", err.getvalue())
         self.assertNotIn("webhook", err.getvalue())
         self.assertIn("another program is polling", an._read_bot_state()["last_error"])
-        self.assertFalse(os.path.exists(_lock_path()))
+        self.assertFalse(an.bot_running())
         _remove_bot_files()
 
 

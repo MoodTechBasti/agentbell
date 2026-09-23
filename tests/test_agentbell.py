@@ -2321,6 +2321,7 @@ class TestTelegramAsk(_TelegramFixture):
 
     def test_ask_with_bot_alive_attaches_keyboard(self):
         cfg = self._tg_cfg()
+        self.addCleanup(an.release_bot_lock, an.acquire_bot_lock())    # a running bot
         an.write_bot_heartbeat()
         before = len(self.tg.requests)
         holder = {}
@@ -2490,30 +2491,24 @@ class TestBotDaemon(_TelegramFixture):
         self.assertEqual(answered["body"]["text"], "unknown action")
 
     def test_heartbeat_and_lock(self):
+        lock = an.acquire_bot_lock()
         an.write_bot_heartbeat()
         self.assertTrue(an.bot_heartbeat_fresh())
-        path = an.acquire_bot_lock()
-        self.assertTrue(os.path.exists(path))
         with self.assertRaises(SystemExit):
             an.acquire_bot_lock()  # our own fresh lock -> "already running"
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        an.release_bot_lock(lock)
+        self.assertFalse(an.bot_heartbeat_fresh())
 
-    @unittest.skipUnless(an._process_start_token(),
-                         "no process start time on this OS; the pid check decides")
     def test_a_reused_pid_does_not_keep_the_lock(self):
         """SIGKILL leaves the lock. The pid can belong to something else."""
         path = os.path.join(an.state_dir(), "bot.lock")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({"pid": os.getpid(), "start": "not-this-process"}, fh)
-        acquired = an.acquire_bot_lock()
-        self.assertEqual(acquired, path)
+        lock = an.acquire_bot_lock()
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        self.assertNotEqual(data.get("start"), "not-this-process")
-        os.remove(path)
+        self.assertNotIn("start", data)
+        an.release_bot_lock(lock)
 
 
 class TestAskParallelChannels(_TelegramFixture):
@@ -3408,6 +3403,7 @@ class TestPurge(unittest.TestCase):
 class TestBotStatus(_TelegramFixture):
     def test_status_running(self):
         cfg = self._tg_cfg()
+        self.addCleanup(an.release_bot_lock, an.acquire_bot_lock())    # a running bot
         an.write_bot_heartbeat()
         import io as _io
         from contextlib import redirect_stdout
@@ -3415,7 +3411,7 @@ class TestBotStatus(_TelegramFixture):
         with redirect_stdout(buffer):
             an.print_bot_status(cfg)
         out = buffer.getvalue()
-        self.assertIn("running", out)
+        self.assertIn("bot:       running (pid", out)
         self.assertIn("lock", out)
 
     def test_status_stale_lock_and_error(self):
@@ -4356,9 +4352,10 @@ class TestAuditRegressions(unittest.TestCase):
             ntfy.stop()
 
     def test_dead_daemon_means_no_dead_buttons(self):
+        lock = an.acquire_bot_lock()
         an.write_bot_heartbeat()
         self.assertTrue(an.bot_heartbeat_fresh())
-        an._update_bot_state(pid=999999)      # fresh timestamp, dead pid
+        an.release_bot_lock(lock)             # fresh timestamp, no bot any more
         self.assertFalse(an.bot_heartbeat_fresh())
         try:
             os.remove(an._bot_state_path())
