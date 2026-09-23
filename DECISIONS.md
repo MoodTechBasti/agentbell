@@ -42,26 +42,32 @@
 
 | Agent | Mechanism | Why |
 |-------|-----------|-----|
-| Claude Code | `~/.claude/settings.json` `hooks` (`UserPromptSubmit`, `Stop`, `StopFailure`, `Notification(agent_needs_input)`), `async: true` | Real shell hooks, documented; event names verified against Claude Code 2.1.232. Async so network latency never blocks a turn. `UserPromptSubmit` only writes a start marker (`--silent`) so the completion push can report the turn duration. |
+| Claude Code | `~/.claude/settings.json` `hooks` (`UserPromptSubmit`, `Stop`, `StopFailure`, `Notification(agent_needs_input)`, since 1.7.0 also `Notification(permission_prompt)`), `async: true` | Real shell hooks, documented; event names verified against Claude Code 2.1.232. Async so network latency never blocks a turn. `UserPromptSubmit` only writes a start marker (`--silent`) so the completion push can report the turn duration. The `permission_prompt` matcher (runs `hook permission_required`) comes from Claude Code's hooks documentation (checked 2026-09-23); it is wired and covered by tests, but not yet field-tested with a real Claude Code session. Existing installs get it only by re-running `hooks install claude`. |
 | Codex | `~/.codex/config.toml` `hooks.UserPromptSubmit` + `hooks.Stop` | Codex supports lifecycle hooks in config.toml (events verified against Codex 0.147.0). We append TOML array-of-tables blocks guarded by markers so user config is never rewritten. Hooks are enabled by default; `features.hooks = true` is written only when it cannot conflict with an existing `[features]` table, and the note now says so instead of claiming hooks are off. `SessionEnd` was considered but dropped: it fires on every exit (including `/clear`) and would spam. |
 | Gemini CLI | `~/.gemini/settings.json` `hooks.AfterAgent` | Fires once per turn after the final response — the correct "done" event. No failure event exists; documented. |
 | OpenCode | plugin in `~/.config/opencode/plugin/agentbell.js` (**v1.3.0**, was an `AGENTS.md` block) | OpenCode has a real plugin bus (`event` hook). Deterministic beats "please call the CLI": `session.idle` → run_completed, `session.error` → run_failed, `permission.asked` → permission_required. Verified against OpenCode 1.18.18. |
 | Kimi Code | `~/.kimi-code/config.toml` `[[hooks]]` (v1.4.0) | Real lifecycle hooks (`UserPromptSubmit`/`Stop`/`StopFailure`), event names re-verified against moonshotai.github.io/kimi-code (2026-08; the kimi-cli docs are being wound down in favor of Kimi Code CLI). Kimi only accepts the four fields `event`/`matcher`/`command`/`timeout` in a `[[hooks]]` table — anything else (e.g. `async`) makes it refuse to load the whole config, so the block is kept to exactly those keys. |
 | Qwen Code | `~/.qwen/settings.json` `hooks` (v1.4.0) | Speaks Claude's hooks.json format (`UserPromptSubmit`/`Stop`/`StopFailure`, no matcher on these events). Command hooks support `async: true` (re-verified against qwenlm.github.io/qwen-code-docs, 2026-08), which is used so a notification send never blocks the end of a turn. Hooks are enabled by default; `disableAllHooks: true` disables them. |
-| Cursor | `.cursor/rules/agentbell.mdc` (alwaysApply rule) | Cursor has no lifecycle shell hooks. A rule that instructs the agent to call the CLI is the standard, reliable mechanism. This is the one file we own outright, so it is written verbatim — a `.mdc` must begin with its YAML frontmatter, and the marker-block wrapper used for shared files broke it (fixed in v1.3.0). Format re-verified against cursor.com/docs/context/rules (2026-08): `.mdc` + `alwaysApply: true`. |
+| Cursor | `.cursor/rules/agentbell.mdc` (alwaysApply rule) | Cursor had no lifecycle shell hooks when this was decided. *(It has since documented hooks of its own, `~/.cursor/hooks.json`; agentbell does not use them yet and still installs the rule, per project.)* A rule that instructs the agent to call the CLI is the standard, reliable mechanism. This is the one file we own outright, so it is written verbatim — a `.mdc` must begin with its YAML frontmatter, and the marker-block wrapper used for shared files broke it (fixed in v1.3.0). Format re-verified against cursor.com/docs/context/rules (2026-08): `.mdc` + `alwaysApply: true`. |
 | Windsurf | `.windsurf/rules/agentbell.md` + legacy `.mdc` (v1.4.0, fixed v1.4.1) | Windsurf/Devin Desktop's rule engine changed: current builds read `.windsurf/rules/*.md` (or `.devin/rules/*.md`, preferred) with a `trigger: always_on` frontmatter (docs.windsurf.com/windsurf/cascade/memories, 2026-08); pre-Devin builds only knew Cursor-style `.mdc`. One install writes **both** files so every build picks the rule up; uninstall removes only files we own. |
-| Cline | `.clinerules/agentbell.md` (v1.4.0) | `clinerules/` directory, markdown rules — Cline processes every `.md`/`.txt` in it. |
+| Cline | `.clinerules/agentbell.md` (v1.4.0) | `clinerules/` directory, markdown rules — Cline processes every `.md`/`.txt` in it. Since 1.7.0, a project that has an older single `.clinerules` *file* gets a marked block inside that file instead (Cline still reads it; creating the directory crashed with `FileExistsError`). Uninstall removes only the block and never deletes the user's file. |
 | Continue | `.continue/rules/agentbell.md` (v1.4.0) | `rules/` directory inside the repo `.continue/`, markdown. |
 | Zed | `.rules` block at repo root (v1.4.0) | Zed reads exactly one file per repo: `.rules` > `.cursorrules` > `.windsurfrules` > `.clinerules` > `.github/copilot-instructions.md` > `AGENT.md` > `AGENTS.md` > `CLAUDE.md` > `GEMINI.md`. Writing `.rules` is the highest-priority single-file option; our marker block is appended so a hand-written `.rules` keeps its own content. |
 | Aider | `AGENTS.md` block at repo root (v1.4.0) | Aider auto-reads `AGENTS.md` (since v0.69) — no config change needed. `CONVENTIONS.md` would require a `read:` line in `.aider.conf.yml`, so `AGENTS.md` was chosen. Status is marked by the `--agent aider` command, so a legacy OpenCode `AGENTS.md` block does not count as installed. |
 
-All installers merge JSON (preserving user keys), append marked TOML/markdown blocks, are idempotent, and `uninstall` removes exactly what was added (identified by the `agentbell hook` command marker / comment blocks). Since v1.4.0 they all live in one `AGENT_SPECS` registry (detect / install / status) that drives `find_agents()`, `install_hooks()`, `hooks_status()` and the purge scan.
+All installers merge JSON (preserving user keys), append marked TOML/markdown blocks, are idempotent, and `uninstall` removes exactly what was added (identified by the `agentbell hook` command marker / comment blocks). Since v1.4.0 they all live in one `AGENT_SPECS` registry (detect / install / status) that drives `find_agents()`, `install_hooks()`, `hooks_status()` and the purge scan. *(Ownership is narrower since 1.7.0: an entry is agentbell's only in the exact shape and place agentbell writes it, §33, and the bytes of the host file around it are kept, §34.)*
 
-**Decision:** hooks call `agentbell hook <event>` (silent, fast, 5s network timeout, never fails the agent) rather than `notify` — hooks must not print to stdout or block agent turns.
+**Decision:** hooks call `agentbell hook <event>` (silent, fast, never fails the agent) rather than `notify` — hooks must not print to stdout or block agent turns. Each network attempt has a 5 s timeout. Since 1.7.0 all sending in one hook, retries and queue replay included, fits a 6 s budget, and what does not fit is queued (§32). A hook that fails still exits 0, but leaves a `hook.error` history record and one stderr line instead of vanishing.
 
-**Decision:** the canonical event set is fixed — `run_completed`, `run_failed`, `input_required`, `permission_required`, `started` — with short aliases (`done`, `failed`, `needs-input`, …) kept for convenience. `permission_required` exists as an event (CLI + MCP + custom scripts) but is *not* wired into agent hooks by default: per-turn permission prompts would spam the phone (opt-in principle).
+**Decision:** the canonical event set is fixed — `run_completed`, `run_failed`, `input_required`, `permission_required`, `started` — with short aliases (`done`, `failed`, `needs-input`, …) kept for convenience. `permission_required` is wired where the host has a permission event of its own: the OpenCode plugin maps `permission.asked` to it (since v1.3.0), and since 1.7.0 the Claude Code hooks map `Notification(permission_prompt)` to it (wired, not yet field-tested). Codex, Gemini CLI, Kimi Code and Qwen Code have no permission event wired. It remains available to the CLI, MCP and custom scripts. *(An earlier version of this paragraph said it was not wired into any agent hook; that was already wrong for OpenCode.)*
 
 ## 4. Approval flow: ntfy response-topic roundtrip (no public server)
+
+**Superseded in part by §22 and §30.** The transport below is current. The
+answer contract is not: exit codes are 0 approved or answered, 1 denied,
+2 timeout and 3 runtime error, and `approved` is true only for an explicit
+yes (§22). A typed reply is used only when exactly one question can be on
+the phone (§30).
 
 **Decision:** `ask` publishes the question to the main topic with ntfy **action buttons** whose HTTP action POSTs the answer to a dedicated `<topic>-responses` topic. `ask` waits for the first message on that topic using a **hybrid receiver**: a live JSON stream (fast path) plus short `poll=1&since=<ts>` requests every ~4s (fallback), deduplicated by message id. Exit 0/1/2 = approved/denied/timeout; free-text replies are passed through as the answer.
 
@@ -71,9 +77,14 @@ All installers merge JSON (preserving user keys), append marked TOML/markdown bl
 
 **Why a dedicated responses topic instead of the main topic?** The main topic carries other traffic (every hook event); a dedicated topic makes "first message = answer" unambiguous. Cost: user subscribes to two topics in the app (the wizard prints both).
 
-**Security note:** on public ntfy.sh, anyone who guesses the topic name can publish to it (both main and responses). For sensitive approvals, self-host ntfy with auth — publish/subscribe/actions all carry the configured Basic auth header. Since v1.2 the wizard suggests a 128-bit random topic by default (plus the username prefix), which makes guessing impractical; the README still recommends self-hosted ntfy + auth for sensitive approvals.
+**Security note:** on public ntfy.sh, anyone who guesses the topic name can publish to it (both main and responses). For sensitive approvals, self-host ntfy with auth — publish and subscribe carry the configured `ntfy.auth` header. The action buttons do not: a button's headers are published inside the message, so they carry only `ntfy.action_auth` (a token that may publish to the response topic), and on a protected server without `action_auth` the question goes out without buttons (§12i). Since v1.2 the wizard suggests a 128-bit random topic by default (plus the username prefix), which makes guessing impractical; the README still recommends self-hosted ntfy + auth for sensitive approvals.
 
 ### 4b. Request-ID model (v1.2)
+
+**Superseded in part by §30.** The request id and the id-bound buttons are
+current. The free-text rule is not: a typed reply no longer goes to the
+newest open ask. It is used only when exactly one ask can still be on the
+phone, and refused with a notice otherwise.
 
 **Decision:** every `ask` carries a 64-bit random approval id (`secrets.token_hex(8)`). ntfy button bodies and Telegram `callback_data` embed it (`APPROVED <id>` / `agentbell|<id>|approved`). Both answer paths bind answers to that id: button answers with a non-matching or unknown id are ignored and logged (`stale_answer` history events; Telegram answers expired callbacks politely). Free-text replies cannot carry an id on either platform, so they are attributed **deterministically to the newest open ask**: each waiting `ask` registers itself in `<state>/ntfy-pending`/`tg-pending` before publishing and unregisters when done; a waiter only accepts free text if it is the newest unexpired entry.
 
@@ -85,7 +96,7 @@ All installers merge JSON (preserving user keys), append marked TOML/markdown bl
 
 ## 5. Quiet hours & priority semantics
 
-**Decision:** quiet windows are time ranges (`22:00-07:30`, overnight wrap supported); during them, notifications below `quiet_hours_min_priority` (default `normal`) are handled per `quiet_hours_mode`: **`suppress`** (default, drop + history) or **`defer`** (store in `<state>/deferred/` and deliver after the window ends). `--force` bypasses both modes; `--defer` on `notify` defers a single call even in suppress mode; `ask` always publishes at high priority and is **never** deferred or suppressed — approvals must not be swallowed.
+**Decision:** quiet windows are time ranges (`22:00-07:30`, overnight wrap supported); during them, notifications below `quiet_hours_min_priority` (default `normal`) are handled per `quiet_hours_mode`: **`suppress`** (default, drop + history) or **`defer`** (store in `<state>/deferred/` and deliver after the window ends). `--force` bypasses both modes; `--defer` on `notify` defers a single call even in suppress mode; `ask` always publishes at high priority and is **never** deferred or suppressed — approvals must not be swallowed. `quiet_hours_min_priority` takes 1–5 or the names `min` … `urgent` (names since 1.7.0; a hand-edited name used to make every send fail).
 
 **Defer delivery:** deferred items are delivered by the next notification activity after the window ends (`notify`/hook/`watch`/webhook), by `agentbell queue flush`, or immediately by the bot daemon if it runs. More than 3 due items are **bundled into one summary notification** ("N deferred notifications") to avoid an inbox flood at 07:30; up to 3 are replayed individually. If quiet hours are still active at flush time (e.g. the window moved), items are re-deferred instead of delivered. A transient delivery failure moves the item into the offline queue instead of dropping it. The deferred store is capped at 200 items (drop-oldest + history).
 
@@ -93,13 +104,15 @@ All installers merge JSON (preserving user keys), append marked TOML/markdown bl
 
 ## 5b. Retry & offline queue
 
-**Decision:** publish failures are classified (`TransientError`: connection errors, timeouts, 5xx/408/429; `PermanentError`: 4xx, bad config, premium gate). Transient failures are retried 3 times with 1s/2s backoff inside the same call. If the channel is still down, the notification is **queued** in `<state>/queue/` (one JSON file per item) and delivered later — the v1.1 failure mode (silent loss) is gone.
+**Decision:** publish failures are classified (`TransientError`: connection errors, timeouts, 5xx/408/429; `PermanentError`: 4xx, bad config, premium gate). A transient failure is tried up to 3 times in total (`RETRY_ATTEMPTS`), with 1s/2s backoff between the tries, inside the same call. A hook stops earlier when its 6 s send budget runs out (§32), and the bot's drain stops at its 20 s budget per cycle. If the channel is still down, the notification is **queued** in `<state>/queue/` (one JSON file per item) and delivered later — the v1.1 failure mode (silent loss) is gone.
 
 **Queue limits:** max 100 items (drop-oldest + `queue_overflow` history), max age 24 h (`queue_expired`), permanent failures on replay are dropped + logged (`queue_dropped`), transient ones stay with an attempt counter (`kept`). Queued `ask` questions are pointless (the answer window closes), so `ask` never queues — it retries and then fails loudly (parallel-channel asks still let the healthy channel decide).
 
 **Drain triggers (no hidden daemon):** (1) `agentbell queue flush` (also flushes deferred items), (2) automatically after any successful send — bounded to 2 queue items so a normal `notify` stays fast, (3) the opt-in bot daemon drains the whole queue + deferred store every poll cycle. Items are claimed atomically (`.sending` rename) so concurrent processes never double-deliver.
 
-**Semantics:** `notify` exits 0 when a message is queued (it is not lost — just delayed) and prints a stderr warning; history records `queued`/`queued_delivered`. Permanent failures still exit 3 as in v1.1.
+**Quiet hours apply to the queue too (1.7.0).** A queued item retried during quiet hours is moved to the deferred store (`queue_deferred`) instead of being pushed, unless its priority is at or above `quiet_hours_min_priority` or it was sent with `--force`. The 24 h age still counts from the first queueing. When one channel of a multi-channel item fails permanently while another delivered or kept it, the dropped channel is recorded (`queue_dropped` / `deferred_dropped`).
+
+**Semantics:** `notify` exits 0 when a message is queued (it is not lost — just delayed) and prints a stderr warning; history records `queued`/`queued_delivered`, which share a `queue_id` since 1.7.0 so `verify` counts a queued hook push as delivered once the queue has delivered it. Permanent failures still exit 3 as in v1.1.
 
 ## 6. One tool, three surfaces: CLI / MCP / webhook
 
@@ -109,11 +122,11 @@ All installers merge JSON (preserving user keys), append marked TOML/markdown bl
 - **MCP** (stdio, JSON-RPC 2.0, `notify` + `ask_approval`) — agents that prefer tool calls over shell (`mcp add <agent>` registers it in each agent's config).
 - **Webhook** (`agentbell server`, 127.0.0.1 by default, optional bearer token) — remote scripts, CI, VPS without the CLI. `/ask` blocks server-side until approval.
 
-**Why:** each surface maps to one real user pain; the shared core keeps the whole thing in one ~5400-line file.
+**Why:** each surface maps to one real user pain; the shared core keeps the whole thing in one file (~5400 lines when this was written, ~10,300 at 1.7.0).
 
 ## 7. Deliberately not implemented (yet)
 
-1. **Windows-native hooks.** The CLI runs on Windows; agent hook configs are generated for the agents' own shells. First-class Windows support is possible but wasn't the focus.
+1. **Windows-native hooks.** The CLI runs on Windows; agent hook configs are generated for the agents' own shells. First-class Windows support is possible but wasn't the focus. *(Superseded in part: since 1.7.0 the hook command is written for the shell each host uses on Windows — a plain path unquoted with forward slashes, which runs in cmd, PowerShell and Git Bash; otherwise `& '…'` for PowerShell hosts and double quotes for Claude Code and Kimi Code; Qwen Code hooks carry `"shell": "powershell"`. The host shells come from the hosts' source and docs as of 2026-09. The forms were run through cmd, PowerShell 5.1 and Git Bash, not inside the real host apps. A path that needs quoting still fails under Codex's `cmd /C` fallback, under Qwen builds that ignore the `shell` key, and in Claude Code without Git Bash. The Windows toast is §24; `watch` on Windows is §28 and §37.)*
 2. **Auto-update / prebuilt binaries / custom sounds** — plausible premium extras later, deliberately not built now.
 3. **Multi-user / team topics, dashboards, rate limiting** — out of scope for a personal tool.
 4. **Cursor global rules.** Cursor stores global rules in its own DB; we install project-level rules (documented). 
@@ -124,7 +137,7 @@ All installers merge JSON (preserving user keys), append marked TOML/markdown bl
 
 ## 7b. Single-file architecture: current state and migration strategy
 
-**Current state:** `agentbell.py` (~5900 lines, ~243 KB) plus `tests/test_agentbell.py` (~3300 lines, ~149 KB). The build step is `py_compile`, nothing else. Single-file distribution is the product identity — a user copies one file and runs it.
+**Current state (1.7.0):** `agentbell.py` (~10,300 lines, ~455 KB) plus 21 test modules under `tests/` (~15,700 lines, ~725 KB; `test_agentbell.py` and the `test_audit*` files from the 2026-09 audit). When this section was first written the numbers were ~5900 lines / ~243 KB and one ~3300-line test file. The build step is `py_compile`, nothing else. Single-file distribution is the product identity — a user copies one file and runs it.
 
 **When to split:** when the file size actively harms development velocity: navigation takes multiple searches, parallel work collides on the same file, code review diffs are unbounded by component, or new contributors spend more time scrolling than reasoning.
 
@@ -145,6 +158,13 @@ All installers merge JSON (preserving user keys), append marked TOML/markdown bl
 
 ## 8. What I'd do next (prioritized)
 
+**Historical (written for v1.5.0).** v1.6.3 is the release on PyPI (§19)
+and 1.7.0 is being prepared. Item 3 exists in part: Windows onboarding
+(`py -m agentbell`), the PowerShell toast (§24), Windows hook commands (§7
+item 1) and `watch` on Windows (§37). There is still no Windows installer
+and no Windows service for the bot. The field test (item 1) continues in
+`FIELD_TEST.md`.
+
 v1.5.0 is the first public release; the 2-week field test (started on v1.3.1) continues against it. In order:
 
 1. **Finish the field test** — `FIELD_TEST.md` is the checklist. Whatever it surfaces gets fixed first; that is the gate, not a feature count.
@@ -154,6 +174,14 @@ v1.5.0 is the first public release; the 2-week field test (started on v1.3.1) co
 5. **Shell completions** for bash/zsh/fish.
 
 ## 9. Telegram interactive approval: answer daemon + file handoff (v1.1)
+
+**Superseded in part.** Read with these sections:
+- single poller: the pid lockfile is now a kernel file lock (§31);
+- free-text replies and the parallel-channel free-text rule: §30 (a typed
+  reply is used only when exactly one question can be on the phone);
+- `agentbell watch`: §28 (no `subprocess.run`; the command keeps the
+  terminal and gets each signal once);
+- run durations: the start marker is per session, not per agent (§26).
 
 **Decision:** Telegram approvals are a **premium** feature implemented as an opt-in long-polling daemon (`agentbell bot`), stdlib-only. `ask` publishes the question with an inline keyboard (Approve/Deny); the daemon picks up the `callback_query` via `getUpdates`, writes the answer to `<state>/tg-answers/<approval-id>.json`, and `ask` polls that file. A pid lockfile (`<state>/bot.lock`) guarantees a single poller.
 
@@ -174,6 +202,11 @@ v1.5.0 is the first public release; the 2-week field test (started on v1.3.1) co
 **Run durations in hook events:** `hook started` writes a start marker (`<state>/runs/<agent>.json`); `run_completed`/`run_failed` consume it and append the duration. `--silent` on `started` records the marker without sending a notification, so agents can be wired with zero noise. `--duration <seconds>` allows explicit values from scripts that measure themselves. Markers expire after 24h; without a marker no duration is appended (no regression).
 
 ### 9b. Bot robustness (v1.2)
+
+**Superseded in part by §31.** Liveness is no longer "heartbeat age + pid
+liveness", and there is no stale lock to reclaim: `bot status` probes the
+kernel lock on `bot.lock` and reads the heartbeat. The heartbeat, the
+`last_error` fields and the drain duty below are current.
 
 **Decision:** `<state>/bot.json` now carries pid, heartbeat, `started_at`, and `last_error`/`last_error_ts` (set on poll failures, cleared on success). `bot status` derives: running/stale/dead from heartbeat age + pid liveness, lock state (`held`/`stale` with the owning pid — a stale lock after a crash is reclaimable, as before), the last known error cause (e.g. "webhook active" on getUpdates 409), open approval count, and queue/deferred counts. The heartbeat is refreshed before **and** after every poll cycle so a long `getUpdates` call can never look dead; the 60s freshness window that decides button availability is unchanged (no dead-button regression). The daemon also drains the offline queue and deferred store each cycle — it is the only always-on drain trigger, and it remains strictly opt-in.
 
@@ -198,6 +231,14 @@ v1.5.0 is the first public release; the 2-week field test (started on v1.3.1) co
 **Why:** before this, queued/deferred data lived only as files in the state dir — a daily-use visibility gap (§8 formerly listed this). The table answers "what is waiting and how old is it" without building a dashboard. Formatting uses a new `format_age` (45s/12m/3h/2d) to stay compact.
 
 ### 11b. `uninstall` (purge)
+
+**Superseded in part by §36.** Since 1.7.0 the purge also stops, disables
+and deletes the bot service first; a directory set by
+`AGENTBELL_CONFIG_DIR` / `AGENTBELL_STATE_DIR` loses only agentbell's own
+entries; a file set by `AGENTBELL_CONFIG` is listed and removed; the Windows
+`Scripts\agentbell.exe` launcher of a `pip install --user` install is
+included. Marked blocks are removed only when they run an agentbell
+command, and hook entries only in the shape agentbell writes (§33).
 
 **Decision:** one command, `agentbell uninstall`, is the complete removal path:
 
@@ -229,11 +270,11 @@ Everything here came out of an adversarial audit of the RC plus end-to-end runs 
 
 ### 12c. Which MCP clients we register (desktop market)
 
-**Decision:** `mcp add` takes explicit client names and defaults to all of: `claude`, `claude-desktop`, `chatgpt-desktop`, `codex`, `gemini`, `qwen-code`, `kimi`, `cursor`, `opencode`, `vscode`. Registration is **global** wherever the client supports it, so every repo is covered without per-project setup.
+**Decision:** `mcp add` takes explicit client names and, without one, registers every client of this list that is installed on the machine (the others are listed as skipped): `claude`, `claude-desktop`, `chatgpt-desktop`, `codex`, `gemini`, `qwen-code`, `kimi`, `cursor`, `opencode`, `vscode`. Registration is **global** wherever the client supports it, so every repo is covered without per-project setup.
 
 **Why ChatGPT Desktop works:** per OpenAI's docs the ChatGPT desktop app, the Codex CLI and the IDE extension *share* MCP configuration in `~/.codex/config.toml`, and the desktop app supports local stdio servers. So the Codex registration covers ChatGPT Desktop; `chatgpt-desktop` is an alias that says so out loud. ChatGPT **web** accepts remote MCP servers only — documented, not worked around (a tunnel would contradict "no public server").
 
-**`--print`** emits the raw snippet for clients we do not write (Windsurf, Zed, LM Studio, …) rather than growing a writer per client.
+**`--print`** emits the raw snippets for clients we do not write (Windsurf, Zed, LM Studio, …) rather than growing a writer per client. It prints the standard `mcpServers` JSON, the VS Code `servers` form, the Codex TOML table and, since 1.7.0, Zed's own form (`context_servers` in Zed's `settings.json`). Before that, Zed users were pointed at the `mcpServers` shape, which Zed does not read.
 
 **Not done:** an HTTP/SSE MCP transport. It would require a reachable endpoint and an auth story — the exact infrastructure this product avoids (§4).
 
@@ -278,7 +319,7 @@ The premium gate is unchanged and still one line deep. Licensing was HMAC at the
 
 The RC was put through a multi-agent adversarial audit: six independent readers over six failure dimensions (approval/concurrency, queue/defer, hooks/purge, security, CLI/portability, Telegram/licensing), every finding then verified by a separate skeptic that had to reproduce it against the real module. 83 raw findings, 37 confirmed, 11 explicitly refuted (documented behavior, stale line numbers, or already fixed mid-run). Each confirmed finding now has a regression test.
 
-Three of them changed how the product behaves, not just how it is implemented:
+Three of them changed how the product behaves, not just how it is implemented. *(The answer contract in the first one was changed again: free text is exit 0 but `approved: false` (§22), exit 3 is a runtime error, and typed-reply routing is §30.)*
 
 **Free-text answers are no longer collapsed.** `_parse_answer` matched a keyword *prefix*, so "yes, but use staging" became a bare `approved` and the instruction was lost. Now: an affirmation approves only when it stands alone; a negation denies even with a reason after it (fail-closed is the right direction for an approval gate, and the reason is kept); everything else is free text. The documented exit-code contract (0 approved/answered, 1 denied, 2 timeout) is unchanged — a verifier correctly refuted the related "fails open" claim as documented, tested behavior, so the README now just states the caveat for anyone chaining `ask && <command>`.
 
@@ -289,7 +330,7 @@ Three of them changed how the product behaves, not just how it is implemented:
 Two findings are documented rather than fixed:
 
 - **ntfy action buttons carry a credential.** A button definition travels inside the published message, so on a protected self-hosted ntfy the `Authorization` header is visible to every subscriber to the topic. Removing it would break button answers entirely. `ntfy.action_auth` now lets you give the buttons a scoped publish-only token instead of the account password, and the README says so.
-- **Free-text attribution is per machine.** Pending markers live in the local state dir, so two machines sharing one topic cannot see each other's open questions. Button answers carry the request ID and are unaffected. Out of scope for a single-user tool (§10: no multi-device sync).
+- **Free-text attribution is per machine.** Pending markers live in the local state dir, so two machines sharing one topic cannot see each other's open questions. Button answers carry the request ID and are unaffected. Out of scope for a single-user tool (§10: no multi-device sync). *(Still true after §30: the one-candidate rule counts only the questions this machine knows about.)*
 
 ### 12j. `--min-duration`: the anti-spam rule
 
@@ -299,7 +340,7 @@ Two findings are documented rather than fixed:
 
 **Why 60 s:** below a minute you were almost certainly still watching. Above it you probably switched tasks — which is the entire premise of the tool.
 
-**Why a flag baked into the hook command and not a config key:** it is visible where the behavior lives (`grep min-duration ~/.claude/settings.json`), editable without a new CLI verb, and per-agent — Codex and Claude Code can differ without a config schema for it. The trade-off is that changing it means editing the hook or re-running `hooks install`.
+**Why a flag baked into the hook command and not a config key:** it is visible where the behavior lives (`grep min-duration ~/.claude/settings.json`), editable without a new CLI verb, and per-agent — Codex and Claude Code can differ without a config schema for it. The trade-off is that changing it means editing the hook. Until 1.7.0, re-running `hooks install` (also `init` and `hooks install all`) quietly reset an edited value to 60. Since 1.7.0 a reinstall keeps the value found in agentbell's own `run_completed` hook for Claude Code, Qwen Code, Codex and Kimi Code (§33). A value of 60 cannot be told apart from the old default, so if the default ever changes, installs that hold 60 keep 60.
 
 ---
 
@@ -361,6 +402,12 @@ or a launchd agent on macOS) with the **absolute** binary path from
 `agentbell_binary()` — `%h/.local/bin` was wrong for pipx and venv installs.
 Where systemd isn't running (WSL without it, containers) it says so and prints
 a `nohup` line, instead of leaving a unit file that will never start.
+
+*(Superseded in part by §31: the unit runs `agentbell_command()` — the
+interpreter plus `agentbell.py` from a checkout, because that file is not
+executable — with `Type=exec`, pins `AGENTBELL_CONFIG` and
+`AGENTBELL_STATE_DIR`, and uses `enable` plus `restart`. A service that did
+not start, including the no-systemd case, now exits 1.)*
 
 ### 13e. Copy-paste blocks are executed, not read
 
@@ -579,6 +626,10 @@ event. So:
   ("N forced smoke tests") — they prove the delivery path, never the wiring.
 - The trust anchor is procedural: one **real agent turn** after the
   integration, then `verify --agent <slug> --since 10m`.
+- *(1.7.0)* An MCP `notify` call carrying `agent` is reported as such
+  ("N of them MCP notify call(s)", `notify_calls` in `--json`). It still
+  verifies an MCP-only host, but an agent with an installed hook
+  integration needs a real lifecycle event.
 - Quiet hours and queueing rewrite a record's event to
   `suppressed`/`deferred`/`queued`; the new `source_event` field preserves
   the original hook event. Without it, "arrived but held" reads as "never
@@ -729,8 +780,10 @@ The same claim-vs-shape confusion existed on the read side: uninstall,
 self-heal and `hooks status` matched the substring `agentbell hook`, which
 only the bare-launcher shape produces. Checkout (`…/agentbell.py hook`) and
 Windows (`'…\agentbell.exe' hook`, always quoted by `shlex.quote`) hooks
-were installable but invisible to removal and repair. The matcher now parses
-the command and compares the first token's stem — and deliberately leaves
+were installable but invisible to removal and repair. *(Superseded in part by
+§33: since 1.7.0 the stem check is only the first step, and an entry is
+agentbell's only in the exact shape and place agentbell writes it.)* The
+matcher now parses the command and compares the first token's stem — and deliberately leaves
 wrapped commands (`bash -c '…'`) alone: a wrapper is the user's construction,
 and "only entries whose command is ours are ever touched" outranks
 completeness of removal.
@@ -807,8 +860,11 @@ repeat counts as the near-duplicate instead (`suppressed: true` in
 
 The plugin records the user's prompt (`message.updated` with role `user`)
 per session and passes `--duration` to the hook. Explicit duration instead
-of the start marker because the marker is per agent, and parallel OpenCode
-sessions would overwrite each other's start. Unknown duration (plugin loaded
+of the start marker because the marker was per agent then, and parallel OpenCode
+sessions would overwrite each other's start. (Markers are per session since
+§26; the plugin still passes `--duration`. In 1.7.0 it also ignores the
+prompt OpenCode re-sends after a turn, which had made some short turns
+look long.) Unknown duration (plugin loaded
 mid-turn) still notifies - agentbell's rule, unchanged. The idle double is
 collapsed per session in memory (10 s) because both events arrive within the
 same second from one plugin instance - exactly the case the file-based
@@ -882,7 +938,9 @@ installed hid an important distinction, while treating it as absent made
 self-heal add a second mechanism. The new `user wrapper` state is installed
 for truthfulness, WARNed in status/doctor/verify, and causes `hooks install`
 to stop with a note until the user removes or updates it. No shell wrapper is
-parsed deeply or claimed as agentbell-owned.
+parsed deeply or claimed as agentbell-owned. *(§33 widens "user-owned" to
+every command that is not in agentbell's exact generated shape, such as a
+hook with flags agentbell does not write.)*
 
 ### 18d. Windows config ACLs are not inferred from POSIX mode bits
 
@@ -920,6 +978,12 @@ execute `agentbell doctor`, the README and field-test checklist label the
 PyPI path as in preparation. Publication proof is recorded after the tag
 workflow succeeds, not inferred from configuration.
 
+*(Status: the "in preparation" label was removed in 4a92ae3 on the
+strength of a `pip install agentbell` from public PyPI into a fresh venv
+(`FIELD_TEST.md`, 2026-09-05). `pipx install agentbell` from public PyPI was
+not re-run in that pass; the only pipx evidence is the isolated local-wheel
+test from 2026-09-03. The pipx half of this boundary is still open.)*
+
 The existing purge ownership model remains unchanged. A pipx installation is
 detected with `pipx list` and removed by calling `pipx uninstall agentbell`;
 agentbell does not unlink pipx's launcher or edit its managed environment by
@@ -928,7 +992,7 @@ so GUI clients do not depend on inheriting the shell `PATH`.
 
 ## 20. Approval replies fail closed (2026-09-22)
 
-**Superseded in part by §22 and §27.** This section is the first pass.
+**Superseded in part by §22, §27 and §30.** This section is the first pass.
 Two statements below are not the current contract. Free text is not
 `approved: true` (§22). Telegram does not use a two-second clock window
 (§22); a free-text reply counts only when its message id is newer than
@@ -998,9 +1062,18 @@ The temp file is created with `O_EXCL` and `O_NOFOLLOW`; an existing
 symlink at that name is unlinked (the link, not its target) and a real
 file is created. The replacement keeps the mode the destination already
 had. A Codex block with no end marker is left untouched instead of
-raising.
+raising. *(§27 changed the symlink rule for home-directory configs, and §34
+states the general rule for bytes agentbell does not own.)*
 
 ## 22. Review of the 2026-09-22 fixes (2026-09-22)
+
+**Superseded in part by §30.** The `approved` contract below is current.
+Two details are not: `wait` (and `warte`, `später`, `hang on` and other
+postponements) now deny as a leading phrase, so `wait for CI, then ship`
+exits 1; only `not` and `nicht` still deny only as the whole reply. And a
+typed Telegram reply is no longer placed by message id alone: it is used
+only when exactly one question can be on the phone, and the message id
+only decides whether it predates that question.
 
 The first pass (§20, §21) was re-checked against the real behavior. Five
 corrections:
@@ -1074,6 +1147,10 @@ read. Subscribe raises `RuntimeError` for the same failures so the
 stream loop reconnects; that loop also catches a short read on the
 body. Callers that already retry or queue a `TransientError` need no
 new policy.
+
+*(Since 1.7.0 a hook failure that still gets through is not swallowed
+silently either: `cmd_hook` exits 0 but writes a `hook.error` record and one
+stderr line, §32.)*
 
 ## 24. Windows toast text is data, not script (2026-09-22)
 
@@ -1157,9 +1234,11 @@ this is for the next time Kimi strips them.
 
 **`ntfy.action_auth` is the password's neighbor.** §25 drops `ntfy.auth`
 when the server changes. The button token was left behind and the next
-`ask` published it on the new server. It is cleared on every server
+`ask` published it on the new server. `init` now clears it on every server
 change, including when `--ntfy-auth` supplies a new password. The same
-server keeps it.
+server keeps it. *(As written here this held for `init` only:
+`config set ntfy.server` still kept both credentials. §35 makes it one rule
+for both paths and defines "the same server".)*
 
 **A `#` inside quotes is not a TOML comment.**
 `[projects."/home/u/C#/app"]` was cut at `#`, not seen as a header, and
@@ -1184,9 +1263,14 @@ to get a duration; the read ignored it.
 **`approved: false` is a behavior change, not a patch note.** JSON, MCP
 and the webhook changed for every free-text reply. The changelog
 records it under Changed. The version string stays 1.6.3 until a real
-release, and that release should be a minor version.
+release, and that release should be a minor version. *(It is being
+prepared as 1.7.0.)*
 
-## 28. `watch` waits for the command to finish (2026-09-23)
+## 28. `watch` keeps the terminal and passes each signal on once (2026-09-23)
+
+*(Rewritten for 1.7.0. The first version of this section described a
+design that was replaced in the same release cycle; see "What was tried
+first".)*
 
 **What was wrong.** `run_watch` used `subprocess.run`. On Ctrl-C that
 helper waits 0.25s and then sends SIGKILL. A migration that traps
@@ -1195,18 +1279,100 @@ The completion push never ran, because the exception left `run_watch`
 before `send_notification`. The same happened for SIGTERM: the process
 died and the child was left without a push.
 
-**Decision.** The command is started in its own session and `watch`
-forwards SIGINT and SIGTERM to that process group, once per signal.
-It then waits until the command exits. There is no 0.25s kill. The
-push is sent afterwards with the command's status. A negative wait
-status (died from a signal) becomes 128+signal, which is what a shell
-reports for Ctrl-C. A command that handles the signal and exits 0 is
-a success. The session is its own so one Ctrl-C is one signal: if the
-command stayed in agentbell's process group, the terminal would deliver
-SIGINT and a forward would deliver it again, and a second interrupt is
-how tools such as Terraform abandon a graceful shutdown. `watch` is for
-a command that runs to completion. It does not put that command in the
-foreground of the terminal.
+**What was tried first.** The command was started in its own session,
+and `watch` forwarded SIGINT and SIGTERM to that process group. That
+fixed Ctrl-C and broke everything interactive: the command no longer
+owned the terminal, so sudo, ssh and gpg password prompts failed and
+Ctrl-Z did nothing. Ctrl-\ and closing the terminal still killed
+`watch` before the push. It was replaced by the design below.
+
+**Decision.** The command runs in `watch`'s own process group, which is
+the terminal's foreground job, so it keeps the terminal: prompts work
+and Ctrl-Z suspends it. `watch` catches SIGINT, SIGQUIT, SIGHUP and
+SIGTERM (and SIGBREAK on Windows) and waits for the command however long
+it takes. There is no 0.25s kill. The push is sent afterwards with the
+command's status. A death by signal becomes 128+N, which is what a shell
+reports; a command that handles the signal and exits 0 is a success. A
+signal that was ignored when `watch` started (nohup, a background job of
+a script) stays ignored, so the command inherits that.
+
+The rule is that the command gets each signal once. A second interrupt
+is how tools such as Terraform abandon a graceful shutdown. The terminal
+already sends Ctrl-C, Ctrl-\ and the hangup to the whole foreground job,
+command included, so `watch` must not send those again. A signal meant
+for `watch` alone has to be passed on. Only the command's pid is
+signaled, never the group, which can hold the rest of a pipeline.
+
+- **Linux.** `watch` blocks these signals while the command runs and
+  takes them with `sigtimedwait`, which names the sender.
+  - Raised by the kernel for a key or a hangup: not passed on, the
+    command got it too. A hangup is passed on when `watch` is the session
+    leader (`ssh -t host agentbell watch …`, `docker run -it`) or had no
+    terminal when it started (cron, CI, supervisord).
+  - Sent by a process in `watch`'s own group: that process signaled the
+    group (`timeout` without `--foreground`, the command's own
+    `kill 0`), so it is not passed on. The exception is `watch`'s parent
+    when it is not a group-killing `timeout`: `uv run`, `uvx`, a nested
+    `watch`, a wrapper script or `timeout --foreground` relays to its
+    child alone, so SIGTERM is passed on, and SIGINT/SIGQUIT are passed on
+    unless `watch` is the terminal's foreground job.
+  - Any other sender is taken to have signaled `watch` alone and is
+    passed on once: `kill -INT <watch pid>` from an IDE stop button or
+    pexpect reaches the command even while `watch` is in the foreground.
+    SIGHUP keeps the hangup rule above whoever sends it.
+- **macOS and other non-Linux POSIX systems.** No `sigtimedwait` sender
+  (and different `si_code` values), so a heuristic: SIGINT and SIGQUIT
+  count as key presses while `watch` is the terminal's foreground job,
+  SIGTERM is always passed on, and the hangup rule is the same as on
+  Linux.
+- **Windows.** Nothing is passed on. Every process on the console gets
+  Ctrl-C and Ctrl-Break, and no other signal reaches `watch` from
+  outside. `watch` survives them and sends the push.
+
+Once the command has ended, SIGINT, SIGQUIT or SIGTERM during a push that
+hangs stops the send: the push goes to the offline queue, `watch` exits
+with the command's code and says so on stderr. A hangup does not stop the
+send. On Windows nothing changes during the send, because the Ctrl-C that
+ended the command may reach `watch` only then. A push that fails never
+changes the exit code; it costs one stderr line. With an unreadable
+config the command still runs, without a push, and its exit code is
+returned.
+
+**Known residual cases.** None of these has a portable fix; they are
+documented instead.
+
+- A group kill sent from **outside** `watch`'s group reaches the command
+  twice: once directly and once passed on. Examples: bash `kill %1`,
+  `kill -- -PGID`, systemd `KillMode=control-group`. The sender info
+  cannot tell it from a kill of `watch` alone; sudo has the same rule. A
+  command that treats a second SIGTERM as "force quit" (Terraform) skips
+  its graceful shutdown then. A SIGTERM sent to `watch` alone reaches the
+  command once (tested).
+- A parent shell script whose trap runs `kill 0` looks like a relaying
+  parent, so the command gets that SIGTERM twice.
+- `timeout --foreground` is recognized only when `timeout` is `watch`'s
+  direct parent and the option is written on its own (`-f`,
+  `--foreground` or an unambiguous prefix). A bundled short option such
+  as `-vf` is read as a group-killing `timeout`, so the signal, which
+  only reached `watch`, is not passed on and the command keeps running.
+- A SIGINT or SIGQUIT that a relaying parent passes on while `watch` is
+  the terminal's foreground job is taken for a key press and dropped:
+  `kill -INT <wrapper pid>` from another terminal does not reach the
+  command.
+- macOS: `kill -INT <watch pid>` while `watch` is in the foreground is
+  not passed on, and a group SIGTERM (including a plain `timeout`)
+  reaches the command twice.
+- Ctrl-C pressed exactly while the command is being started may not
+  reach it. `watch` survives and pushes; pressing Ctrl-C again works.
+- Linux: if the parent left SIGCHLD ignored, `watch` notices the exit
+  only at the one-second `sigtimedwait` timeout.
+
+**Evidence boundary.** The pty tests (Ctrl-C, Ctrl-\, Ctrl-Z, a
+`/dev/tty` prompt, SIGTERM, `timeout`, relaying parents) were run on
+Linux and WSL2; macOS runs them only in CI. Real interactive use — a sudo
+prompt, closing a terminal window — is not field-tested yet and has rows
+in `FIELD_TEST.md`. Windows argument handling for `.bat`/`.cmd` tools is
+§37.
 
 ## 29. Five smaller holes from the same audit (2026-09-23)
 
@@ -1221,7 +1387,9 @@ them in a set. `headers` is an object and `args` can be a list, and
 neither is hashable. The comparison now freezes JSON values into tuples.
 The user's hook is left in place.
 
-**The bot lock has to name one process, not a pid.** SIGTERM killed the
+**The bot lock has to name one process, not a pid.** *(Superseded by §31:
+the start-time field was replaced by a kernel file lock. The SIGTERM part
+stands, and a clean stop now exits 0.)* SIGTERM killed the
 daemon before the lock was removed. The next start treated a live pid as
 "the bot is running" even after that pid had been given to another
 program. The lock stores the Linux start-time field, and a mismatch is a
@@ -1240,3 +1408,314 @@ leave a tail.
 request list after the ask thread had started, so a fast `sendMessage`
 was treated as "already there" and the test waited 20 seconds. The count
 is taken before the thread starts.
+
+## 30. A typed reply answers one question or none (2026-09-23)
+
+**What was wrong.** A typed reply carries no question id. It went to the
+newest open ask (§4b, §9), later to the newest question sent before the
+reply, ordered by Telegram message id or ntfy server time (§22). Both
+rules approved the wrong ask in reproducible cases. A newer question
+whose send failed, was retried or was still in flight could sit anywhere
+on the phone. A question that had just timed out was still on the screen,
+and a "yes" typed under it went to an older ask. Marking uncertain sends
+and same-second ties only moved the problem.
+
+**Decision.** A misrouted approval is worse than a lost reply: a lost one
+costs a tap on a button, a misrouted one runs the wrong command. A typed
+reply is used only when exactly one question can still be on the phone.
+
+- The candidates are every open ask plus every ended ask that got no
+  answer. An ended ask's marker becomes a tombstone (`closed`,
+  `answered`) and stays until it expires: the ask's timeout plus 60 s
+  from its start, and at least 60 s after its end. Answered tombstones
+  do not count.
+- With exactly one candidate, the reply is used when that ask is still
+  open and its question is known to be out before the reply: a greater
+  Telegram message id, or an ntfy server time that is not earlier
+  (whole seconds, so the same second counts). A reply older than every
+  candidate's question is a replay and stays stale.
+- In every other case the reply is refused and recorded as
+  `stale_answer` with the channel, the reason and whether the notice
+  went out. The person who typed it is told: the Telegram bot answers
+  the message with `Your reply "…" was not used: <reason>. Please tap a
+  button, or answer with Reply on the question.`, and on ntfy the
+  waiting ask publishes a "Reply not used" notification (priority high,
+  up to 60 characters of the reply) to the main topic.
+- Explicit routes are unchanged and always work: the buttons, a typed
+  `APPROVED <id>` / `DENIED <id>` with the full id (any letter case),
+  and Telegram's Reply on the question. A reply that names a question
+  that has ended is not used. `approve 2` is not an id; it is free text.
+- A marker that cannot be read is read once more after 50 ms (it may be
+  caught mid-rewrite). If it still cannot be read it counts as an open
+  question of unknown place, for up to about an hour, then it is
+  deleted. On ntfy a typed reply is not used while the one candidate is
+  still publishing its question (up to 60 s).
+- A server that sends no message times (real ntfy does) gets no typed
+  replies at all. Buttons still work.
+
+The reply text is read more strictly in the same release. Smart
+punctuation is mapped to ASCII first, so `yes… wait` and `ok — later`
+read like `yes... wait` and `ok - later`. Postponements deny, also with a
+reason after them: `wait`, `warte`, `später`, `hang on`, `one moment`,
+⏸ ⏳ ⌛. A yes followed by a denial or a postponement denies (`yes, but
+wait`, `ok, later`, `👍⏳`), which also catches benign `yes, no problem`;
+that errs on the side of not running the gated command.
+
+**Cost.** Fewer typed replies are accepted. With two asks open, or for up
+to the timeout plus 60 s after an ask that ended unanswered, typed text is
+refused with a notice. A duplicate "yes" meant for an ask that was already
+answered can still reach a later single open ask when it is typed after
+that ask's question; excluding answered tombstones is the price of not
+blocking every reply after every answer. Markers are local, so two
+machines sharing one topic still cannot see each other's asks (§12i).
+
+## 31. The bot lock is a kernel lock (2026-09-23)
+
+**What was wrong.** `bot.lock` held a pid, later a pid plus the Linux
+start time (§29). A killed bot left the file behind, a reused pid read as
+a running bot (macOS has no start time), two bots started at the same
+moment could both take the lock, and a stopping bot could delete a lock
+another bot had just taken. The service had its own problems: SIGTERM
+ended the bot with 143, so `systemctl --user stop` left the unit failed
+and `Restart=on-failure` started it again; from a checkout the unit ran
+the non-executable `agentbell.py`; and `uninstall` left the enabled unit
+restarting a deleted binary every 10 seconds.
+
+**Decision.** The bot holds a kernel lock on `bot.lock` for its whole
+life: `flock` on POSIX, `msvcrt.locking` on Windows (on a byte far past
+the pid record, so the file stays readable). The kernel drops it however
+the process ends, SIGKILL and power loss included, so it never goes
+stale, and a pid that now belongs to another program cannot hold it. The
+pid in the file is only for people. `bot status`, `doctor`, `uninstall`
+and the button decision in `ask` probe with a non-blocking shared lock
+(Windows has none: an exclusive probe, tried once more after 50 ms). A
+starting bot waits up to one second for a probe to finish. A clean stop
+empties the file and leaves it; deleting it would let a start that had
+just opened it lock a file nobody else can see.
+
+SIGTERM is handled like Ctrl-C: release the lock, exit 0. A stopped
+service stays stopped; a crash is still restarted. The launchd job uses
+`KeepAlive` with `SuccessfulExit=false` for the same reason.
+
+`bot install-service` writes a unit that runs `agentbell_command()`
+(interpreter plus script from a checkout) with `Type=exec`, so a command
+that cannot start fails the install instead of looping. It pins
+`AGENTBELL_CONFIG` and `AGENTBELL_STATE_DIR`, because a service does not
+see the shell's variables, and refuses a license key that exists only in
+`AGENTBELL_LICENSE`. It uses `enable` plus `restart`, so a running bot
+picks up the new unit. A service that did not start (including a machine
+without systemd, where it prints a `nohup` line) exits 1. `uninstall`
+stops, disables and deletes the service first (§36).
+
+**Cost.** A filesystem without `flock` (some network mounts) makes the
+bot refuse to start, with the error shown. A bot started by an earlier
+version holds no kernel lock and is invisible to the new CLI until it is
+restarted. `Type=exec` needs systemd 240; older systemd treats it as
+`simple`. Neither service manager was run for real: the unit was checked
+with `systemd-analyze verify` and a mocked `systemctl`, the plist with
+`plistlib` and a mocked `launchctl`. The field test has rows for it.
+
+## 32. A hook has a 6-second send budget (2026-09-23)
+
+**What was wrong.** A hook send was up to three tries of 5 s each plus 1 s
+and 2 s of backoff, about 18 s in the worst case. Kimi Code kills a hook
+after 10 s (agentbell writes `timeout = 10`), Gemini CLI after 15 s. A
+push that was still retrying died with the hook, unrecorded. A socket
+timeout does not bound a stalled DNS lookup or a server that sends one
+byte at a time, and a hook that crashed was swallowed without a trace.
+
+**Decision.** All sending in one hook — retries, the queue drain and the
+deferred flush after it — shares a wall-clock budget of
+`HOOK_SEND_BUDGET_SECONDS = 6`, below Kimi's 10 s with room for the
+interpreter to start. A backoff pause that would cross the deadline is
+skipped. Each try runs in a helper thread and is given up 0.5 s after its
+own timeout, so the worst case is about 7 s. What the budget cannot
+deliver goes to the offline queue (history `queued`) and is delivered by
+the next successful send, `queue flush` or the bot. The OS notification
+helper is capped by the remaining budget as well. A hook still always
+exits 0; a failure writes a `hook.error` record (agent, event, error,
+project) and one stderr line, and `verify` counts it as an event that
+reached no channel.
+
+**Cost.** On hosts whose hooks run async with long timeouts (Claude Code,
+Codex, Qwen Code), a flaky network now queues the push after about 6 s
+instead of retrying for up to 18 s. A try that was given up can still
+land late; if the server accepted it, the queued retry duplicates the
+push. That duplicate already existed for any socket timeout after the
+request was sent (§7 item 8).
+
+## 33. A hook entry is agentbell's only in the exact shape it writes (2026-09-23)
+
+**What was wrong.** Install, reinstall and uninstall treated every
+command whose first word was agentbell's binary as agentbell's own
+(§16j). Hooks the user wrote were rewritten or deleted: a `Notification`
+hook with matcher `permission_prompt` that called `agentbell hook`, a
+wrapper such as `afplay …; agentbell hook …`, a hook with an extra
+`--priority high`. A tuned `--min-duration` went back to 60 on every
+reinstall (§12j).
+
+**Decision.** An entry belongs to agentbell only when both hold:
+
+1. its command is exactly the generated shape — an agentbell binary at
+   any path (or any interpreter followed by `agentbell.py`), `hook
+   <event> --agent <slug>`, and only the flags agentbell writes
+   (`--silent`, `--min-duration N`);
+2. it sits where agentbell writes that command: the same event and
+   matcher in a JSON settings file, the same table, event and matcher in
+   a Codex or Kimi `config.toml`.
+
+Everything else is the user's. Reinstall and uninstall leave it.
+`hooks uninstall` says how many such commands it kept, and `uninstall
+--yes` reports them as kept and does not print "Done" while they remain.
+`hooks status` shows `user wrapper` and `doctor` warns. With a user's
+hook and no agentbell entry in the file, install adds nothing and says
+why. A reinstall keeps the `--min-duration` found in agentbell's own
+`run_completed` hook. An install that changes nothing does not rewrite
+the file. A Codex or Kimi table without markers that is exactly what
+agentbell writes counts as agentbell's: status reads installed, install
+does not add a second copy, uninstall removes it, and a path that no
+longer exists is repaired. The same test applies to Claude Code, Gemini
+CLI, Qwen Code, Codex and Kimi Code.
+
+**Cost.** Editing a generated hook by hand makes it the user's. If
+agentbell's other entries are still in the file, a reinstall writes the
+standard entry for that slot as well, so that event can push twice until
+one is removed; it shows as `user wrapper`. A user's own hook that is
+byte-for-byte agentbell's shape is removed by uninstall. The new Claude
+`permission_prompt` hook reaches existing installs only through a
+reinstall, and status does not flag it as missing, because that would also
+warn people who removed it on purpose. A user who already had their own
+`permission_prompt` hook calling agentbell gets two pushes per dialog.
+
+## 34. Bytes agentbell does not own stay as they were (2026-09-23)
+
+**What was wrong.** The config writers normalised what they did not own:
+CRLF files came back LF (and LF files CRLF on Windows), comments and
+foreign tables near agentbell's block were dropped, a non-UTF-8
+`AGENTS.md` crashed `status`, `doctor` and `verify`, and inline TOML
+hook forms turned into invalid TOML.
+
+**Decision.** agentbell edits only its own lines and keeps the rest.
+
+- **Codex and Kimi `config.toml`:** read with the file's own line
+  ending and written back with it; final newlines, trailing blank lines
+  and comments stay. Uninstall removes only agentbell's hook tables and
+  its `[mcp_servers.agentbell]` table with its sub-tables, even when a
+  sub-table sits elsewhere. Install touches only its own marked
+  `features.hooks = true` line (and a pre-1.3 bare line directly above
+  agentbell's block), so a flag under `[profiles.x]` is left alone. A file that is not UTF-8, or that defines hooks inline
+  (`hooks = {…}`, `hooks.Stop = …`, a plain `[hooks.Stop]` table), is
+  refused: nothing is written, a note names the entry, and `hooks
+  install` exits 1.
+- **Rule files** (`AGENTS.md`, `.rules`, `.clinerules`, `.continue`
+  rules): edited byte for byte, including non-UTF-8 text (cp1252,
+  latin-1) and the file's own line endings. A UTF-16 file is left
+  unchanged with a note. A marker counts only on a line of its own; a
+  marker quoted in running text is user text. A marker without its
+  partner blocks every write and removal, with a note.
+- **JSON settings and MCP files:** a file with comments or trailing
+  commas, or not UTF-8, is refused byte-for-byte unchanged; the refusal
+  prints the entries to add by hand, the other agents still install, and
+  the exit code is 1. A real change keeps every key and value, but the
+  file is re-serialized with two-space indentation. A symlinked config is
+  updated where it points; a link into a read-only store (Nix,
+  home-manager) is refused with a message. The existing mode is kept,
+  and a new file follows the umask.
+
+**Cost.** A TOML file that mixes CRLF and LF comes back in its majority
+line ending. After install and uninstall, a rule file that had no final
+newline has one. JSON formatting is not preserved on a real change; the
+content is.
+
+## 35. One credential rule for a server change (2026-09-23)
+
+**What was wrong.** `init` cleared `ntfy.auth` and `ntfy.action_auth` on a
+server change (§25, §27). `agentbell config set ntfy.server <other>` did
+not, so the next push or `ask` sent the self-hosted password and the
+button token to the new server. `ntfy.action_auth` could not be set with
+`config set` at all.
+
+**Decision.** `config set ntfy.server` and `init` use one function. Two
+values are the same server when scheme, host, port and path match; letter
+case, a trailing slash and an explicit default port do not count, and an
+empty stored server means the default `https://ntfy.sh`. A stored value
+that could never be used (a port like `8o80`) is compared by scheme and
+host only, so correcting the typo on the same host keeps the credentials.
+On a real change both credentials are cleared, with one stderr line each
+saying how to set them again. `init --ntfy-auth` supplies the new password
+and still clears the button token; an interactive `init` asks for the new
+server's credential. `config set ntfy.action_auth <token>` exists: it is
+redacted in output, `none` clears it, and it refuses the value stored in
+`ntfy.auth`. `config set ntfy.server` refuses a URL that cannot be used
+(no host, a bad port, `?`, `#`, spaces, credentials in the URL, a
+mistyped scheme).
+
+**Cost.** Moving to another host always means entering the credentials
+again, even when they are the same.
+
+## 36. Purge deletes only what agentbell owns (2026-09-23)
+
+**What was wrong.** `uninstall --yes` deleted the whole directory named by
+`AGENTBELL_CONFIG_DIR` or `AGENTBELL_STATE_DIR`, which could be
+`~/.config`. It deleted metadata of other `pip --user` packages whose
+name starts with `agentbell`, and a user's own `.clinerules` file once it
+was empty. It left an `AGENTBELL_CONFIG` file, the Windows
+`Scripts\agentbell.exe` launcher and the enabled bot service behind, and
+reported "already fully removed" when it could not read a directory or
+`pipx list` failed.
+
+**Decision.** The default `~/.config/agentbell` and
+`~/.local/state/agentbell` are still removed whole. A directory set by an
+env var loses only agentbell's own entries (`config.json`;
+`history.jsonl`, `queue`, `deferred`, `runs`, `bot.json`, `bot.lock`,
+`tg-answers`, `tg-pending`, `ntfy-pending`, `ntfy-consumed`,
+`.doctor-probe`), and inside those folders only agentbell's own item
+files. The directory goes only when nothing else is left; everything else
+is listed as kept. A directory that cannot be read is listed, and `--yes`
+fails with the reason. A symlinked config file loses only the link, with
+a warning that the target still holds the license key and tokens; a
+symlinked config or state directory is kept. A file set by
+`AGENTBELL_CONFIG` is listed and removed. `pip --user` removal touches
+only agentbell's own files. pipx detection reads both output streams and
+says so when pipx cannot be asked. On Windows the `Scripts\agentbell.exe`
+launcher is included; it is locked while it runs, so the dry run points
+to `py -m agentbell uninstall --yes`. The bot service is stopped,
+disabled and deleted first. Marked blocks are removed only when they run
+an agentbell `--agent` command, a user's `.clinerules` file is never
+deleted, and hook entries follow §33. The dry run stays the default.
+
+**Cost.** A hand-edited block without an agentbell `--agent` line
+survives the purge and is not listed. `STATE_DIR_NAMES` has to grow with
+every new state file; a test fails when a writer adds a name it does not
+list.
+
+## 37. Windows batch files get their arguments unchanged or not at all (2026-09-23)
+
+**What was wrong.** `agentbell watch -- npm test` failed on Windows:
+CreateProcess finds `.exe` files, and npm, yarn and pnpm are `.cmd`
+files. Once `watch` found them, a second problem showed: CreateProcess
+runs a `.bat` or `.cmd` through `cmd.exe`, which parses the arguments
+again. `^` disappeared (`lodash@^4.17.0` became an exact version), `|`
+and `<` broke the command, `&` ran a second one, and `%NAME%` expanded.
+This is the BatBadBut class (CVE-2024-24576).
+
+**Decision.** CreateProcess's own search runs first, so everything it
+found before still runs, even when the current directory holds a script
+of the same name. If it finds nothing, `watch` looks on `PATH` only,
+never in the current directory, for a `.com`, `.exe`, `.bat` or `.cmd`.
+A batch file is started with a command line `watch` builds itself:
+`cmd.exe /d /v:off /s /c ""script" args"`. Every argument that holds
+anything other than letters, digits and `#$*+-./:?@\_` is double-quoted
+(the set Rust uses), and trailing backslashes are doubled so they cannot
+escape the closing quote. `/d` skips the `cmd` AutoRun registry command
+and `/v:off` turns delayed expansion off. `%`, `"`, CR and LF cannot be
+passed through `cmd.exe` safely, so an argument holding one is refused:
+exit 127, one stderr line, and a push saying the command could not be
+started. Rust escapes `%` and `"` instead; refusing is the safe default.
+
+**Cost.** Arguments with `%` or `"` (JSON on the command line,
+`--define=100%`) cannot reach a `.bat`/`.cmd` tool through `watch`. A bare
+name no longer finds a `.cmd` in the current directory (`watch --
+.\build` does). The AutoRun command no longer runs before a batch file.
+The Windows test suite covers this; a real PowerShell session running
+`watch -- npm …` is not field-tested yet.

@@ -1,11 +1,11 @@
-# FIELD TEST — 2-week checklist (v1.6.3)
+# FIELD TEST — 2-week checklist (v1.7.0)
 
 Goal: use the tool like a real user for two weeks and tick off every path below.
 Budget: ~20 minutes for the first pass, then just use it.
 
 ## Prerequisites and evidence
 
-- Record the OS, Python version (`python3 --version` or `py --version`), AgentBell version, ntfy server, and agent/editor version before starting.
+- Record the OS, Python version (`python3 --version` or `py --version`), agentbell version (`agentbell --version`), ntfy server, and agent/editor version before starting.
 - Use a real ntfy app subscription for the configured main and `-responses` topics; automated tests do not prove phone delivery.
 - Treat Telegram, MCP desktop clients, agent hooks, and network recovery as separate integration tests. Do not mark one as passed because another worked.
 - For every completed row, retain the command, exit code, relevant `agentbell history --limit 10` record, and either the received phone notification or an app/editor screenshot. Redact topics, tokens, and message content before sharing evidence.
@@ -96,7 +96,7 @@ this retained evidence.
 | 2 | doctor | `agentbell doctor` | All checks OK; exit 0 |
 | 3 | Basic notify | `agentbell notify "hello" --priority high --tags test` | Push with title/priority/tags |
 | 4 | ask via ntfy (buttons) | `agentbell ask "Deploy to prod?"` | Question + Approve/Deny on the phone; CLI exits 0/1 |
-| 5 | ask free text | `agentbell ask "Which env?" --no-buttons` | Typed answer is printed by the CLI, exit 0 |
+| 5 | ask free text | `agentbell ask "Which env?" --no-buttons` | Typed answer is printed by the CLI, exit 0; with `--json`, `approved` is `false` (a free-text answer is not an approval). Since 1.7.0 a typed reply is used only while this is the only open question (see row 36) |
 | 6 | ask timeout | `agentbell ask "Anyone there?" --timeout 15` | Exit 2 after ~15 s, "timeout" |
 | 7 | two asks in a row | run #4, answer it, immediately run #6 | The second ask does **not** inherit the first answer |
 | 8 | watch | `agentbell watch -- sleep 5` / `agentbell watch -- false` | ✅ exit 0 + duration / 🔴 exit 1; exit code passed through |
@@ -106,11 +106,11 @@ this retained evidence.
 | 11 | OpenCode plugin | `agentbell hooks install opencode`, finish a turn in **any** repo | `run_completed` push **with duration** (plugin is global); exactly one push per turn; a turn under 60 s stays silent (`hook.skipped_short`); a doubled `session.idle` shows up as at most one `hook.skipped_duplicate` record, never as a second buzz — **v1.6.0 result: failed** (24 same-second doubles in 415 turns, no short-turn filter; see the agent table), fixed in v1.6.1. **Re-verification 2026-09-03 (v1.6.2 plugin, OpenCode 1.18.26): passed.** Three consecutive real turns in one session: 9 s → one `hook.skipped_short`; 62 s → exactly one `hook.run_completed` delivered to ntfy + Telegram with `in 1m02s` in the text; 51 s → one `hook.skipped_short`. No second record for any turn; `verify --agent opencode --since 10m` reported `3 event(s): 1 delivered, 2 skipped (short turn)`, exit 0 |
 | 12 | MCP in a desktop app | `agentbell mcp add claude-desktop chatgpt-desktop`, restart the app | The app lists `notify` / `ask_approval` and can call them |
 | 13 | Telegram (premium) | `agentbell license activate <key>`, `agentbell init`, `agentbell bot install-service` | Question with Telegram buttons; a press answers the ask; `bot status` healthy after closing the terminal |
-| 14 | Parallel channels | with ntfy + Telegram: `agentbell ask "Deploy?"` | Both get it; first answer wins; `channel` in `--json` says which |
-| 15 | Quiet hours / defer | set quiet hours to "now", mode `defer`, send a low-prio notify | No push now; after the window / `queue flush` it arrives (3+ → one summary) |
+| 14 | Parallel channels | with ntfy + Telegram: `agentbell ask "Deploy?"` | Both get it; first answer wins; `channel` in `--json` says which. A button press gives `approved: true`; a typed free-text answer exits 0 with `approved: false` |
+| 15 | Quiet hours / defer | set quiet hours to "now", mode `defer`, send a low-prio notify | No push now; after the window / `queue flush` it arrives (up to 3 due items one by one, 4 or more → one summary) |
 | 16 | Offline queue | point the server at a dead port, `agentbell notify "offline"` | Exit 0 + stderr warning; `queue list` shows it; after fixing, `queue flush` delivers |
 | 17 | history | `agentbell history --limit 20` | sent / suppressed / deferred / queued / ask results all visible |
-| 18 | secrets | `agentbell config show` | license, bot token, ntfy password, webhook token all redacted; `ls -l` on config.json shows `-rw-------` |
+| 18 | secrets | `agentbell config show` | license, bot token, ntfy password, `ntfy.action_auth` and webhook token redacted, the topic shortened to its first 6 characters; `ls -l` on config.json shows `-rw-------` |
 | 19 | Full purge + re-init | `agentbell uninstall`, then `--yes`, then `pipx install agentbell && agentbell init` | Dry run lists the pipx package and everything else; purge uses `pipx uninstall agentbell`, removes config/state/hooks/MCP, and keeps foreign config — pipx-specific removal still only verified in the 2026-09-03 isolated-pipx test above, not re-run here |
 | 20 | License status | `agentbell license status` | Correct premium state |
 | 21 | Change one setting | `agentbell config set ntfy.topic <long-random>` | Written + re-subscribe hint; `doctor` turns the topic WARN into OK; no wizard needed |
@@ -119,9 +119,41 @@ this retained evidence.
 | 24 | Double integration is detected | wire the same agent via hooks AND the Appendix A rules block on purpose, finish a turn **of at least 60 s** (a shorter turn hits `--min-duration` on the hook side, leaves only one `run_completed` record and defeats the check) | One push — the identical second one is suppressed and recorded as `hook.skipped_duplicate` (v1.6.0 delivered both); `agentbell verify` WARNs "possible double integration" either way; after removing one mechanism, a fresh window is clean (`verify --since 10m`) — **passed 2026-08-21** with GitHub Copilot CLI 1.0.80 under v1.6.0 semantics (two pushes); the default 7-day window keeps warning until the old duplicate records age out |
 | 25 | Old Aider block migration | put a pre-scope agentbell block containing `--agent aider` in an `AGENTS.md` that also has user sections; run `agentbell hooks status`, `agentbell verify --json`, then `agentbell hooks install aider` | status/text verify show the bordered ACTION REQUIRED banner; JSON has `repair_notices[0].code == "aider_agents_block_outdated"`; reinstall preserves user sections and the next status says `installed` with no banner |
 
+## New in 1.7.0 — needs a real-world check
+
+The 2026-09 audit changed these paths. The test suite covers them (Linux,
+WSL2, Windows Python; macOS only in CI), but none has been checked on a real
+machine with a real phone yet. **`[ ]` means untested, not "known good".**
+Tick a row only with the evidence described under "Prerequisites and
+evidence".
+
+| # | What | Command / setup | Expected | Status |
+|---|------|-----------------|----------|--------|
+| 26 | Password prompt under watch | in a terminal: `agentbell watch -- sudo -k true` | sudo asks for the password in the terminal and accepts it; push "succeeded (exit 0)" | [ ] |
+| 27 | Ctrl-C under watch | `agentbell watch -- sleep 60`, press Ctrl-C once; then `agentbell watch -- sh -c 'trap "echo cleanup; exit 0" INT; sleep 60'`, Ctrl-C once | first: exit 130 and a "failed (exit 130)" push; second: `cleanup` printed once, exit 0, success push | [ ] |
+| 28 | Ctrl-Z under watch | `agentbell watch -- sleep 60`, press Ctrl-Z, then `fg` | the job stops and resumes; one push when `sleep` ends | [ ] |
+| 29 | Closing the terminal | `agentbell watch -- sleep 30` in a terminal window, then close the window | the command gets the hangup (a plain `sleep` ends with exit 129); the push still arrives and `agentbell history` records it | [ ] |
+| 30 | `timeout` around watch (Linux) | `timeout 5 agentbell watch -- sh -c 'trap "echo term; exit 0" TERM; sleep 60 & wait'` | `term` is printed once (one SIGTERM, not two); push arrives | [ ] |
+| 31 | Ctrl-C while the push hangs | on a test config whose `ntfy.server` points at a port that accepts but never answers (e.g. `nc -l 8099`): `agentbell watch -- true`, press Ctrl-C while it sends | watch exits at once with 0; stderr says the notification was queued; `agentbell queue list` shows it | [ ] |
+| 32 | Stop the bot service | `systemctl --user stop agentbell-bot`, then `systemctl --user status agentbell-bot` and `agentbell bot status` | unit `inactive`, not `failed`, and not restarted; `bot status` says not running (not "stale") | [ ] |
+| 33 | Kill the bot service | `systemctl --user kill agentbell-bot` (SIGTERM); start it again; then `systemctl --user kill -s KILL agentbell-bot` | SIGTERM: clean stop, stays stopped. SIGKILL: systemd restarts it after ~10 s, the old lock does not block the new bot, `bot status` healthy | [ ] |
+| 34 | Service from a checkout, removed by uninstall | from a checkout: `python3 ./agentbell.py bot install-service`; later, during row 19, `agentbell uninstall --yes` | the service starts (`systemctl --user status agentbell-bot`); after uninstall the unit file and its `default.target.wants` link are gone and no bot runs | [ ] |
+| 35 | Claude Code permission prompt | `agentbell hooks install claude` again (existing installs lack the hook), then let Claude Code show a permission dialog and leave it open | a `permission_required` push labelled Claude Code; `agentbell history` shows `hook.permission_required`. Wired in 1.7.0 from Claude Code's hooks docs, **not yet field-tested** | [ ] |
+| 36 | Typed reply with two open asks | two terminals: `agentbell ask "A?" --timeout 120` and `agentbell ask "B?" --timeout 120`; type `yes` as a reply in the ntfy app | neither ask is approved; a "Reply not used" notification arrives; `agentbell history` has `stale_answer` with `notice: sent`; the buttons still answer each ask. With Telegram: the bot answers the typed `yes` with "was not used", and Reply on one question answers that question | [ ] |
+| 37 | Typed reply right after an unanswered ask | let `agentbell ask "A?" --timeout 15` time out, then within a minute run `agentbell ask "B?"` and type `yes` | refused with a notice (A's question may still be on the phone); about a minute after A ended, a typed reply to a new single ask is used again | [ ] |
+| 38 | Codex config with foreign tables | back up `~/.codex/config.toml` (with your own tables, e.g. `[tui]`, `[projects."…"]`, `[mcp_servers.other]`, a `[profiles.x]` with `features.hooks`); `agentbell hooks install codex`; finish a real Codex turn; `agentbell hooks uninstall codex`; `diff` against the backup | Codex loads the config and the push arrives; after uninstall the only differences are entries Codex itself wrote in the meantime; CRLF stays CRLF if the file used it | [ ] |
+| 39 | Windows PowerShell setup | Windows PowerShell: `py -m pip install --user agentbell` (or pipx), `py -m agentbell init`, `agentbell doctor`, `agentbell test` | init completes; if the Scripts directory is not on `PATH`, doctor prints the PowerShell fix; the test push arrives | [ ] |
+| 40 | Windows `watch -- npm` | in a scratch project: `agentbell watch -- npm --version`, `agentbell watch -- npm install lodash@^4.17.0`, `agentbell watch -- npm run build -- 100%` | npm runs (the `.cmd` is found on `PATH`); `npm ls lodash` shows the newest 4.x release, not exactly 4.17.0 (the caret survived); the `%` argument is refused with exit 127, one stderr line and a "could not be started" push | [ ] |
+| 41 | Server change drops credentials | on a config with `ntfy.auth` (and `ntfy.action_auth`): `agentbell config set ntfy.server https://other.example`, then `agentbell config show`; also re-run `agentbell init` and enter another server | stderr says each credential was cleared; `config show` has no auth; the next `ask`/`notify` sends no password to the new server. Setting the same server with a trailing slash or different letter case keeps them | [ ] |
+| 42 | Parallel sessions keep their own durations | two Claude Code sessions in one repo; a long turn (> 60 s) in one while a short turn ends in the other | the long turn pushes with its own duration; the short one is `hook.skipped_short` | [ ] |
+| 43 | Tuned `--min-duration` survives reinstall | change `--min-duration 60` to `120` in agentbell's `Stop` hook in `~/.claude/settings.json`, run `agentbell hooks install claude` | the hook still says `120` | [ ] |
+| 44 | OpenCode plugin update | after upgrading, `agentbell hooks status` (shows `update needed`), `agentbell hooks install opencode`, then the three turns of row 11 | status `installed`; row 11's expectations hold with the 1.7.0 plugin | [ ] |
+| 45 | Purge with a shared state dir | `AGENTBELL_STATE_DIR` pointing at a directory that also holds a foreign file, plus a foreign file inside its `runs/`; `agentbell uninstall`, then `--yes` | the dry run lists the foreign files as kept; after `--yes` they are still there and only agentbell's entries are gone | [ ] |
+
 ## Agent wiring — all 12
 
-Rows 9–11 above cover the three agents in daily use here. These are all twelve,
+Rows 9–11 above cover Claude Code, Codex and OpenCode; Kimi Code was in
+daily use as well and is ticked in the table below. These are all twelve,
 so the gaps are visible instead of implied. **Everything unticked is untested,
 not "known good".**
 
@@ -139,15 +171,15 @@ Reliability class (shown by `agentbell hooks status`):
 
 | Agent | Mechanism | Scope | Expected when a turn ends | Status |
 |---|---|---|---|---|
-| Claude Code | `~/.claude/settings.json` hooks | global | finished (with duration), failed, needs-input | `[x]` 2026-08-20 → 09-02, WSL2: 242 `run_completed` (223 with duration), 181 `skipped_short`, 43 `run_failed`, 1 `input_required`; delivered to ntfy + Telegram (rows 9, 9b). Finding: one API outage → 6 `run_failed` in 7 s from parallel sessions — collapsed since v1.6.1 |
+| Claude Code | `~/.claude/settings.json` hooks | global | finished (with duration), failed, needs-input; since 1.7.0 also a permission dialog (`permission_prompt`, not yet field-tested: row 35) | `[x]` 2026-08-20 → 09-02, WSL2: 242 `run_completed` (223 with duration), 181 `skipped_short`, 43 `run_failed`, 1 `input_required`; delivered to ntfy + Telegram (rows 9, 9b). Finding: one API outage → 6 `run_failed` in 7 s from parallel sessions — collapsed since v1.6.1 |
 | Codex | `~/.codex/config.toml` `[[hooks.…]]` | global | finished (with duration) | `[x]` 2026-08-21 → 09-02: 70 `run_completed`, all with duration, 62 `skipped_short`; delivered to ntfy + Telegram (row 10) |
-| OpenCode | plugin in `~/.config/opencode/plugin/` | global | finished (with duration), failed, permission asked — exactly one push per turn | `[x]` events 2026-08-21 → 09-02 on OpenCode 1.18.26: 415 `run_completed`, 24 `run_failed`, 36 `permission_required`, all delivered. **"Exactly one push per turn" failed:** 24 same-second doubles (~6% of turns, same session and project) and 0 short-turn skips (no duration). Fixed in v1.6.1 (per-session idle dedupe, `--duration` + `--min-duration 60`). Fixed plugin, 2026-09-03: `[x]` short turns (7 s, 9 s, 51 s → one `skipped_short` each, no push), `[x]` 62 s turn → one delivered push with `in 1m02s`, no duplicate (row 11 passed) |
+| OpenCode | plugin in `~/.config/opencode/plugin/` | global | finished (with duration), failed, permission asked — exactly one push per turn | `[x]` events 2026-08-21 → 09-02 on OpenCode 1.18.26: 415 `run_completed`, 24 `run_failed`, 36 `permission_required`, all delivered. **"Exactly one push per turn" failed:** 24 same-second doubles (~6% of turns, same session and project) and 0 short-turn skips (no duration). Fixed in v1.6.1 (per-session idle dedupe, `--duration` + `--min-duration 60`). Fixed plugin, 2026-09-03: `[x]` short turns (7 s, 9 s, 51 s → one `skipped_short` each, no push), `[x]` 62 s turn → one delivered push with `in 1m02s`, no duplicate (row 11 passed). The 1.7.0 plugin changed again (re-sent prompts are ignored): `[ ]` re-verify, row 44 |
 | Gemini CLI | `~/.gemini/settings.json` `AfterAgent` | global | finished only — Gemini exposes no failure event | `[ ]` installed, no events in the 7 days before 2026-09-02 (not used) |
 | Kimi Code | `~/.kimi-code/config.toml` `[[hooks]]` | global | finished (with duration), failed | `[x]` 2026-08-26/27: 5 `run_completed` with duration, 4 `skipped_short`, 1 `run_failed`; delivered to ntfy + Telegram |
 | Qwen Code | `~/.qwen/settings.json` hooks | global | finished (with duration), failed; hooks are async, so the end of a turn never waits on the network | `[ ]` installed, no events in the 7 days before 2026-09-02 (not used) |
 | Cursor | `.cursor/rules/agentbell.mdc` | project | best-effort: the agent calls the CLI on finish / needs-input / failure | [ ] |
 | Windsurf | `.windsurf/rules/agentbell.md` + legacy `.mdc` | project | best-effort; on a current (Devin) build the `.md` is the file that fires | [ ] |
-| Cline | `.clinerules/agentbell.md` | project | best-effort | [ ] |
+| Cline | `.clinerules/agentbell.md` (or a marked block in an existing single `.clinerules` file) | project | best-effort | [ ] |
 | Continue | `.continue/rules/agentbell.md` | project | best-effort | [ ] |
 | Zed | `.rules` block | project | best-effort; if the repo already had a `.rules`, check its own content survived | [ ] |
 | Aider | `AGENTS.md` block | project | best-effort; check a legacy OpenCode `AGENTS.md` block is not counted as Aider's | [ ] |
@@ -226,18 +258,18 @@ integration" for several real `permission_required` prompts inside one
 second (the near-duplicate heuristic now only covers per-turn events).
 - **Tier 2 — MCP-only mechanism: PASSED 2026-08-21.** GitHub Copilot CLI
   1.0.80 received an ephemeral stdio MCP config with custom instructions,
-  built-in MCPs and shell use excluded from the test. It called AgentBell's
+  built-in MCPs and shell use excluded from the test. It called agentbell's
   `notify` tool once with `agent: "github-copilot-mcp"`; history recorded one
   delivered, attributed event and `verify` exited 0. This proves the MCP-only
   mechanism on a real host, not yet one of the MCP-only products originally
   proposed (Crush, Amp or Warp Agent CLI).
 - **Tier 3 — rules-only mechanism: PASSED 2026-08-21 (3/3 turns).** A
-  committed slug-scoped `AGENTS.md` was the only AgentBell integration in
+  committed slug-scoped `AGENTS.md` was the only agentbell integration in
   three independent GitHub Copilot CLI sessions. All three produced exactly
   one delivered, attributed event; `verify` exited 0 with no duplicates.
   This measures rules-only behavior on a hook-capable host, not yet a product
   whose only integration surface is a rules file.
-- **Tier 4 — failure modes: PASSED 2026-08-21.** (a) with AgentBell absent
+- **Tier 4 — failure modes: PASSED 2026-08-21.** (a) with agentbell absent
   from `PATH`, the JSON guide used the absolute checkout path and returned a
   concrete `path_fix`; (b) all-day quiet hours recorded one event as held and
   `verify` exited 0; (c) two concurrent same-slug sessions produced two held
@@ -255,12 +287,12 @@ second (the near-duplicate heuristic now only covers per-turn events).
 
 ## Known limitations (expected, not bugs)
 
-- **Possible duplicate on retry**: a timed-out POST may have been delivered anyway, so a rare duplicate push can occur (approval answers are deduplicated by request ID).
-- **Free text → newest ask**: with two asks open, a free-text reply answers the newest one (ntfy and Telegram alike). Button answers are matched by ID.
+- **Possible duplicate on retry**: a timed-out POST may have been delivered anyway, so a rare duplicate push can occur (approval answers are deduplicated by request ID). The same holds for a hook send given up at the 6 s hook budget and queued: if the server had accepted it, the queued retry repeats it.
+- **Typed replies need a single open question**: a typed reply is used only when exactly one approval question can still be on the phone. With two asks open, or for about a minute after an ask ended unanswered (its timeout plus 60 s from its start at the latest), it is refused with a notice ("Reply not used" on ntfy, a reply from the Telegram bot) and recorded as `stale_answer`. Buttons, a typed `APPROVED <id>` / `DENIED <id>` and Telegram's Reply on the question always name their question.
 - **Deferred delivery needs activity**: without the `bot` daemon, deferred items go out with the next notification/`queue flush` after the window — not exactly at window end.
 - **Queue/defer are local**: no multi-device sync; they live in the state dir on this machine.
-- **Caps**: 200 deferred items, 100 queued items / 24 h age, history rotated at 2 MB.
-- **Six agents are wired by rule file, not by hook**: Cursor, Windsurf, Cline, Continue, Zed and Aider have no lifecycle hooks, so their wiring is an instruction the agent is asked to follow. Best-effort by construction — the model can skip it, and sometimes will. The other six (Claude Code, Codex, Gemini CLI, OpenCode, Kimi Code, Qwen Code) have real hook systems and are deterministic.
+- **Caps**: 200 deferred items, 100 queued items / 24 h age (counted from the first queueing, also across a quiet-hours defer), history rotated at 2 MB.
+- **Six agents are wired by rule file, not by hook**: for Cursor, Windsurf, Cline, Continue, Zed and Aider agentbell writes an instruction the agent is asked to follow, per project (run `hooks install <agent>` in each repo). Cursor has since documented lifecycle hooks of its own; agentbell does not use them yet. Best-effort by construction — the model can skip it, and sometimes will. The other six (Claude Code, Codex, Gemini CLI, OpenCode, Kimi Code, Qwen Code) have real hook systems and are deterministic.
 - **ChatGPT web** cannot use a local MCP server (desktop app can).
 - **Premium**: Telegram channel, parallel delivery and Telegram buttons need a lifetime key.
 - **A manual smoke test without `--force` is indistinguishable from a real event**: `verify` marks `--force` events as smoke tests, but an agent running the plain hook command by hand looks like real wiring. The trust anchor is procedural — end the session, do one real turn, then `verify`.
