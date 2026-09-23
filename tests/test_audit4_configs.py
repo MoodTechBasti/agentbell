@@ -226,13 +226,15 @@ class TestCodexFeatureFlag(_Home):
         an.install_hooks("codex", add=False)
         self.assertEqual(self.read(path).decode("utf-8"), original)
 
-    def test_the_legacy_flag_above_our_block_still_moves_to_the_top(self):
+    def test_an_unmarked_flag_above_our_block_stays_and_the_top_gets_ours(self):
+        # CR3-2: it may be the user's own line; only the marked one is ours
         path = an.codex_config_path()
         self.write(path, 'model = "gpt-5"\n[model_providers.oss]\nname = "x"\n\n'
                          "features.hooks = true\n\n" + an.codex_hooks_block())
         self.assertTrue(an.install_hooks("codex")["changed"])
         text = self.read(path).decode("utf-8")
-        self.assertEqual(text.count("features.hooks = true"), 1)
+        self.assertEqual(text.count("features.hooks = true"), 2)
+        self.assertIn('name = "x"\n\nfeatures.hooks = true\n\n' + an.TOML_START, text)
         self.assertLess(text.index("features.hooks = true  " + an.CODEX_FLAG_MARKER),
                         text.index("[model_providers.oss]"))
 

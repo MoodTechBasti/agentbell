@@ -112,6 +112,11 @@ WEBHOOK_ASK_MAX_TIMEOUT = 3600
 # bytes; without a cap a bogus Content-Length makes us allocate at will.
 WEBHOOK_MAX_BODY = 64 * 1024
 
+# How much of a body over that cap the webhook reads and drops before its
+# 413. Windows resets a connection closed with unread data in it, and the
+# client then sees the reset instead of the answer.
+WEBHOOK_DRAIN_MAX = 1024 * 1024
+
 # Host header values that prove the request really went to loopback. Anything
 # else is a DNS-rebinding attempt: a name the attacker controls that resolves
 # to 127.0.0.1, so a browser tab can reach this API as if it were local.
@@ -4297,40 +4302,32 @@ def _codex_hooks_flag_is_top_level(text):
                 or re.search(r"^\[features\]", text, re.M))
 
 
-def _codex_flag_pattern(marked_only):
-    """A `features.hooks = true` line we wrote.
-
-    Uninstall (`marked_only`) deletes only the line carrying our comment.
-    Install also takes the bare line a <=1.3.0rc1 install put right above
-    our start marker, where it belonged to the table before it. A flag the
-    user set anywhere else ([profiles.x] included) stays. The second
-    alternative is not anchored: a file with no trailing newline used to get
-    the flag glued onto the last line, and a `^...\\n` pattern could neither
-    prevent that nor remove it.
+def _strip_codex_flag(text):
+    """Remove the `features.hooks = true` line we wrote, known by its marker
+    comment. An unmarked flag is the user's wherever it stands, [profiles.x]
+    included, even right above our block. The second alternative is not
+    anchored: a file with no trailing newline used to get the flag glued onto
+    the last line, and a `^...\\n` pattern could neither prevent that nor
+    remove it.
     """
     marker = re.escape(CODEX_FLAG_MARKER)
     flag = r"features\.hooks[ \t]*=[ \t]*true[ \t]*"
-    legacy = ("" if marked_only else
-              r"|^[ \t]*" + flag + r"\n(?=(?:[ \t]*\n)*" + re.escape(TOML_START) + ")")
-    return re.compile(r"(?m)^[ \t]*" + flag + marker + r"[ \t]*\n?"
-                      + r"|" + flag + marker + r"[ \t]*" + legacy)
-
-
-def _strip_codex_flag(text, marked_only):
-    return _codex_flag_pattern(marked_only).sub("", text)
+    return re.sub(r"(?m)^[ \t]*" + flag + marker + r"[ \t]*\n?"
+                  + r"|" + flag + marker + r"[ \t]*", "", text)
 
 
 def _codex_insert_features_flag(text):
     """Put `features.hooks = true` above the first [table] header.
 
-    After a table header TOML would attach it to that table, so an older
-    install wrote it where it never applied - drop that copy on the way.
+    After a table header TOML would attach it to that table. A marked copy
+    that ended up there (glued onto a last line without a newline) is
+    dropped on the way.
 
     The line carries a marker comment: uninstall must delete the line *we*
     added and keep an identical line the user wrote themselves. The flag is
     always its own line, even when `text` has no trailing newline.
     """
-    text = _strip_codex_flag(text, marked_only=False)
+    text = _strip_codex_flag(text)
     lines = text.splitlines(keepends=True)
     # Before the first table, so TOML keeps the key top-level. Also before
     # our start marker when that comes first: the marker is not a table, and
@@ -4692,6 +4689,21 @@ def _read_toml(path):
     return raw.replace("\r\n", "\n"), _line_ending(raw)
 
 
+def _unreadable_toml_configs():
+    """(agent, path) for a Codex or Kimi config that is not UTF-8. Install,
+    `mcp add` and uninstall refuse it; doctor and verify say so instead of
+    calling the agent "not wired up" or its MCP entry "not registered"."""
+    rows = []
+    for agent, path in (("codex", codex_config_path()), ("kimi", kimi_config_path())):
+        try:
+            _read_toml(path)
+        except RuntimeError:
+            rows.append((agent, path))
+        except OSError:
+            pass              # no file: nothing to read
+    return rows
+
+
 def _write_toml(path, text, eol):
     _write_text_atomic(path, text.replace("\n", eol), newline="")
 
@@ -4806,8 +4818,9 @@ def install_codex_hooks():
             block = _with_tuned_min_duration(
                 codex_hooks_block(), map(_toml_unquote, _toml_command_values(text)), "codex")
             new_text, _present, replaced = _replace_toml_block(text, block)
-            # Self-heal an install from <=1.3.0rc1, where the feature flag was
-            # appended at EOF and therefore belonged to the last table.
+            # Put back a top-level flag that is gone (or that a <=1.3.0rc1
+            # install appended at EOF, into the last table). An unmarked flag
+            # in a table stays: it may be the user's own [profiles.x] line.
             if (_codex_features_need_note(new_text) != "conflict"
                     and not _codex_hooks_flag_is_top_level(new_text)):
                 new_text = _codex_insert_features_flag(new_text)
@@ -4816,7 +4829,7 @@ def install_codex_hooks():
                 _write_toml(path, new_text, eol)
                 return {"changed": True,
                         "notes": ["codex: updated the hook block (binary path, flags, "
-                                  "or the old misplaced 'features.hooks = true')"]}
+                                  "or a missing top-level 'features.hooks = true')"]}
             # no note: the caller already says "already present"
             return {"changed": False, "notes": []}
     else:
@@ -4863,7 +4876,7 @@ def uninstall_codex_hooks():
         new_text = _drop_unmarked_hooks(text, codex_hooks_block())[0]
     # only the line we added: an identical line the user wrote themselves has
     # no marker comment, and removing it would silently turn off their hooks
-    new_text = _strip_codex_flag(new_text, marked_only=True)
+    new_text = _strip_codex_flag(new_text)
     if new_text == text:
         return False
     _write_toml(path, new_text, eol)
@@ -5279,7 +5292,9 @@ def _block_file_result(agent, project, relpath, content, add, replace_stale=Fals
     notes = []
     changed = _install_block_file(path, content, add=add, replace_stale=replace_stale,
                                   notes=notes)
+    # a removal notes only why it left a block in place (a symlink, a stray marker)
     return {"agent": agent, "changed": changed, "path": path,
+            "refused": not add and bool(notes),
             "notes": [f"{agent}: {note}" for note in notes]}
 
 
@@ -5487,7 +5502,7 @@ def uninstall_kimi_hooks():
         _write_toml(path, new_text, eol)
         return {"changed": True, "notes": []}
     if TOML_START in text or TOML_END in text:
-        return {"changed": False,
+        return {"changed": False, "refused": True,
                 "notes": ["kimi: found an agentbell marker without its pair; "
                           "left the file unchanged"]}
     new_text, removed, leftover = _drop_unmarked_hooks(text, kimi_hooks_block())
@@ -5574,8 +5589,8 @@ def _codex_install(add):
 
 def _kimi_install(add):
     result = install_kimi_hooks() if add else uninstall_kimi_hooks()
-    return {"agent": "kimi", "changed": result["changed"],
-            "path": kimi_config_path(), "notes": result.get("notes", [])}
+    return {"agent": "kimi", "changed": result["changed"], "path": kimi_config_path(),
+            "refused": result.get("refused", False), "notes": result.get("notes", [])}
 
 
 def _opencode_result(project, add):
@@ -5584,7 +5599,7 @@ def _opencode_result(project, add):
     if legacy["changed"]:
         result["changed"] = True     # migrate away from the v1.3rc AGENTS.md block
     return {"agent": "opencode", "changed": result["changed"], "path": result["path"],
-            "notes": legacy["notes"]}
+            "refused": legacy["refused"], "notes": legacy["notes"]}
 
 
 AGENTS = ["claude", "codex", "gemini", "kimi", "qwen-code",
@@ -5817,15 +5832,19 @@ def _hooks_in_place(agent, project=None):
 def _install_and_report(agent, project=None, add=True, indent=""):
     """Install (or remove) `agent`'s hooks and print what happened; False
     when its config refused the change. One config agentbell cannot
-    rewrite must not stop the other agents."""
+    rewrite must not stop the other agents. A removal fails only when
+    agentbell's own wiring stays ("refused": a symlinked rule file, a stray
+    marker); a note about the user's own agentbell hooks is information."""
     try:
         result = install_hooks(agent, project=project, add=add)
     except (OSError, RuntimeError) as exc:
         print(f"{indent}{PROG}: hooks for {agent} not changed: {exc}", file=sys.stderr)
         return False
-    ok = True
+    ok = not result.get("refused")
     if not add:
-        print(f"{indent}{'removed' if result['changed'] else 'nothing to remove'} for {agent}")
+        done = ("removed" if result["changed"]
+                else "left in place" if result.get("refused") else "nothing to remove")
+        print(f"{indent}{done} for {agent}")
     elif result["changed"]:
         print(f"{indent}installed hooks for {agent}: {result['path']}")
     else:
@@ -5835,8 +5854,6 @@ def _install_and_report(agent, project=None, add=True, indent=""):
         ok = _hooks_in_place(agent, project)
     for note in result.get("notes", []):
         print(f"{indent}  note: {note}")
-    if not add and not result["changed"] and result.get("notes"):
-        ok = False      # left in place, and the note says why
     return ok
 
 
@@ -7469,24 +7486,43 @@ def webhook_server(cfg):
             self._send(403, {"error": "unexpected Host header"})
             return False
 
-        def _read_body(self):
-            """(payload, ok). Everything a hostile caller can put in a request
-            line has to be survivable: a non-numeric or negative length, a
-            length larger than memory, and JSON nested deep enough to blow the
-            parser's recursion limit."""
+        def _take_body(self):
+            """(body bytes or None, refusal (code, error) or None).
+
+            do_POST reads the body before any answer, a refusal included:
+            a socket closed with the body still unread makes Windows reset
+            the connection, and the client never sees the 401 or 403.
+            Everything a hostile caller can put in a request line has to be
+            survivable: a non-numeric or negative length (nothing can be
+            read then) and a length larger than memory. Up to
+            WEBHOOK_DRAIN_MAX of an oversized body is read and dropped in
+            pieces; a client that sends less than it declared gets its 413
+            after a one-second pause instead of never.
+            """
             raw_length = self.headers.get("Content-Length")
             try:
                 length = int(raw_length) if raw_length not in (None, "") else 0
             except (TypeError, ValueError):
-                self._send(400, {"error": "invalid Content-Length"})
-                return None, False
+                length = -1
             if length < 0:
-                self._send(400, {"error": "invalid Content-Length"})
-                return None, False
+                return None, (400, "invalid Content-Length")
             if length > WEBHOOK_MAX_BODY:
-                self._send(413, {"error": "body too large"})
-                return None, False
-            raw = self.rfile.read(length) if length else b""
+                left = min(length, WEBHOOK_DRAIN_MAX)
+                self.connection.settimeout(1.0)
+                try:
+                    while left > 0:
+                        chunk = self.rfile.read(min(left, WEBHOOK_MAX_BODY))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                except OSError:
+                    pass          # it sent less than it declared
+                return None, (413, "body too large")
+            return (self.rfile.read(length) if length else b""), None
+
+        def _parse_body(self, raw):
+            """(payload, ok); JSON nested deep enough to blow the parser's
+            recursion limit is a 400 like any other bad JSON."""
             try:
                 payload = json.loads(raw.decode("utf-8")) if raw else {}
             except (ValueError, RecursionError):
@@ -7506,12 +7542,16 @@ def webhook_server(cfg):
                 self._send(404, {"error": "not found"})
 
         def do_POST(self):
+            raw, refusal = self._take_body()
             if not self._same_origin():
                 return
             if not self._authorized():
                 self._send(401, {"error": "unauthorized"})
                 return
-            payload, ok = self._read_body()
+            if refusal:
+                self._send(refusal[0], {"error": refusal[1]})
+                return
+            payload, ok = self._parse_body(raw)
             if not ok:
                 return
             if self.path == "/notify":
@@ -8148,7 +8188,14 @@ def doctor_checks(cfg, send=False):
                        if status in ("installed", "user wrapper")]
     outdated_hooks = [agent for agent, status, _, _ in status_rows if status == "update needed"]
     wrapped_hooks = [agent for agent, status, _, _ in status_rows if status == "user wrapper"]
-    missing = [a for a in find_agents() if a not in installed_hooks and a not in outdated_hooks]
+    unreadable = dict(_unreadable_toml_configs())
+    for agent, path in unreadable.items():
+        checks.append(_check(WARN, f"{agent} config",
+                             f"{path} is not UTF-8 text (saved in a legacy encoding?) - "
+                             "agentbell cannot read or change its hooks or MCP entry",
+                             "save it as UTF-8, then run agentbell doctor again"))
+    missing = [a for a in find_agents() if a not in installed_hooks and a not in outdated_hooks
+               and a not in unreadable]
     # self-integrated agents (via `agentbell integrate`) have no config we
     # check, but their history records make them visible here - text only,
     # `verify` is the command that actually assesses them
@@ -8203,7 +8250,7 @@ def doctor_checks(cfg, send=False):
         if self_integrated:
             checks.append(_check(OK, "agent hooks",
                                  "self-integrated: " + ", ".join(self_integrated)))
-        elif not outdated_hooks:
+        elif not outdated_hooks and not unreadable:
             checks.append(_check(WARN, "agent hooks", "no agent is wired up yet",
                                  "agentbell hooks install all"))
 
@@ -8218,7 +8265,7 @@ def doctor_checks(cfg, send=False):
             WARN, "mcp", "registered in " + ", ".join(name for name, _ in broken)
             + ", but the client cannot start " + ", ".join(sorted({c for _, c in broken})),
             "agentbell mcp add " + " ".join(name.split("/")[0] for name, _ in broken)))
-    if not registrations:
+    if not registrations and "codex" not in unreadable:
         checks.append(_check(WARN, "mcp", "not registered in any client (optional)",
                              "agentbell mcp add"))
 
@@ -8591,10 +8638,11 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                     if status == "update needed"}
     wrapped = {name for name, status, _, _ in status_rows
                if status == "user wrapper"}
+    unreadable = {name for name, _ in _unreadable_toml_configs()}
     if agent:
         targets = [agent]
     else:
-        targets = sorted(set(observations) | installed | needs_update)
+        targets = sorted(set(observations) | installed | needs_update | unreadable)
     agents_data = []
     observed_any = False
     for slug in targets:
@@ -8678,13 +8726,19 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
                 "installed but no events in the window - the wiring has not "
                 "been proven yet",
                 "finish one real agent turn, then run this again"))
-        else:
+        elif slug not in unreadable:
             fix = (f"agentbell hooks install {slug}" if known
                    else f"agentbell integrate --agent {slug}")
             checks.append(_check(WARN, name,
                                  "nothing known: not installed, no events in the window",
                                  fix))
         agents_data.append(row)
+        if slug in unreadable:
+            checks.append(_check(
+                WARN, name,
+                "its config file is not UTF-8 text - agentbell cannot read or change "
+                "its hooks or MCP entry",
+                "agentbell doctor   # names the file"))
         if slug in wrapped:
             checks.append(_check(
                 WARN, name,
@@ -9485,9 +9539,21 @@ def _terminal_foreground():
         os.close(tty)
 
 
+# timeout(1)'s long options. getopt takes any unambiguous prefix of one.
+_TIMEOUT_LONG_OPTIONS = ("foreground", "kill-after", "preserve-status", "signal",
+                         "verbose", "help", "version")
+
+
 def _kills_its_group(pid):
     """Whether process `pid` is timeout(1), which signals its child and then
-    its whole group; with --foreground it signals the child alone."""
+    its whole group; with --foreground it signals the child alone.
+
+    Its arguments are read the way its getopt reads them: options up to
+    the duration, short ones bundled (-vs TERM, -sTERM; newer coreutils
+    also take -f and -p), long ones as any unambiguous prefix (--fore,
+    --sig TERM). A spelling this cannot read answers False: passing a
+    signal on once too often is better than dropping it.
+    """
     try:
         with open(f"/proc/{pid}/comm", encoding="utf-8") as fh:
             if fh.read().strip() != "timeout":
@@ -9498,12 +9564,24 @@ def _kills_its_group(pid):
         return False
     options = iter(args)
     for arg in options:
-        if arg == "-f" or (len(arg) > 2 and "--foreground".startswith(arg)):
-            return False
-        if arg in ("-k", "-s", "--kill-after", "--signal"):
-            next(options, None)
-        elif arg == "--" or not arg.startswith("-"):
+        if arg in ("-", "--") or not arg.startswith("-"):
             break             # the duration; the command's own options follow
+        if arg.startswith("--"):
+            name, has_value = arg[2:].split("=", 1)[0], "=" in arg
+            found = [o for o in _TIMEOUT_LONG_OPTIONS if o == name] or [
+                o for o in _TIMEOUT_LONG_OPTIONS if o.startswith(name)]
+            if len(found) != 1 or found[0] == "foreground":
+                return False
+            if found[0] in ("kill-after", "signal") and not has_value:
+                next(options, None)
+            continue
+        for at, letter in enumerate(arg[1:], 2):
+            if letter in "ks":
+                if at == len(arg):
+                    next(options, None)   # its value is the next argument
+                break                     # else the rest of this one
+            if letter not in "pv":
+                return False              # -f, or nothing timeout knows
     return True
 
 

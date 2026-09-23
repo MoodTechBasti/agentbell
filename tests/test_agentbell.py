@@ -1,5 +1,6 @@
 """Tests for agentbell. Run with: python3 -m unittest discover -s tests -v"""
 
+import atexit
 import base64
 import contextlib
 import http.client
@@ -29,6 +30,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import agentbell as an  # noqa: E402
 
 _TEST_ROOT = tempfile.mkdtemp(prefix="agentbell-tests-")
+
+
+def _remove_tree(path):
+    """Delete a temp tree at exit; say so when part of it stays (a file a
+    process still holds open on Windows) instead of failing silently."""
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        shutil.rmtree(path, ignore_errors=True)
+        sys.stderr.write(f"test_agentbell: could not remove all of {path}: {exc}\n")
+
+
+# Every temp dir a test makes (mkdtemp, NamedTemporaryFile) lands under
+# _TEST_ROOT and goes with it, removed or not by the test itself (WF-3).
+tempfile.tempdir = os.path.join(_TEST_ROOT, "tmp")
+os.makedirs(tempfile.tempdir)
+atexit.register(_remove_tree, _TEST_ROOT)
 os.environ["AGENTBELL_STATE_DIR"] = os.path.join(_TEST_ROOT, "state")
 os.environ["AGENTBELL_CONFIG_DIR"] = os.path.join(_TEST_ROOT, "config")
 os.environ.pop("AGENTBELL_CONFIG", None)
@@ -4274,7 +4292,9 @@ class TestAuditRegressions(unittest.TestCase):
 
     @unittest.skipUnless(HAS_TOMLLIB, "tomllib requires 3.11+")
     def test_codex_install_repairs_a_pre_1_3_0_config(self):
-        """The old install put the flag where TOML scoped it to the last table."""
+        """The old install put the flag where TOML scoped it to the last table.
+        The top-level flag is added; the unmarked line may be the user's and
+        stays (CR3-2)."""
         import tomllib
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, "config.toml")
@@ -4294,7 +4314,8 @@ class TestAuditRegressions(unittest.TestCase):
             with open(path, "rb") as fh:
                 data = tomllib.load(fh)
             self.assertIs(data["features"]["hooks"], True)
-            self.assertEqual(data["model_providers"]["oss"], {"name": "x"})
+            self.assertEqual(data["model_providers"]["oss"],
+                             {"name": "x", "features": {"hooks": True}})
             self.assertFalse(an.install_codex_hooks()["changed"])     # idempotent
         finally:
             an.codex_config_path = original

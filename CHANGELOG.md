@@ -66,11 +66,19 @@ that is still running from an earlier version. Until it restarts, `ask`,
   reaches the command when `watch` runs without a terminal (cron, CI).
   macOS and other non-Linux systems use a heuristic instead: while `watch`
   is the terminal's foreground job, Ctrl-C and Ctrl-\\ count as keys, so a
-  `kill -INT <watch pid>` sent from elsewhere is not passed on. Known
-  residual on every POSIX system: a signal sent to the whole group from
-  outside it (`kill %1`, `kill -- -PGID`, systemd `KillMode=control-group`)
-  reaches the command twice, as with sudo. A command that treats a second
-  SIGTERM as "force quit" then skips its graceful shutdown.
+  `kill -INT <watch pid>` sent from elsewhere is not passed on.
+  timeout(1)'s options are read the way its getopt reads them
+  (`-vs TERM --foreground`, `--sig TERM`, `--fore`). An option it cannot
+  read counts as a relay. Known residual on every POSIX system: a signal
+  sent to the whole group from outside it (`kill %1`, `kill -- -PGID`,
+  systemd `KillMode=control-group`) reaches the command twice, as with
+  sudo. On Linux it arrives three times when a relaying parent sits in
+  between (`uv run`, a nested `watch`). A parent that signals its own
+  group (a script's `trap 'kill 0' TERM`) cannot be told apart from a
+  relay, so the command gets that signal twice. A command that treats a
+  second SIGTERM as "force quit" then skips its graceful shutdown.
+  Dropping a signal that might be a repeat was rejected: a command that
+  never stops, while the push says it succeeded, is worse.
 - **Ctrl-C while the push hangs ends `watch`.** Once the command has ended,
   Ctrl-C or SIGTERM during a stalled send queues the push, says so on
   stderr, and exits with the command's code. Before, these signals were
@@ -89,10 +97,14 @@ that is still running from an earlier version. Until it restarts, `ask`,
 - **Refused configs exit 1.** `hooks install` exits 1 when it refuses a
   config and nothing is installed: a settings.json with comments or
   trailing commas, clashing TOML hooks, a non-UTF-8 config, a broken
-  AGENTS.md block, a symlinked rule file. `hooks uninstall` and
-  `uninstall --yes` report a failure (exit 1) when something still runs
-  agentbell afterwards: an unpaired marker, a hook you wrote yourself, a
-  symlinked AGENTS.md. `mcp add` exits 1 when a client row says FAILED.
+  AGENTS.md block, a symlinked rule file. `hooks uninstall` exits 1 when
+  agentbell's own block stays in place (an unpaired marker in a rule file
+  or the Kimi config, a symlinked AGENTS.md) and says "left in place for
+  <agent>". A hook you wrote
+  yourself that calls agentbell is kept with a note and exit 0, so
+  `hooks uninstall all` can be run again. `uninstall --yes` exits 1 when a
+  step fails and does not print "Done" while your own hooks still run
+  agentbell. `mcp add` exits 1 when a client row says FAILED.
 - **`bot install-service` exits 1 when the service could not be set up**
   (no systemd, as on WSL; `systemctl` or `launchctl` failing or missing;
   an unwritable service directory). It used to report success. The
@@ -349,9 +361,12 @@ that is still running from an earlier version. Until it restarts, `ask`,
   file mode. A file that mixes CRLF and LF gets its majority line ending.
 - A symlinked config stays a symlink; the file it points at is updated.
 - A config without a trailing newline stays valid: `features.hooks = true`
-  goes on its own line, and a copy glued to the last line is removed. A
-  `features.hooks = true` you set under another table (`[profiles.x]`) is
-  kept.
+  goes on its own line, and a copy glued to the last line is removed.
+  Only the `features.hooks = true` line with agentbell's marker comment is
+  agentbell's. A flag without it is kept wherever it stands, under
+  `[profiles.x]` or directly above agentbell's block. A bare flag that a
+  1.3.0rc1 or older install appended there now stays as well, and install
+  adds the top-level one.
 - A config with inline hooks (`hooks = {...}`, `Stop = [...]`, dotted
   `hooks.Stop = ...`, a plain `[hooks.Stop]` table) is not turned into
   invalid TOML: nothing is written, and a note names the entry and how to
@@ -453,8 +468,15 @@ that is still running from an earlier version. Until it restarts, `ask`,
 - An MCP `notify` call no longer verifies an installed hook; an agent
   with hooks needs a real lifecycle event. MCP-only hosts are still
   verified by their first notify call.
+- A Codex or Kimi `config.toml` that is not UTF-8 is named by `doctor`
+  (and reported by `verify`, without the path). Before, `doctor` said
+  "not registered" and "not wired up" and suggested `mcp add` or `hooks
+  install`, which refuse the same file.
 - The webhook server reports a port already in use as an error instead of
   a traceback.
+- The webhook server reads the request body before it refuses a request
+  (401, 403, 413; up to 1 MiB of a body over the cap). Before, a
+  client on Windows got a connection reset instead of the answer.
 
 ### Security
 
@@ -497,6 +519,9 @@ that is still running from an earlier version. Until it restarts, `ask`,
   pip `--user` or pipx install, whatever `KIMI_CODE_HOME`, `QWEN_HOME`,
   `XDG_*`, `APPDATA`, `PYTHONUSERBASE`, `PIPX_*` or `AGENTBELL_CONFIG` are
   set to.
+- The test suite removes its temp dirs at exit. Every temp dir a test
+  makes lives under one root, and a part that cannot be removed is
+  reported on stderr.
 
 ## 1.6.3 — 2026-09-03 — review hardening
 

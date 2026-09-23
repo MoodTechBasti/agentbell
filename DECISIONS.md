@@ -1348,13 +1348,30 @@ documented instead.
   command that treats a second SIGTERM as "force quit" (Terraform) skips
   its graceful shutdown then. A SIGTERM sent to `watch` alone reaches the
   command once (tested).
-- A parent shell script whose trap runs `kill 0` looks like a relaying
-  parent, so the command gets that SIGTERM twice.
-- `timeout --foreground` is recognized only when `timeout` is `watch`'s
-  direct parent and the option is written on its own (`-f`,
-  `--foreground` or an unambiguous prefix). A bundled short option such
-  as `-vf` is read as a group-killing `timeout`, so the signal, which
-  only reached `watch`, is not passed on and the command keeps running.
+- Linux: a parent in `watch`'s group that signals the whole group
+  itself looks exactly like a parent that relays to `watch` alone. Both
+  send the same signal with the same `SI_USER` sender, and the sender is
+  `watch`'s parent in both cases. Example: a shell script with
+  `trap 'kill 0' TERM` around `agentbell watch -- cmd &`. The command
+  gets that SIGTERM twice, once from the group and once from `watch`. A
+  group signal from outside with a relaying parent in between (`uv run`,
+  a nested `watch`, then `kill -- -PGID`, `kill %1`, a CI cancel) reaches
+  the command three times: directly, from outside through `watch`, and
+  relayed by the parent through `watch`. A plain `watch` gets it twice,
+  as in the first item. Dropping a repeat within a time window was
+  considered and rejected: that window cannot tell a duplicate from a
+  second, intended signal. The kernel's pending-signal bits cannot tell
+  "already handled" from "never sent" either. A dropped signal (the
+  command never stops, and the push says it succeeded) is worse than a
+  duplicate, so `watch` passes it on.
+- `timeout` counts as a group kill only when it is `watch`'s direct
+  parent (`/proc/<pid>/comm` is `timeout`). Its arguments are read the
+  way its getopt reads them: options up to the duration, bundled short
+  options (`-vs TERM`, `-sTERM`, `-vf`), and any unambiguous prefix of a
+  long option (`--sig TERM`, `--fore`). A spelling this parser cannot
+  read (an unknown or ambiguous option) is treated as a relay, so the
+  command gets the signal at worst twice and never zero times. BusyBox
+  and other `timeout` programs are read with GNU's options.
 - A SIGINT or SIGQUIT that a relaying parent passes on while `watch` is
   the terminal's foreground job is taken for a key press and dropped:
   `kill -INT <wrapper pid>` from another terminal does not reach the
@@ -1600,7 +1617,12 @@ reinstall (§12j).
    a Codex or Kimi `config.toml`.
 
 Everything else is the user's. Reinstall and uninstall leave it.
-`hooks uninstall` says how many such commands it kept, and `uninstall
+`hooks uninstall` says how many such commands it kept and exits 0. The
+kept commands are the user's, not a refusal, so `hooks uninstall all`
+can be run again. It exits 1 only when agentbell's own block stays in
+place (a symlinked AGENTS.md, a marker without its partner in a rule file
+or the Kimi config), and then it
+prints "left in place for <agent>" with the reason. `uninstall
 --yes` reports them as kept and does not print "Done" while they remain.
 `hooks status` shows `user wrapper` and `doctor` warns. With a user's
 hook and no agentbell entry in the file, install adds nothing and says
@@ -1636,12 +1658,21 @@ hook forms turned into invalid TOML.
   ending and written back with it; final newlines, trailing blank lines
   and comments stay. Uninstall removes only agentbell's hook tables and
   its `[mcp_servers.agentbell]` table with its sub-tables, even when a
-  sub-table sits elsewhere. Install touches only its own marked
-  `features.hooks = true` line (and a pre-1.3 bare line directly above
-  agentbell's block), so a flag under `[profiles.x]` is left alone. A file that is not UTF-8, or that defines hooks inline
+  sub-table sits elsewhere. Install and uninstall touch only the
+  `features.hooks = true` line that carries agentbell's marker comment.
+  An unmarked flag is the user's wherever it stands, under `[profiles.x]`
+  or directly above agentbell's block. Earlier builds removed a bare line
+  in that spot, taking it for the one installs up to 1.3.0rc1 appended,
+  and a user's `[profiles.x]` flag there went with it. Such a line now
+  stays in the table it belongs to, and install adds the marked top-level
+  flag. A
+  file that is not UTF-8, or that defines hooks inline
   (`hooks = {…}`, `hooks.Stop = …`, a plain `[hooks.Stop]` table), is
   refused: nothing is written, a note names the entry, and `hooks
-  install` exits 1.
+  install` exits 1. `doctor` names a Codex or Kimi config that is not
+  UTF-8, and `verify` reports it without the path. Neither calls that
+  agent "not wired up" or its MCP entry "not registered", which would
+  suggest a fix that fails on the same file.
 - **Rule files** (`AGENTS.md`, `.rules`, `.clinerules`, `.continue`
   rules): edited byte for byte, including non-UTF-8 text (cp1252,
   latin-1) and the file's own line endings. A UTF-16 file is left
