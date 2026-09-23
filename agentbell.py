@@ -11,10 +11,12 @@ Python stdlib only. Python >= 3.9.
 import argparse
 import base64
 import datetime
+import errno
 import getpass
 import hashlib
 import hmac
 import html
+import http.client
 import json
 import os
 import platform
@@ -23,6 +25,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -116,6 +119,12 @@ WEBHOOK_LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 # Random bytes for approval request ids (16 hex chars when hex-encoded):
 # unguessable, carried by ntfy button bodies and Telegram callback_data.
 APPROVAL_ID_BYTES = 8
+
+# Listing the response topic before waiting. One failed read used to leave
+# the "already seen" set empty, so a late "yes" to the previous question
+# became the answer to this one. Retry a short blip; then refuse to wait.
+PRIME_ATTEMPTS = 3
+PRIME_RETRY_SECONDS = 0.2
 
 # Topics shorter than this are considered guessable on public servers.
 MIN_GUESSABLE_TOPIC_LEN = 16
@@ -690,11 +699,29 @@ def _auth_header(ntfy_cfg):
 
 # Telegram puts the bot token in the URL path, and error messages carry the
 # URL into history, state files and stderr. Scrub it at the single choke point.
-_TG_TOKEN_RE = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
+# The token runs until the next slash: a space or CR used to stop the match
+# early and leave the rest of the secret in the error.
+_TG_TOKEN_RE = re.compile(r"/bot\d+:[^/]*")
 
 
 def safe_url(url):
     return _TG_TOKEN_RE.sub("/bot<redacted>", str(url))
+
+
+def _telegram_token(token):
+    """The bot token, or PermanentError that does not repeat it.
+
+    A paste often carries a trailing newline. That is still the token.
+    A space or CR inside it is not a token Telegram will accept, and it
+    must not be copied into the error: the URL parser quotes the whole
+    URL, and the old scrubber stopped at the whitespace.
+    """
+    cleaned = str(token or "").strip()
+    # Surrounding whitespace is a paste. Whitespace inside the token is not,
+    # and it must not be repeated: the HTTP library quotes the raw URL.
+    if not cleaned or any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
+        raise PermanentError("invalid bot token")
+    return cleaned
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -729,9 +756,22 @@ def http_request(url, method="GET", headers=None, body=None, timeout=10.0):
             data = body
     try:
         with OPENER.open(request, data=data, timeout=timeout) as resp:
-            return resp.status, resp.read()
+            try:
+                body = resp.read()
+            except (OSError, http.client.HTTPException) as exc:
+                # The status line made it; the body did not. urllib does not
+                # wrap this read, so RemoteDisconnected and IncompleteRead
+                # used to escape as a raw crash.
+                raise TransientError(
+                    f"connection to {safe_url(url)} dropped while reading "
+                    f"the response ({type(exc).__name__})") from exc
+            return resp.status, body
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
+        try:
+            raw = exc.read()
+            detail = raw.decode("utf-8", "replace")[:300] if raw else ""
+        except (OSError, http.client.HTTPException):
+            detail = ""
         if 300 <= exc.code < 400:
             target = exc.headers.get("Location") if exc.headers else None
             raise PermanentError(
@@ -746,6 +786,12 @@ def http_request(url, method="GET", headers=None, body=None, timeout=10.0):
         raise TransientError(f"cannot reach {safe_url(url)}: {exc.reason}") from exc
     except socket.timeout as exc:
         raise TransientError(f"timeout talking to {safe_url(url)}") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        # getresponse() is outside urllib's OSError wrapper. A reset there
+        # (RemoteDisconnected, ConnectionResetError) is not a URLError and
+        # not a timeout, so it used to skip the retry and the offline queue.
+        raise TransientError(
+            f"connection to {safe_url(url)} failed ({type(exc).__name__})") from exc
 
 
 def clamp_message(text, limit=3900):
@@ -830,8 +876,9 @@ class NtfyChannel:
             request.add_header(key, value)
         try:
             return OPENER.open(request, timeout=timeout)     # never follows redirects
-        except (urllib.error.URLError, socket.timeout) as exc:
-            raise RuntimeError(f"cannot subscribe to {url}: {exc}") from exc
+        except (urllib.error.URLError, socket.timeout, OSError,
+                http.client.HTTPException) as exc:
+            raise RuntimeError(f"cannot subscribe to {safe_url(url)}: {exc}") from exc
 
     def poll(self, topic, since, timeout=10.0):
         """One-shot fetch of messages since `since`.
@@ -881,6 +928,7 @@ class TelegramChannel:
         Every endpoint answers with {"ok": bool, "result"/"description"}, so
         parsing and error reporting live here instead of in five copies.
         """
+        token = _telegram_token(token)
         url = f"{TG_API_BASE}/bot{token}/{method}{url_params}"
         if body is None:
             status, raw = http_request(url, timeout=timeout)
@@ -931,8 +979,9 @@ class TelegramChannel:
         else:
             text += "\n\n(start the answer bot with 'agentbell bot' to answer here)"
         body["text"] = text
-        self._api("sendMessage", body, timeout)
-        return {"channel": "telegram", "ok": True}
+        result = self._api("sendMessage", body, timeout)
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        return {"channel": "telegram", "ok": True, "message_id": message_id}
 
     def answer_callback(self, callback_query_id, text=None, timeout=10.0):
         body = {"callback_query_id": callback_query_id}
@@ -989,11 +1038,6 @@ def _applescript_string(value):
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _powershell_string(value):
-    """Quote a value for a PowerShell single-quoted string."""
-    return "'" + str(value).replace("'", "''") + "'"
-
-
 def os_notify(title, message, priority=3):
     system = platform.system()
     title = str(title or "Notification")
@@ -1019,8 +1063,14 @@ def os_notify(title, message, priority=3):
             return {"channel": "os", "ok": True}
         elif system == "Windows":
             # BurntToast is not installed by default, so use the WinRT toast API
-            # directly. This actually shows a notification - the previous
-            # version only loaded the type and reported success.
+            # directly. The text is not interpolated into the script: Windows
+            # PowerShell 5.1 treats typographic apostrophes (U+2018–U+201B)
+            # as quotes, so a message containing ’ closed the string and the
+            # rest ran as code. The script is constant; the text rides in the
+            # child environment. A NUL cannot live in an environment block.
+            env = os.environ.copy()
+            env["AGENTBELL_OS_TITLE"] = title.replace("\x00", "")
+            env["AGENTBELL_OS_MESSAGE"] = message.replace("\x00", "")
             script = (
                 "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
                 "ContentType = WindowsRuntime] > $null;"
@@ -1029,14 +1079,14 @@ def os_notify(title, message, priority=3):
                 "$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
                 "[Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
                 "$n = $t.GetElementsByTagName('text');"
-                f"$n.Item(0).AppendChild($t.CreateTextNode({_powershell_string(title)})) > $null;"
-                f"$n.Item(1).AppendChild($t.CreateTextNode({_powershell_string(message)})) > $null;"
+                "$n.Item(0).AppendChild($t.CreateTextNode($env:AGENTBELL_OS_TITLE)) > $null;"
+                "$n.Item(1).AppendChild($t.CreateTextNode($env:AGENTBELL_OS_MESSAGE)) > $null;"
                 "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
                 "'agentbell').Show([Windows.UI.Notifications.ToastNotification]::new($t))"
             )
             subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                check=True, timeout=15, capture_output=True,
+                check=True, timeout=15, capture_output=True, env=env,
             )
             return {"channel": "os", "ok": True}
     except (OSError, subprocess.SubprocessError):
@@ -1079,8 +1129,14 @@ def in_quiet_hours(quiet_hours, now=None):
         current = now.hour * 60 + now.minute
         if start == end:
             continue
+        # 23:59 is the last minute a window can name. Treating it like every
+        # other exclusive end drops that minute, so "00:00-23:59" (all day)
+        # is loud at 23:59. The window runs through that minute and stops
+        # at midnight. Every other end stays exclusive: 14:00 is not quiet
+        # in a window that ends at 14:00.
         if start < end:
-            if start <= current < end:
+            end_at = 24 * 60 if end == 23 * 60 + 59 else end
+            if start <= current < end_at:
                 return True
         else:
             if current >= start or current < end:
@@ -1122,9 +1178,15 @@ def next_quiet_end(quiet_hours, now=None):
         if start is None or end is None or start == end:
             continue
         if start < end:
-            if not start <= current < end:
+            end_at = 24 * 60 if end == 23 * 60 + 59 else end
+            if not start <= current < end_at:
                 continue
-            end_dt = now.replace(hour=end // 60, minute=end % 60, second=0, microsecond=0)
+            if end_at == 24 * 60:
+                end_dt = (now + datetime.timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+            else:
+                end_dt = now.replace(hour=end // 60, minute=end % 60,
+                                     second=0, microsecond=0)
         else:
             if current >= start:
                 end_dt = (now + datetime.timedelta(days=1)).replace(
@@ -1244,19 +1306,103 @@ def safe_agent_name(value):
     return value if AGENT_NAME_RE.fullmatch(value) else None
 
 
-def _run_marker_path(agent):
-    return os.path.join(state_dir(), "runs", f"{validate_agent_name(agent)}.json")
+def _scope_token(value):
+    """A session id or directory, or nothing. Numbers and strings only."""
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value.strip()
+    return ""
 
 
-def write_start_marker(agent):
-    ensure_state_dir(os.path.dirname(_run_marker_path(agent)))
-    with open_private(_run_marker_path(agent), "w") as fh:
+def _marker_scope(session_id=None, cwd=None):
+    """File suffix for one session. Empty means the legacy per-agent marker.
+
+    A session id wins. Without one, the working directory separates two
+    agents in different trees. Two sessions in one tree need the id: the
+    host puts it on the hook's stdin.
+    """
+    session = _scope_token(session_id)
+    if session:
+        token = "s:" + session
+    else:
+        directory = _scope_token(cwd)
+        if not directory:
+            return ""
+        token = "c:" + directory
+    return hashlib.sha1(token.encode("utf-8")).hexdigest()[:16]
+
+
+def _run_marker_path(agent, scope=""):
+    name = validate_agent_name(agent)
+    if scope:
+        name = f"{name}-{scope}"
+    return os.path.join(state_dir(), "runs", f"{name}.json")
+
+
+def _run_marker_is_stale(path, max_age, now):
+    """True when this start marker is older than the duration window."""
+    try:
+        if not os.path.isfile(path):
+            return False
+    except OSError:
+        return False
+    started = None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and data.get("started_at") is not None:
+            started = float(data.get("started_at"))
+    except (OSError, ValueError, TypeError):
+        started = None
+    if started is None:
+        try:
+            started = os.path.getmtime(path)
+        except OSError:
+            return False
+    return started > 0 and now - started > max_age
+
+
+def _sweep_stale_run_markers(max_age=86400):
+    """Delete session start markers that a Stop hook will never consume.
+
+    A turn that ends without Stop leaves `runs/<agent>-<scope>.json`.
+    `read_start_marker` already ignores a file older than `max_age`, so
+    deleting it does not change which turns get a duration. `last-sent.json`
+    is the dedupe record in the same directory and is not a start marker.
+    """
+    directory = os.path.join(state_dir(), "runs")
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        if name == "last-sent.json" or not name.endswith(".json"):
+            continue
+        path = os.path.join(directory, name)
+        if not _run_marker_is_stale(path, max_age, now):
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def write_start_marker(agent, session_id=None, cwd=None):
+    _sweep_stale_run_markers()
+    path = _run_marker_path(agent, _marker_scope(session_id, cwd))
+    ensure_state_dir(os.path.dirname(path))
+    with open_private(path, "w") as fh:
         json.dump({"agent": agent, "started_at": time.time()}, fh)
 
 
-def read_start_marker(agent, max_age=86400):
+def read_start_marker(agent, max_age=86400, session_id=None, cwd=None):
     """Return elapsed seconds since the start marker (consumed on read)."""
-    path = _run_marker_path(agent)
+    _sweep_stale_run_markers(max_age)
+    path = _run_marker_path(agent, _marker_scope(session_id, cwd))
     age = None
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -1413,6 +1559,31 @@ def newest_pending(name):
 
 def write_tg_pending(approval_id, message, timeout_seconds):
     write_pending("tg-pending", approval_id, message, timeout_seconds)
+
+
+def remember_tg_question_message(approval_id, message_id):
+    """Record the Telegram message id of the question we just sent.
+
+    Free-text replies are ordered against this id, not against the local
+    clock. Message ids increase inside one chat. A restarted bot replays
+    about a day of updates; a lower id was written before this question
+    existed, whatever the two clocks say (DECISIONS §16i, §22).
+    """
+    path = _tg_pending_path(approval_id)
+    try:
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return
+        data["question_message_id"] = message_id
+        with open_private(path, "w") as fh:
+            json.dump(data, fh)
+    except (OSError, ValueError):
+        return
 
 
 def remove_tg_pending(approval_id):
@@ -1633,6 +1804,46 @@ def _pid_alive(pid):
         return False
 
 
+def _process_start_token(pid=None):
+    """Linux start-time field for `pid`, or "" when this host has none.
+
+    /proc/<pid>/stat field 22. It stays constant for the life of that
+    process and changes when the pid is reused, which a bare pid check
+    cannot see. The command name is in parentheses and may itself contain
+    spaces and parentheses, so the fields after the last ')' are what counts.
+    """
+    pid = os.getpid() if pid is None else pid
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8") as fh:
+            stat = fh.read()
+    except (OSError, ValueError):
+        return ""
+    fields = stat.rpartition(")")[2].split()
+    # state is field 3, so field 22 is index 19 of what follows the comm.
+    if len(fields) <= 19:
+        return ""
+    return fields[19]
+
+
+def _bot_lock_is_live(data):
+    """True only when the recorded process is still that same process."""
+    if not isinstance(data, dict):
+        return False
+    try:
+        pid = int(data.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if not _pid_alive(pid):
+        return False
+    recorded = data.get("start")
+    if not recorded:
+        return True
+    current = _process_start_token(pid)
+    if not current:
+        return True
+    return str(current) == str(recorded)
+
+
 def acquire_bot_lock():
     """Exclusive lock so only one answer daemon polls getUpdates at a time."""
     ensure_state_dir()
@@ -1647,17 +1858,18 @@ def acquire_bot_lock():
                     data = json.load(fh)
             except (OSError, ValueError):
                 pass
-            if data.get("pid") and _pid_alive(int(data["pid"])):
+            if _bot_lock_is_live(data):
                 raise SystemExit(
-                    f"{PROG}: another agentbell bot is already running (pid {data['pid']})"
+                    f"{PROG}: another agentbell bot is already running (pid {data.get('pid')})"
                 )
             try:
                 os.remove(path)
             except OSError:
                 pass
             continue
+        start = _process_start_token() or None
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"pid": os.getpid(), "ts": time.time()}, fh)
+            json.dump({"pid": os.getpid(), "ts": time.time(), "start": start}, fh)
         return path
     raise SystemExit(f"{PROG}: could not acquire bot lock at {path}")
 
@@ -2239,12 +2451,87 @@ def ask_actions(server, resp_topic, approval_id, yes_label, no_label, ntfy_cfg):
 VERDICT_ID_RE = re.compile(r"(approved?|denied?|deny)\s+([0-9a-f]+)\b", re.I)
 
 
-def _parse_answer(text):
+# Standalone affirmations. Anything with more words ("yes, but use staging")
+# stays free text so the instruction is not thrown away. `ja` is the pair
+# of `nein`: a German yes is an explicit approval, not an open answer.
+_APPROVAL_WORDS = frozenset({
+    "approve", "approved", "yes", "yep", "yeah", "ok", "okay", "y", "ja",
+    "\U0001f44d",
+})
+
+# Leading negations, longest first so "not yet" is not lost to "n" and
+# "noch nicht" is not lost to a shorter token. A custom no-button label is
+# added at match time. This list is the exit-code gate (`ask && deploy`
+# sees only the exit code). It cannot be complete; anything it does not
+# recognize is free text and is not an approval either (DECISIONS §22).
+_DENIAL_PHRASES = (
+    "auf gar keinen fall", "auf keinen fall", "keinesfalls", "lieber nicht",
+    "absolut nicht", "absolutely not", "please do not", "please don't",
+    "please dont", "please no", "bitte nicht", "bloß nicht", "bloss nicht",
+    "nicht jetzt", "not today", "not now", "not yet", "noch nicht",
+    "no thank you", "no thanks", "no way", "hell no", "hold on", "do not",
+    "abgebrochen", "abbrechen", "abbruch", "niemals", "denied", "don't",
+    "dont", "never", "cancel", "reject", "later", "stopp", "moment",
+    "abort", "nope", "nein", "deny", "halt", "stop", "nee", "nah", "nö",
+    "ne", "no", "n",
+)
+
+# Whole-reply refusals. As a prefix, "not" / "nicht" would eat "not staging
+# — use prod" and "wait" would eat "wait for CI, then ship". Alone, both
+# mean no. "halt" is a leading phrase (like "stop"): "halt, tests are red"
+# has to deny, or `ask && deploy` would run.
+_DENIAL_STANDALONE = frozenset({
+    "not", "nicht", "wait", "warte",
+})
+
+# A leading mark is a denial, including a skin tone or a gender ZWJ sequence.
+# ✋ and ⛔ sit with the other stop marks: "not now" was a denial and the
+# raised hand / no-entry mark for the same reply was not.
+_DENIAL_MARK_RE = re.compile(
+    r"^(?:\U0001f44e|\u274c|\U0001f6d1|\U0001f6ab|\u274e|\u2716|\u2715"
+    r"|\U0001f645|\u270b|\u26d4)"
+    r"(?:[\U0001f3fb-\U0001f3ff]|\ufe0f|\u200d[\u2640\u2642\U0001f9d1]*)*"
+    r"[\s,.:!-]*(.*)\Z",
+    re.S,
+)
+
+
+def _strip_trailing_punct(text):
+    return re.sub(r"[.!]+$", "", text or "").strip()
+
+
+def _denial_reason(text, no_label):
+    """Return the text after a leading negation, or None if it is not one.
+
+    `no_label` is the deny button's label: typing the word the question
+    told the user to reply with has to deny, even when it is not in the
+    built-in list ("Abort", "Hold").
+    """
+    phrases = list(_DENIAL_PHRASES)
+    extra = _strip_trailing_punct((no_label or "").strip())
+    extra = extra.replace("\u2019", "'").replace("\u2018", "'")
+    if extra:
+        phrases.append(extra)
+    for phrase in sorted(set(phrases), key=len, reverse=True):
+        match = re.match(
+            r"^" + re.escape(phrase) + r"(?!\w)[\s,.:!-]*(.*)\Z",
+            text, re.I | re.S)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _parse_answer(text, yes_label="Approve", no_label="Deny"):
     """Classify an answer as approved / denied / free text.
 
-    A bare "yes" is approval; "yes, but use staging" is an instruction and must
-    keep its text - collapsing it to a plain "approved" silently dropped what
-    the user actually said.
+    Approval is only a bare "yes" (or `ja`), the yes button's label alone,
+    or the button body `APPROVED <id>`. "yes, but use staging" keeps its
+    text and is not an approval. A negation, a no-mark (👎 ❌ 🛑 ✋ ⛔), or
+    the no button's label denies even with a reason after it. The yes
+    label is checked before that list: the hint says to reply with it,
+    and a label such as "Stop it" would otherwise match the denial "stop".
+    Anything else is free text: exit 0, the text in `answer`, and
+    `approved` false (DECISIONS §22).
     """
     cleaned = (text or "").strip()
     if not cleaned:
@@ -2254,15 +2541,26 @@ def _parse_answer(text):
         return "approved", ""
     if re.fullmatch(r"denied?\s+[0-9a-f]+", cleaned, re.I):
         return "denied", ""
-    # A negation always denies, even with a reason after it: failing closed is
-    # the safe direction for an approval gate ("no, not yet" must not proceed).
-    denial = re.match(r"(deny|denied|no|nope|cancel|reject|stop|n)\b[\s,.:!-]*(.*)",
-                      cleaned, re.I | re.S)
-    if denial:
-        return "denied", denial.group(2).strip()
-    # An affirmation only approves when it stands alone: "yes, but use staging"
-    # is an instruction, and collapsing it to "approved" would lose it.
-    if re.fullmatch(r"(approve[d]?|yes|yep|yeah|ok|okay|y|\U0001f44d)[.!]*", cleaned, re.I):
+    normalized = cleaned.replace("\u2019", "'").replace("\u2018", "'")
+    standalone = _strip_trailing_punct(normalized)
+    yes = _strip_trailing_punct((yes_label or "").strip())
+    yes = yes.replace("\u2019", "'").replace("\u2018", "'")
+    if yes and standalone.casefold() == yes.casefold():
+        return "approved", ""
+    mark = _DENIAL_MARK_RE.match(normalized)
+    if mark:
+        return "denied", mark.group(1).strip()
+    reason = _denial_reason(normalized, no_label)
+    if reason is not None:
+        return "denied", reason
+    if standalone.casefold() in _DENIAL_STANDALONE:
+        return "denied", ""
+    words = set(_APPROVAL_WORDS)
+    if yes:
+        words.add(yes.casefold())
+    if standalone.casefold() in words:
+        return "approved", ""
+    if re.fullmatch(r"\U0001f44d(?:[\U0001f3fb-\U0001f3ff]|\ufe0f)*[.!]*", normalized):
         return "approved", ""
     return "answer", cleaned
 
@@ -2310,16 +2608,33 @@ class ApprovalWaiter:
         second is replayed into this one and the new question is answered
         instantly with the old text (reproduced end-to-end). Priming by
         message id is exact and costs one request before we start waiting.
+
+        A failed read must not start the wait with an empty seen set: the
+        next poll would then treat that old reply as the answer. Retry a
+        short blip, then fail closed.
         """
-        try:
-            events = NtfyChannel(self.cfg).poll(self.resp_topic, self._window(), timeout=8.0)
-        except RuntimeError as exc:
-            self._record_error(str(exc))
+        last = None
+        for attempt in range(PRIME_ATTEMPTS):
+            try:
+                events = NtfyChannel(self.cfg).poll(
+                    self.resp_topic, self._window(), timeout=8.0)
+            except RuntimeError as exc:
+                last = exc
+                self._record_error(str(exc))
+                if attempt + 1 >= PRIME_ATTEMPTS or self.stop_event.is_set():
+                    break
+                self.stop_event.wait(PRIME_RETRY_SECONDS)
+                continue
+            with self.lock:
+                for event in events:
+                    if event.get("id"):
+                        self.seen.add(event["id"])
             return
-        with self.lock:
-            for event in events:
-                if event.get("id"):
-                    self.seen.add(event["id"])
+        raise RuntimeError(
+            "not waiting for an answer: the response topic could not be "
+            f"checked for an older reply ({last}). A previous reply would "
+            "otherwise be able to approve this question"
+        ) from last
 
     def _log_stale(self, text):
         if len(self.stale_logged) >= 10:
@@ -2412,8 +2727,8 @@ class ApprovalWaiter:
                         continue
                     if event.get("event") == "message":
                         self._offer(event.get("id"), event.get("message") or "")
-            except (OSError, RuntimeError):
-                pass       # connection dropped: reconnect below
+            except (OSError, http.client.HTTPException, RuntimeError):
+                pass       # connection dropped, including a short read: reconnect
             finally:
                 try:
                     stream.close()
@@ -2494,25 +2809,32 @@ class TelegramAnswerWaiter:
 
 
 def wait_first(waiters, timeout_seconds, print_status):
-    """Wait for the first answer across channel waiters; the others are stopped."""
+    """Wait for the first answer across channel waiters; the others are stopped.
+
+    `waiters` may grow while this runs. ntfy is armed on another thread when
+    Telegram is also configured, and that thread appends its waiter only
+    after the response topic has been primed. A slice each pass picks up
+    the newcomer; append is the only mutation.
+    """
     results = queue.Queue()
-    threads = []
-    for name, waiter in waiters:
-        thread = threading.Thread(
-            target=lambda n=name, w=waiter: results.put((n, w.wait(print_status=False))),
-            daemon=True,
-        )
-        thread.start()
-        threads.append(thread)
+    started = set()
     deadline = time.monotonic() + timeout_seconds
     spinner = ["|", "/", "-", "\\"]
     tick = 0
     while time.monotonic() < deadline:
+        for name, waiter in waiters[:]:
+            if id(waiter) in started:
+                continue
+            started.add(id(waiter))
+            threading.Thread(
+                target=lambda n=name, w=waiter: results.put((n, w.wait(print_status=False))),
+                daemon=True,
+            ).start()
         try:
             name, result = results.get(timeout=0.4)
             if result.get("timeout"):
                 continue  # this waiter gave up; keep waiting for the others
-            for _, waiter in waiters:
+            for _, waiter in waiters[:]:
                 waiter.stop_event.set()
             return {"timeout": False, "message": result["message"], "channel": name}
         except queue.Empty:
@@ -2523,7 +2845,7 @@ def wait_first(waiters, timeout_seconds, print_status):
                 )
                 sys.stderr.flush()
                 tick += 1
-    for _, waiter in waiters:
+    for _, waiter in waiters[:]:
         waiter.stop_event.set()
     return {"timeout": True, "message": None}
 
@@ -2580,8 +2902,10 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
             buttons=True, print_status=True, channels=None):
     """Ask a question on one or more channels and wait for the first answer.
 
-    Parallel behavior: every chosen channel gets the question at once; the
-    first answer wins, the others are stopped; the timeout is shared.
+    Every channel that can be reached gets the question; the first answer
+    wins; the timeout is shared. An ntfy response topic that cannot be
+    read drops ntfy only. Telegram is still asked, and the ask fails only
+    when no channel is left.
     """
     timeout_seconds = int(timeout_seconds or cfg.data.get("approval_timeout") or DEFAULT_APPROVAL_TIMEOUT)
     approval_id = secrets.token_hex(APPROVAL_ID_BYTES)
@@ -2604,60 +2928,124 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
             raise RuntimeError("Telegram is not configured (bot_token/chat_id). Run 'agentbell init' first.")
 
     waiters = []
-    if "ntfy" in channels:
-        waiter = ApprovalWaiter(cfg, resp_topic, timeout_seconds, approval_id=approval_id)
-        waiter.start()  # prime + subscribe before publishing so no reply is missed
-        waiters.append(("ntfy", waiter))
+    ntfy_waiter = None
+    ntfy_error = {}
+    ask_closed = threading.Event()
+    arm_lock = threading.Lock()
+    arm_thread = None
     if "telegram" in channels:
         waiters.append(("telegram", TelegramAnswerWaiter(approval_id, timeout_seconds)))
+    if "ntfy" in channels:
+        ntfy_waiter = ApprovalWaiter(cfg, resp_topic, timeout_seconds, approval_id=approval_id)
+
+    def _publish_ntfy_question():
+        server = NtfyChannel(cfg).server()
+        actions = (ask_actions(server, resp_topic, approval_id, yes_label, no_label, ntfy)
+                   if buttons else None)
+        # buttons can be dropped (protected server without action_auth),
+        # so the hint has to match what actually arrives on the phone
+        hint = (f"Tap {yes_label} or {no_label}, or type a custom answer." if actions
+                else f"Reply '{yes_label}' or '{no_label}' in the ntfy app, "
+                     "or type a custom answer.")
+        publish_with_retry(lambda: NtfyChannel(cfg).publish(
+            ntfy.get("topic"),
+            f"{message}\n\nID: {approval_id}\n{hint}",
+            title="\u2753 Approval requested",
+            priority=PRIORITIES["high"],
+            tags=["question", "approval"],
+            actions=actions,
+        ))
+
+    def _note_ntfy_failure(exc, detail):
+        """Record an ntfy failure. With another channel still up, warn and go on."""
+        with arm_lock:
+            if ask_closed.is_set():
+                return
+            ntfy_error["exc"] = exc
+            if "telegram" not in channels or ntfy_error.get("reported"):
+                return
+            ntfy_error["reported"] = True
+            sys.stderr.write(f"{PROG}: {detail}\n")
+
+    def _arm_ntfy():
+        # Prime before publishing, or a reply already on the topic becomes
+        # the answer. When Telegram is also configured this runs beside the
+        # Telegram send: a dead ntfy must not stop the other channel, and
+        # must not delay it for the whole prime budget either.
+        try:
+            ntfy_waiter.start()
+        except RuntimeError as exc:
+            _note_ntfy_failure(
+                exc,
+                "ntfy response topic could not be checked; "
+                f"asking without ntfy ({exc})")
+            return
+        with arm_lock:
+            if ask_closed.is_set() or ntfy_waiter.stop_event.is_set():
+                ntfy_waiter.stop_event.set()
+                return
+            write_ntfy_pending(approval_id, message, timeout_seconds)
+        try:
+            _publish_ntfy_question()
+        except RuntimeError as exc:
+            wrapped = RuntimeError(f"ntfy: {exc}")
+            _note_ntfy_failure(wrapped, str(wrapped))
+            ntfy_waiter.stop_event.set()
+            return
+        with arm_lock:
+            if ask_closed.is_set():
+                ntfy_waiter.stop_event.set()
+                return
+            waiters.append(("ntfy", ntfy_waiter))
 
     if print_status:
         sys.stderr.write(
-            f"{PROG}: asking for approval via {', '.join(name for name, _ in waiters)} "
+            f"{PROG}: asking for approval via {', '.join(channels)} "
             f"(timeout {timeout_seconds}s)...\n"
         )
         sys.stderr.flush()
 
     try:
         # register the open question only now, so the finally below always
-        # cleans it up again
-        if "ntfy" in channels:
-            write_ntfy_pending(approval_id, message, timeout_seconds)
+        # cleans it up again. The ntfy marker is written by _arm_ntfy, after
+        # a successful prime and before that publish.
         if "telegram" in channels:
             write_tg_pending(approval_id, message, timeout_seconds)
-        publish_errors = []
-        if "ntfy" in channels:
-            try:
-                server = NtfyChannel(cfg).server()
-                actions = ask_actions(server, resp_topic, approval_id, yes_label, no_label, ntfy) if buttons else None
-                # buttons can be dropped (protected server without action_auth),
-                # so the hint has to match what actually arrives on the phone
-                hint = (f"Tap {yes_label} or {no_label}, or type a custom answer." if actions
-                        else f"Reply '{yes_label}' or '{no_label}' in the ntfy app, "
-                             "or type a custom answer.")
-                publish_with_retry(lambda: NtfyChannel(cfg).publish(
-                    ntfy.get("topic"),
-                    f"{message}\n\nID: {approval_id}\n{hint}",
-                    title="\u2753 Approval requested",
-                    priority=PRIORITIES["high"],
-                    tags=["question", "approval"],
-                    actions=actions,
-                ))
-            except RuntimeError as exc:
-                publish_errors.append(f"ntfy: {exc}")
+        if ntfy_waiter is not None and "telegram" in channels:
+            arm_thread = threading.Thread(target=_arm_ntfy, daemon=True)
+            arm_thread.start()
+        elif ntfy_waiter is not None:
+            _arm_ntfy()
+            if ntfy_error.get("exc") is not None:
+                raise ntfy_error["exc"]
+
+        telegram_error = None
         if "telegram" in channels:
             try:
-                bot_alive = bot_heartbeat_fresh()
-                publish_with_retry(lambda: TelegramChannel(cfg).send_ask(
+                sent = publish_with_retry(lambda: TelegramChannel(cfg).send_ask(
                     message, approval_id, yes_label, no_label,
-                    buttons=buttons and bot_alive,
+                    buttons=buttons and bot_heartbeat_fresh(),
                 ))
+                message_id = sent.get("message_id") if isinstance(sent, dict) else None
+                if message_id:
+                    remember_tg_question_message(approval_id, message_id)
             except RuntimeError as exc:
-                publish_errors.append(f"telegram: {exc}")
-        if len(publish_errors) == len(channels):
-            raise RuntimeError("; ".join(publish_errors))
-        for error in publish_errors:
-            sys.stderr.write(f"{PROG}: {error}\n")
+                telegram_error = exc
+                sys.stderr.write(f"{PROG}: telegram: {exc}\n")
+            if telegram_error is not None and arm_thread is not None:
+                # Telegram cannot deliver. Wait until we know whether ntfy
+                # can carry the ask; do not burn the approval timeout on a
+                # channel that never got the question.
+                arm_thread.join()
+            if telegram_error is not None and not any(name == "ntfy" for name, _ in waiters):
+                parts = []
+                if ntfy_error.get("exc") is not None:
+                    parts.append(str(ntfy_error["exc"]))
+                parts.append(f"telegram: {telegram_error}")
+                raise RuntimeError("; ".join(parts))
+        if not waiters:
+            raise RuntimeError("no approval channel could be started")
+
         write_history({"event": "ask", "message": message, "approval_id": approval_id,
                        "timeout": timeout_seconds, "buttons": buttons, "channels": channels})
 
@@ -2665,18 +3053,25 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         # A response topic we cannot read (403, wrong auth, DNS) otherwise
         # looks exactly like "nobody answered" for the whole timeout.
         if result.get("timeout"):
-            for name, waiter in waiters:
+            if ntfy_error.get("exc") is not None and not ntfy_error.get("reported"):
+                sys.stderr.write(f"{PROG}: ntfy answer channel problem: {ntfy_error['exc']}\n")
+            for name, waiter in waiters[:]:
                 for error in getattr(waiter, "errors", []):
                     sys.stderr.write(f"{PROG}: {name} answer channel problem: {error}\n")
     finally:
         # stop the poller/stream threads first: in a long-lived process (MCP
         # server, webhook server) an abandoned waiter would keep polling ntfy
-        # every few seconds for the rest of the process's life
-        for _, pending_waiter in waiters:
-            pending_waiter.stop_event.set()
-        remove_ntfy_pending(approval_id)
-        remove_tg_pending(approval_id)
-        remove_tg_answer(approval_id)
+        # every few seconds for the rest of the process's life. The lock
+        # keeps _arm_ntfy from writing a pending marker after we removed it.
+        with arm_lock:
+            ask_closed.set()
+            if ntfy_waiter is not None:
+                ntfy_waiter.stop_event.set()
+            for _, pending_waiter in waiters:
+                pending_waiter.stop_event.set()
+            remove_ntfy_pending(approval_id)
+            remove_tg_pending(approval_id)
+            remove_tg_answer(approval_id)
 
     if print_status:
         sys.stderr.write("\n")
@@ -2686,7 +3081,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         write_history({"event": "ask_result", "approval_id": approval_id, "result": "timeout"})
         return {"approved": False, "answer": None, "denied": False, "timeout": True}
     text = result["message"]
-    kind, answer = _parse_answer(text)
+    kind, answer = _parse_answer(text, yes_label=yes_label, no_label=no_label)
     write_history({"event": "ask_result", "approval_id": approval_id,
                    "result": kind, "answer": answer, "raw": text, "channel": channel})
     if kind == "denied":
@@ -2694,7 +3089,11 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         return {"approved": False, "answer": answer or None, "denied": True,
                 "timeout": False, "channel": channel}
     if kind == "answer":
-        return {"approved": True, "answer": answer, "denied": False, "timeout": False, "channel": channel}
+        # Not a yes and not a no. Exit 0 (the caller prints the text); the
+        # boolean is false so a gate that only reads `approved` does not
+        # treat "Stopp" or "staging" as permission to proceed.
+        return {"approved": False, "answer": answer, "denied": False,
+                "timeout": False, "channel": channel}
     return {"approved": True, "answer": None, "denied": False, "timeout": False, "channel": channel}
 
 
@@ -2831,7 +3230,21 @@ def _hook_key(hook):
     an exact-string match would treat the stale entry as current and never
     repair it.
     """
-    return tuple(sorted(hook.items())) if isinstance(hook, dict) else hook
+    return _freeze_json(hook)
+
+
+def _freeze_json(value):
+    """A hashable copy of a JSON value.
+
+    Hook entries are compared by putting them in a set. An HTTP hook's
+    `headers` object, or any list, is not hashable as itself. A tuple of
+    sorted pairs is.
+    """
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), _freeze_json(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 def _merge_json_hooks(path, event_hooks, add=True):
@@ -2976,6 +3389,27 @@ def _codex_hooks_flag_is_top_level(text):
                 or re.search(r"^\[features\]", text, re.M))
 
 
+def _codex_flag_pattern(marked_only):
+    """A `features.hooks = true` line we wrote, or any such line on install.
+
+    Install consolidates every top-level copy into one marked line. Uninstall
+    (`marked_only`) deletes only the line carrying our comment, so a flag the
+    user wrote themselves stays. The second alternative is not anchored: a
+    file with no trailing newline used to get the flag glued onto the last
+    line, and a `^...\\n` pattern could neither prevent that nor remove it.
+    """
+    marker = re.escape(CODEX_FLAG_MARKER)
+    comment = marker if marked_only else r"(?:#[^\n]*)?"
+    return re.compile(
+        r"(?m)^[ \t]*features\.hooks[ \t]*=[ \t]*true[ \t]*" + comment + r"[ \t]*\n?"
+        + r"|features\.hooks[ \t]*=[ \t]*true[ \t]*" + marker + r"[ \t]*"
+    )
+
+
+def _strip_codex_flag(text, marked_only):
+    return _codex_flag_pattern(marked_only).sub("", text)
+
+
 def _codex_insert_features_flag(text):
     """Put `features.hooks = true` above the first [table] header.
 
@@ -2983,20 +3417,221 @@ def _codex_insert_features_flag(text):
     install wrote it where it never applied - drop those copies on the way.
 
     The line carries a marker comment: uninstall must delete the line *we*
-    added and keep an identical line the user wrote themselves.
+    added and keep an identical line the user wrote themselves. The flag is
+    always its own line, even when `text` has no trailing newline.
     """
-    text = re.sub(r"^\s*features\.hooks\s*=\s*true[ \t]*(#[^\n]*)?\n", "", text, flags=re.M)
+    text = _strip_codex_flag(text, marked_only=False)
     lines = text.splitlines(keepends=True)
-    index = next((i for i, line in enumerate(lines) if re.match(r"\s*\[", line)), len(lines))
-    return ("".join(lines[:index]) + f"features.hooks = true  {CODEX_FLAG_MARKER}\n"
+    # Before the first table, so TOML keeps the key top-level. Also before
+    # our start marker when that comes first: the marker is not a table, and
+    # a key written between the marker and [[hooks...]] is inside the block
+    # the next install would move.
+    table_at = next((i for i, line in enumerate(lines) if re.match(r"\s*\[", line)), len(lines))
+    marker_at = next((i for i, line in enumerate(lines) if TOML_START in line), len(lines))
+    index = min(table_at, marker_at)
+    prefix = "".join(lines[:index])
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return (prefix + f"features.hooks = true  {CODEX_FLAG_MARKER}\n"
             + "".join(lines[index:]))
 
 
 def _write_text_atomic(path, text):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    """Replace `path` without following a symlink planted at the temp name.
+
+    A hostile repo can ship `AGENTS.md.tmp` as a symlink to `~/.bashrc`.
+    A plain open() follows it and writes the rule file there. Create the
+    temp name with O_EXCL (and O_NOFOLLOW where the OS has it); if that
+    name already exists, unlink it — a symlink unlink removes the link,
+    not its target — and create a real file.
+
+    When `path` itself is a symlink, replace the file it points at.
+    `os.replace` on the link would swap that link for a regular file and
+    leave a dotfiles checkout holding the old hooks. Rule files still
+    refuse a symlink destination before they call this. Keep the mode the
+    destination already had, so a 0600 Codex or Kimi config stays 0600.
+    """
+    destination = os.path.realpath(path) if os.path.islink(path) else path
+    directory = os.path.dirname(destination)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    try:
+        mode = os.stat(destination).st_mode & 0o777
+    except OSError:
+        mode = 0o644
+    tmp = destination + ".tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    handle = None
+    for _attempt in range(2):
+        try:
+            handle = os.open(tmp, flags, mode)
+            break
+        except OSError as exc:
+            if exc.errno not in (errno.EEXIST, errno.ELOOP):
+                raise
+            os.unlink(tmp)
+    if handle is None:
+        raise OSError(errno.EEXIST, "cannot create temp file", tmp)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, destination)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _strip_toml_comment(text):
+    """Drop a `#` comment, keeping a `#` that sits inside a quoted string.
+
+    `[projects."/home/u/C#/app"]` is a table header. Cutting at the first
+    `#` made that line look like prose, so the table was swallowed by the
+    hook table above it and deleted with our block.
+    """
+    in_basic = False
+    in_literal = False
+    escaped = False
+    out = []
+    for char in text:
+        if in_basic:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_basic = False
+            continue
+        if in_literal:
+            out.append(char)
+            if char == "'":
+                in_literal = False
+            continue
+        if char == '"':
+            in_basic = True
+            out.append(char)
+        elif char == "'":
+            in_literal = True
+            out.append(char)
+        elif char == "#":
+            break
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _toml_header_key(line):
+    """A TOML table header with its comment stripped, or "" if `line` is not one."""
+    text = _strip_toml_comment(line.strip()).strip()
+    if len(text) >= 2 and text.startswith("[") and text.endswith("]"):
+        return text
+    return ""
+
+
+def _toml_unquote(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        inner = value[1:-1]
+        if value[0] == '"':
+            inner = inner.replace('\\"', '"').replace("\\\\", "\\")
+        return inner
+    return value
+
+
+def _iter_toml_chunks(text):
+    """Yield each table (header through the line before the next header)."""
+    buf = []
+    for line in text.splitlines(keepends=True):
+        if _toml_header_key(line) and buf:
+            yield "".join(buf)
+            buf = [line]
+        else:
+            buf.append(line)
+    if buf:
+        yield "".join(buf)
+
+
+def _chunk_is_our_toml(chunk, owned_headers):
+    """True for a table this tool generated, false for one the host wrote.
+
+    Codex stores its own `[tui]`, `[plugins.*]`, `[notice.*]` and
+    `[hooks.state]` tables and has been observed writing them between our
+    markers. A header we emit that carries no command (the parent
+    `[[hooks.Stop]]` line) is ours. A table with a command is ours only
+    when that command is our hook — a user's own hook is not.
+    """
+    if not chunk.strip():
+        return True
+    commands = re.findall(r"(?m)^[ \t]*command[ \t]*=[ \t]*(.*?)\s*$", chunk)
+    if commands:
+        return any(_is_our_hook_command(_toml_unquote(command)) for command in commands)
+    for line in chunk.splitlines():
+        header = _toml_header_key(line)
+        if header:
+            return header in owned_headers
+    return False
+
+
+def _owned_headers(block):
+    return {key for key in (_toml_header_key(line) for line in block.splitlines()) if key}
+
+
+def _is_header_only(chunk):
+    return (not re.search(r"(?m)^[ \t]*command[ \t]*=", chunk)
+            and any(_toml_header_key(line) for line in chunk.splitlines()))
+
+
+def _chunk_header(chunk):
+    for line in chunk.splitlines():
+        header = _toml_header_key(line)
+        if header:
+            return header
+    return ""
+
+
+def _is_child_header(child, parent):
+    """[[hooks.Stop.hooks]] belongs to the [[hooks.Stop]] element above it."""
+    if not (child.startswith("[[") and child.endswith("]]")
+            and parent.startswith("[[") and parent.endswith("]]")):
+        return False
+    return child[2:-2].strip().startswith(parent[2:-2].strip() + ".")
+
+
+def _partition_toml_interior(interior, block):
+    """Split the text between our markers into (our tables, foreign tables).
+
+    A header-only parent we emit (`[[hooks.Stop]]` with no keys) has to
+    stay with any later child that is not our hook. Looking only at the
+    next chunk drops that parent when our own hook sits between it and
+    the user's `[[hooks.Stop.hooks]]`. Uninstall then leaves the child
+    with no parent, and TOML reads `hooks.Stop` as a table instead of
+    an array.
+    """
+    headers = _owned_headers(block)
+    chunks = [chunk for chunk in _iter_toml_chunks(interior) if chunk.strip()]
+    keep_parent = [False] * len(chunks)
+    for index, chunk in enumerate(chunks):
+        if not (_chunk_is_our_toml(chunk, headers) and _is_header_only(chunk)):
+            continue
+        parent = _chunk_header(chunk)
+        if not parent:
+            continue
+        for later in chunks[index + 1:]:
+            later_header = _chunk_header(later)
+            if not later_header or not _is_child_header(later_header, parent):
+                break
+            if not _chunk_is_our_toml(later, headers):
+                keep_parent[index] = True
+                break
+    ours, foreign = [], []
+    for index, chunk in enumerate(chunks):
+        is_ours = _chunk_is_our_toml(chunk, headers) and not keep_parent[index]
+        (ours if is_ours else foreign).append(chunk.strip("\n"))
+    return "\n".join(ours), "\n".join(foreign)
 
 
 def _replace_toml_block(text, block):
@@ -3004,16 +3639,41 @@ def _replace_toml_block(text, block):
 
     Returns (new_text, present, changed). A stale block - old binary path,
     old flags, old hook shape - is as bad as a missing one: install must
-    repair it, not just detect it.
+    repair it, not just detect it. Tables the host wrote between the
+    markers are not part of our block: they are moved after the end
+    marker, not deleted.
     """
     if TOML_START not in text or TOML_END not in text:
         return text, False, False
     start = text.index(TOML_START)
-    end = text.index(TOML_END) + len(TOML_END)
-    if text[start:end].strip() == block.strip():
+    end_at = text.index(TOML_END)
+    end = end_at + len(TOML_END)
+    owned, foreign = _partition_toml_interior(text[start + len(TOML_START):end_at], block)
+    expected, _ = _partition_toml_interior(
+        block.split(TOML_START, 1)[-1].split(TOML_END, 1)[0], block)
+    if not foreign and owned.strip() == expected.strip():
         return text, True, False
-    return (text[:start].rstrip() + "\n" + block + text[end:].lstrip("\n"),
-            True, True)
+    rebuilt = block.rstrip() + "\n"
+    if foreign:
+        rebuilt += "\n" + foreign + "\n"
+    new_text = text[:start].rstrip() + "\n" + rebuilt + text[end:].lstrip("\n")
+    if new_text == text:
+        return text, True, False
+    return new_text, True, True
+
+
+def _drop_toml_block(text, block):
+    """Remove our marked block. Foreign tables inside it stay in the file."""
+    if TOML_START not in text or TOML_END not in text:
+        return text, False
+    start = text.index(TOML_START)
+    end_at = text.index(TOML_END)
+    end = end_at + len(TOML_END)
+    _owned, foreign = _partition_toml_interior(text[start + len(TOML_START):end_at], block)
+    middle = (foreign + "\n") if foreign else ""
+    new_text = text[:start].rstrip() + ("\n" if (middle or text[end:].strip()) else "")
+    new_text += middle + text[end:].lstrip("\n")
+    return new_text, new_text != text
 
 
 def install_codex_hooks():
@@ -3060,10 +3720,7 @@ def install_codex_hooks():
     if new_text and not new_text.endswith("\n"):
         new_text += "\n"
     new_text += "\n" + codex_hooks_block()
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    os.replace(tmp, path)
+    _write_text_atomic(path, new_text)
     return {"changed": True, "notes": notes}
 
 
@@ -3073,18 +3730,17 @@ def uninstall_codex_hooks():
         return False
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
-    if TOML_START not in text:
+    # A missing end marker used to raise ValueError halfway through. Leave
+    # the file untouched rather than guess where our block stops.
+    if TOML_START not in text or TOML_END not in text:
         return False
-    start = text.index(TOML_START)
-    end = text.index(TOML_END) + len(TOML_END)
-    new_text = text[:start].rstrip() + "\n" + text[end:].lstrip("\n")
+    new_text, _changed = _drop_toml_block(text, codex_hooks_block())
     # only the line we added: an identical line the user wrote themselves has
     # no marker comment, and removing it would silently turn off their hooks
-    new_text = re.sub(r"^[ \t]*features\.hooks[ \t]*=[ \t]*true[ \t]*"
-                      + re.escape(CODEX_FLAG_MARKER) + r"[ \t]*\n",
-                      "", new_text, flags=re.M)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
+    new_text = _strip_codex_flag(new_text, marked_only=True)
+    if new_text == text:
+        return False
+    _write_text_atomic(path, new_text)
     return True
 
 
@@ -3520,6 +4176,16 @@ def install_kimi_hooks():
                 return {"changed": True,
                         "notes": ["kimi: updated the hook block (binary path or flags changed)"]}
             return {"changed": False, "notes": []}
+        # Kimi has been seen stripping the marker comments while leaving the
+        # hook tables in place. Appending a second block would run every
+        # hook twice. Leave the commands. Uninstall removes a table only
+        # when its command is exactly ours.
+        if _OUR_HOOK_RE.search(text):
+            return {"changed": False,
+                    "notes": ["kimi: hook commands are already in this file, but the "
+                              "agentbell markers are gone. Nothing was added, so the "
+                              "hooks are not duplicated. uninstall removes a command "
+                              "only when it is exactly ours"]}
     block = kimi_hooks_block()
     with open(path, "a", encoding="utf-8") as fh:
         if text and not text.endswith("\n"):
@@ -3528,20 +4194,86 @@ def install_kimi_hooks():
     return {"changed": True, "notes": []}
 
 
+def _kimi_hooks_installed():
+    """True when Kimi will run our hooks, markers or not.
+
+    Status used to require the marker comments. After Kimi removed them the
+    hooks were still live, and doctor recommended an install that appended
+    a second copy.
+    """
+    path = kimi_config_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    if TOML_START in text and TOML_END in text:
+        return True
+    return bool(_OUR_HOOK_RE.search(text))
+
+
+def _toml_command_values(chunk):
+    return re.findall(r"(?m)^[ \t]*command[ \t]*=[ \t]*(.*?)\s*$", chunk)
+
+
+def _drop_unmarked_kimi_hooks(text):
+    """Remove `[[hooks]]` tables whose command is exactly ours.
+
+    Kimi deletes the marker comments and leaves the tables. Those tables
+    are still ours when every command matches `_is_our_hook_command` —
+    the same check install uses, not a guess. A table that only mentions
+    agentbell (a shell wrapper) stays. Returns (new_text, removed, leftover).
+    """
+    kept = []
+    removed = 0
+    leftover = 0
+    for chunk in _iter_toml_chunks(text):
+        commands = [_toml_unquote(value) for value in _toml_command_values(chunk)]
+        ours = [command for command in commands if _is_our_hook_command(command)]
+        mentions = [command for command in commands if _OUR_HOOK_RE.search(command)]
+        exact = bool(commands) and len(ours) == len(commands) and _chunk_header(chunk) == "[[hooks]]"
+        if exact:
+            removed += 1
+            continue
+        if mentions:
+            leftover += len(mentions)
+        kept.append(chunk)
+    return "".join(kept), removed, leftover
+
+
 def uninstall_kimi_hooks():
+    """Remove our Kimi hooks. Returns {"changed", "notes"} like install.
+
+    With both markers, only the marked block is removed (foreign tables
+    inside it stay). Without markers, `[[hooks]]` tables whose command is
+    exactly ours are removed. A wrapper that merely mentions agentbell is
+    left, and the note says so — "already gone" would be a lie, because
+    Kimi would keep calling a binary that is no longer there.
+    """
     path = kimi_config_path()
     if not os.path.exists(path):
-        return False
+        return {"changed": False, "notes": []}
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
-    if TOML_START not in text or TOML_END not in text:
-        return False
-    start = text.index(TOML_START)
-    end = text.index(TOML_END) + len(TOML_END)
-    new_text = text[:start].rstrip() + "\n" + text[end:].lstrip("\n")
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
-    return True
+    if TOML_START in text and TOML_END in text:
+        new_text, changed = _drop_toml_block(text, kimi_hooks_block())
+        if not changed:
+            return {"changed": False, "notes": []}
+        _write_text_atomic(path, new_text)
+        return {"changed": True, "notes": []}
+    if TOML_START in text or TOML_END in text:
+        return {"changed": False,
+                "notes": ["kimi: found an agentbell marker without its pair; "
+                          "left the file unchanged"]}
+    new_text, removed, leftover = _drop_unmarked_kimi_hooks(text)
+    notes = []
+    if removed:
+        _write_text_atomic(path, new_text)
+        notes.append("kimi: removed hook commands whose agentbell markers were already gone")
+    if leftover:
+        notes.append("kimi: some hook lines mention agentbell but are not exactly "
+                     "our command, so they were left in place")
+    return {"changed": removed > 0, "notes": notes}
 
 
 def qwen_settings_path(project=None):
@@ -3605,11 +4337,9 @@ def _codex_install(add):
 
 
 def _kimi_install(add):
-    if add:
-        result = install_kimi_hooks()
-        return {"agent": "kimi", "changed": result["changed"],
-                "path": kimi_config_path(), "notes": result.get("notes", [])}
-    return {"agent": "kimi", "changed": uninstall_kimi_hooks(), "path": kimi_config_path()}
+    result = install_kimi_hooks() if add else uninstall_kimi_hooks()
+    return {"agent": "kimi", "changed": result["changed"],
+            "path": kimi_config_path(), "notes": result.get("notes", [])}
 
 
 def _opencode_result(project, add):
@@ -3659,7 +4389,7 @@ AGENT_SPECS = {
         "detect": lambda: _detect_bins_paths(("kimi",), (os.path.join(_home(), ".kimi-code"),)),
         "path": lambda project: kimi_config_path(),
         "install": lambda project, add: _kimi_install(add),
-        "status": lambda project: _file_contains(kimi_config_path(), TOML_START),
+        "status": lambda project: _kimi_hooks_installed(),
     },
     "qwen-code": {
         "scope": "global", "kind": "file", "reliability": "hook",
@@ -4695,11 +5425,9 @@ def _remove_mcp_server_key(path, container):
     servers.pop("agentbell")
     if not servers:
         data.pop(container, None)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
+    # Same writer as every other JSON config: O_EXCL so a symlink planted
+    # at path.tmp is not followed, and the mode the file already has is kept.
+    write_json_atomic(path, data)
     return True
 
 
@@ -5229,10 +5957,18 @@ def handle_bot_update(cfg, update):
     if not pending:
         return
     # Telegram retains undelivered updates for ~24h, so a restarted daemon
-    # replays a backlog. A message written before the question was asked can
-    # never be its answer.
-    sent_at = float(message.get("date") or 0)
-    if sent_at and sent_at < float(pending.get("created", 0)) - 60:
+    # replays a backlog. Message ids increase inside the chat, so an id at
+    # or below the question's id was written before the question existed.
+    # Comparing clocks instead reopens that window whenever the local clock
+    # is behind Telegram, and drops a live reply when the local clock is ahead.
+    question_id = pending.get("question_message_id")
+    reply_id = message.get("message_id")
+    try:
+        predates = (question_id is None or reply_id is None
+                    or int(reply_id) <= int(question_id))
+    except (TypeError, ValueError):
+        predates = True
+    if predates:
         write_history({"event": "stale_answer", "approval_id": pending["approval_id"],
                        "text": text[:120], "reason": "reply predates the question"})
         return
@@ -5260,6 +5996,20 @@ def run_bot(cfg, poll_timeout=25):
     write_bot_heartbeat()
     print(f"{PROG}: Telegram answer bot running (chat {tg.get('chat_id')}). Ctrl-C to stop.")
     offset = None
+    # SIGTERM (service stop) used to kill the process before `finally`, so
+    # the lock stayed. The next start then refused whenever that pid was
+    # alive again, even if it was a different program.
+    term_installed = False
+    previous_term = None
+
+    def _on_term(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    try:
+        previous_term = signal.signal(signal.SIGTERM, _on_term)
+        term_installed = True
+    except (OSError, ValueError):
+        term_installed = False
     try:
         while True:
             write_bot_heartbeat()
@@ -5297,6 +6047,11 @@ def run_bot(cfg, poll_timeout=25):
             os.remove(lock_path)
         except OSError:
             pass
+        if term_installed:
+            try:
+                signal.signal(signal.SIGTERM, previous_term)
+            except (OSError, ValueError):
+                pass
 
 
 def _queue_overview(directory):
@@ -6098,6 +6853,14 @@ def cmd_verify(args):
 # Commands
 # ---------------------------------------------------------------------------
 
+def _same_ntfy_server(left, right):
+    """True when two server values are the same host after normalization."""
+    try:
+        return normalize_server(left) == normalize_server(right)
+    except RuntimeError:
+        return False
+
+
 def suggest_topic():
     """High-entropy default topic: 128 random bits after a short user prefix.
 
@@ -6193,22 +6956,29 @@ def cmd_init(args):
     print("agentbell setup")
     print("==================")
     ntfy = cfg.data["ntfy"]
+    # Re-init is the documented way to add Telegram. The values already in
+    # the config are the defaults. Forcing ntfy.sh here kept a self-hosted
+    # password and then the test push sent it to ntfy.sh.
+    previous_server = ntfy.get("server") or ""
+    previous_topic = ntfy.get("topic") or ""
     try:
         if args.server:
             ntfy["server"] = normalize_server(args.server)
-        else:
-            ntfy["server"] = normalize_server(
-                ask("ntfy server (blank = ntfy.sh)", DEFAULT_NTFY_SERVER) or DEFAULT_NTFY_SERVER
-            )
+        elif interactive:
+            current = previous_server or DEFAULT_NTFY_SERVER
+            ntfy["server"] = normalize_server(ask("ntfy server", current) or current)
+        elif not previous_server:
+            ntfy["server"] = DEFAULT_NTFY_SERVER
     except RuntimeError as exc:
         raise SystemExit(f"{PROG}: {exc}")
 
-    suggested = None
     if args.topic:
         ntfy["topic"] = args.topic
-    else:
-        suggested = suggest_topic()
+    elif interactive:
+        suggested = previous_topic or suggest_topic()
         ntfy["topic"] = ask("ntfy topic", suggested) or suggested
+    elif not previous_topic:
+        ntfy["topic"] = suggest_topic()
     try:
         validate_topic(ntfy["topic"])
     except RuntimeError as exc:
@@ -6226,8 +6996,31 @@ def cmd_init(args):
         print(f"    {ntfy['topic']}")
         print(f"    {ntfy['topic']}-responses   (replies to approval questions)")
         input("  Press Enter once subscribed...")
+    server_changed = bool(previous_server) and not _same_ntfy_server(
+        previous_server, ntfy.get("server"))
+    # action_auth is a token for the previous server. Leaving it in place
+    # publishes it inside the next ask's button headers on the new server,
+    # where those buttons do not work. --ntfy-auth replaces the password
+    # only; it is not this token.
+    if server_changed and ntfy.get("action_auth"):
+        ntfy["action_auth"] = None
+        print(f"{PROG}: ntfy server changed; not sending the saved ntfy "
+              "action token to the new server.", file=sys.stderr)
     if args.ntfy_auth:
         ntfy["auth"] = args.ntfy_auth
+    elif server_changed:
+        # The saved password belongs to the previous server. Sending it to
+        # the new one both fails and discloses it.
+        if interactive:
+            print("  The ntfy server changed. The saved password will not be "
+                  "sent to the new server.")
+            entered = ask(
+                "ntfy auth for this server (user:pass or token, blank for none)", "")
+            ntfy["auth"] = entered or None
+        else:
+            ntfy["auth"] = None
+            print(f"{PROG}: ntfy server changed; not sending the saved ntfy "
+                  "password to the new server.", file=sys.stderr)
     warn_cleartext_auth(ntfy.get("server"), ntfy.get("auth"))
 
     tg = cfg.data["telegram"]
@@ -6473,13 +7266,95 @@ def cmd_notify(args):
         raise SystemExit(3)
 
 
+def read_hook_payload(stream=None, raw=None):
+    """The host's hook JSON, if one is already waiting on stdin.
+
+    Claude Code and others pass `session_id` this way. Reading must not
+    block: an interactive `agentbell hook` has a terminal on stdin, and a
+    hook whose payload is not written yet must still exit. `raw` skips the
+    read; tests pass the text directly.
+    """
+    if raw is None:
+        raw = _read_ready_text(sys.stdin if stream is None else stream)
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_ready_text(stream, limit=65536):
+    """Bytes already buffered on `stream`, or "". Never waits for more."""
+    try:
+        if stream.isatty():
+            return ""
+    except Exception:  # noqa: BLE001 - a weird stdin is "no payload"
+        return ""
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return ""
+    if os.name == "nt":
+        return _read_ready_windows(fd, limit)
+    try:
+        import fcntl
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    except (ImportError, OSError):
+        return ""
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        try:
+            data = os.read(fd, limit)
+        except BlockingIOError:
+            data = b""
+    except OSError:
+        data = b""
+    finally:
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+        except OSError:
+            pass
+    return data.decode("utf-8", "replace")
+
+
+def _read_ready_windows(fd, limit):
+    """PeekNamedPipe: a Windows pipe cannot be polled with select()."""
+    try:
+        import ctypes
+        import msvcrt
+        handle = msvcrt.get_osfhandle(fd)
+        avail = ctypes.c_ulong(0)
+        ok = ctypes.windll.kernel32.PeekNamedPipe(
+            handle, None, 0, None, ctypes.byref(avail), None)
+        if not ok or avail.value <= 0:
+            return ""
+        return os.read(fd, min(int(avail.value), limit)).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - no payload is safer than blocking
+        return ""
+
+
+def _hook_session(payload):
+    if not isinstance(payload, dict):
+        return None
+    for key in ("session_id", "sessionId"):
+        token = _scope_token(payload.get(key))
+        if token:
+            return token
+    return None
+
+
 def run_hook(cfg, event, agent, cwd=None, duration=None, force=False, silent=False,
-             min_duration=None):
+             min_duration=None, session_id=None):
     spec = HOOK_EVENTS[event]
     validate_agent_name(agent)
     project = _normalized_project(cwd)
+    # A session id isolates parallel sessions even when they share a cwd.
+    marker_cwd = None if session_id else cwd
     if event == "started":
-        write_start_marker(agent)
+        write_start_marker(agent, session_id=session_id, cwd=marker_cwd)
         if silent:
             return {"ok": True, "silent": True}
     # Unknown slugs (self-integrated agents) show as their slug, not "Agent".
@@ -6489,7 +7364,7 @@ def run_hook(cfg, event, agent, cwd=None, duration=None, force=False, silent=Fal
     message = f"{spec['emoji']} {agent_label} {event.replace('-', ' ')} ({cwd or os.getcwd()})"
     if event in ("run_completed", "run_failed"):
         if duration is None:
-            duration = read_start_marker(agent)
+            duration = read_start_marker(agent, session_id=session_id, cwd=marker_cwd)
         if duration is not None:
             message += f" in {format_duration(duration)}"
     # "finished" fires after every turn. A 20-second answer while you are
@@ -6541,9 +7416,12 @@ def cmd_hook(args):
             pass
         raise SystemExit(0)
     try:
-        run_hook(Config(), event, args.agent, cwd=args.cwd,
+        payload = read_hook_payload()
+        run_hook(Config(), event, args.agent,
+                 cwd=args.cwd or (payload.get("cwd") if isinstance(payload.get("cwd"), str) else None),
                  duration=args.duration, force=args.force, silent=args.silent,
-                 min_duration=args.min_duration)
+                 min_duration=args.min_duration,
+                 session_id=_hook_session(payload))
     except Exception:  # noqa: BLE001 - a hook must never fail the agent's turn
         pass
     raise SystemExit(0)
@@ -6581,6 +7459,85 @@ def cmd_ask(args):
     raise SystemExit(0)
 
 
+def _restore_signals(previous):
+    for signum, handler in previous:
+        try:
+            signal.signal(signum, handler)
+        except (OSError, ValueError):
+            pass
+
+
+def _forward_watch_signal(pid, signum):
+    """Send `signum` to the watched command's process group.
+
+    The command is its own session, so a Ctrl-C delivered to agentbell does
+    not already reach it. Signaling the group reaches the command and the
+    children it started. A dead pid is not an error: it exited between the
+    signal and this call.
+    """
+    if not pid:
+        return
+    if os.name == "nt":
+        try:
+            if signum == signal.SIGINT and hasattr(signal, "CTRL_BREAK_EVENT"):
+                os.kill(pid, signal.CTRL_BREAK_EVENT)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(pid, signum)
+    except OSError:
+        try:
+            os.kill(pid, signum)
+        except OSError:
+            pass
+
+
+def _watch_status(returncode):
+    """Shell-style status. A signal death is 128+signal, not a negative waitpid."""
+    if returncode is None:
+        return 1
+    if returncode < 0:
+        return 128 + (-returncode)
+    return returncode
+
+
+def _watch_command(cmd):
+    """Run `cmd` and wait for it. Forward SIGINT and SIGTERM; do not SIGKILL.
+
+    `subprocess.run` waits 0.25s after Ctrl-C and then kills the child.
+    A migration that traps the signal to finish the current step dies
+    instead, and `watch` never gets far enough to send the push. Each
+    caught signal is forwarded once. The command is its own session, so
+    a terminal Ctrl-C is not delivered twice (once by the terminal and
+    again by us). It may take as long as it needs to exit.
+    """
+    argv = [str(part) for part in cmd]
+    holder = {"pid": None, "pending": None}
+
+    def on_signal(signum, _frame):
+        holder["pending"] = signum
+        _forward_watch_signal(holder["pid"], signum)
+
+    previous = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous.append((signum, signal.getsignal(signum)))
+            signal.signal(signum, on_signal)
+        except (OSError, ValueError):
+            continue
+    try:
+        proc = subprocess.Popen(argv, start_new_session=True)
+        holder["pid"] = proc.pid
+        if holder["pending"] is not None and proc.poll() is None:
+            _forward_watch_signal(proc.pid, holder["pending"])
+        return proc.wait()
+    finally:
+        _restore_signals(previous)
+
+
 def run_watch(cfg, cmd, title=None, priority=None, fail_priority=None,
               tags=None, force=False):
     """Run a command, notify on completion, report exit code + duration.
@@ -6588,23 +7545,25 @@ def run_watch(cfg, cmd, title=None, priority=None, fail_priority=None,
     Returns {"exit_code", "message", "notification"}. The command's exit code
     is what `watch` exits with; notification failures are reported on stderr
     and do not change the exit code. A command that cannot be spawned at all
-    yields exit code 127.
+    yields exit code 127. Ctrl-C and SIGTERM are forwarded and the command is
+    allowed to finish; the push is sent either way (DECISIONS §28).
     """
     label = " ".join(shlex.quote(str(part)) for part in cmd)
     started = time.monotonic()
     try:
-        proc = subprocess.run([str(part) for part in cmd])
+        returncode = _watch_status(_watch_command(cmd))
         duration = time.monotonic() - started
-        ok = proc.returncode == 0
+        ok = returncode == 0
         if ok:
             message = f"\u2705 {label} succeeded (exit 0) in {format_duration(duration)}"
             title = title or "Command finished"
             prio = priority or "normal"
         else:
-            message = f"\U0001f534 {label} failed (exit {proc.returncode}) in {format_duration(duration)}"
+            message = (f"\U0001f534 {label} failed (exit {returncode}) "
+                       f"in {format_duration(duration)}")
             title = title or "Command failed"
             prio = fail_priority or "urgent"
-        exit_code = proc.returncode
+        exit_code = returncode
     except OSError as exc:
         exit_code = 127
         message = f"\U0001f534 {label} could not be started ({exc})"
@@ -6933,6 +7892,11 @@ def redacted_config(data):
     if auth:
         user = str(auth).partition(":")[0]
         safe["ntfy"]["auth"] = (f"{user}:...(redacted)" if ":" in str(auth) else "...(redacted)")
+    # The button token is a credential. `config show` used to print it whole,
+    # and the next ask publishes whatever is stored here inside the message.
+    action_auth = (safe.get("ntfy") or {}).get("action_auth")
+    if action_auth:
+        safe["ntfy"]["action_auth"] = "...(redacted)"
     hook_token = (safe.get("webhook") or {}).get("token")
     if hook_token:
         # a live shared secret with no recognisable prefix: show none of it

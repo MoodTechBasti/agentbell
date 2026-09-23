@@ -925,3 +925,318 @@ detected with `pipx list` and removed by calling `pipx uninstall agentbell`;
 agentbell does not unlink pipx's launcher or edit its managed environment by
 hand. Hooks continue to store `agentbell_binary()`'s absolute launcher path,
 so GUI clients do not depend on inheriting the shell `PATH`.
+
+## 20. Approval replies fail closed (2026-09-22)
+
+**Superseded in part by §22 and §27.** This section is the first pass.
+Two statements below are not the current contract. Free text is not
+`approved: true` (§22). Telegram does not use a two-second clock window
+(§22); a free-text reply counts only when its message id is newer than
+the question. The denial list was extended again in §27, and an exact
+yes-button label is checked before that list. Read §22 and §27 for what
+the code does now.
+
+**What was wrong.** Three separate holes turned a non-approval into a yes:
+
+- `_parse_answer` only knew a short English list. The no button's own label
+  (`Abort`, the word the hint tells the user to type), `Nein`, `not yet`,
+  `don't`, and 👎 came back as free text, and `run_ask` reported
+  `approved: true` (exit 0). `ask_approval` returns that same object, so a
+  model gating a destructive action saw an approval.
+- `ApprovalWaiter._prime` swallowed one failed poll and then waited with an
+  empty seen set. The next poll, a few seconds later, delivered a `yes`
+  that was already on the response topic and attributed it to the new
+  question. That breaks the rule in §12b.
+- The Telegram backlog guard subtracted 60 seconds. A restarted bot replays
+  updates, and a `yes` from half a minute before the new question was
+  accepted. The v1.3 changelog already said replies that predate the
+  question are rejected; the code did not do that.
+
+**Decision.** Negations and the no button's label deny, including a reason
+after them (`Abort, tests are red`). The yes button's label approves only
+when it is the whole reply, same rule as bare `yes`. A failed prime is
+retried three times and then `ask` raises (exit 3) instead of waiting.
+Telegram allows `TG_REPLY_CLOCK_SKEW_SECONDS` (2) for whole-second dates
+and a clock that is a moment ahead, and rejects anything older.
+
+**Left unchanged on purpose.** *(Superseded by §22. Do not restore this.)*
+Free text that is not a negation is still an answer: exit 0,
+`approved: true`, the text in `answer`. That is the "Which environment?" /
+`staging` contract from §12i and the README. A strict gate still has to
+read `approved` together with `answer`; exit 0 alone has never meant
+"bare approval". Collapsing every free-text reply to `approved: false`
+would break that contract, so it was not done. §22 did set `approved`
+false for free text. Exit 0 for `staging` stayed. The exit code was the
+contract this paragraph was protecting, not the boolean.
+
+## 21. Host config files are not ours to trim (2026-09-22)
+
+**What was wrong.** Three writers treated a file we only partly own as if
+we owned all of it.
+
+- `_replace_toml_block` replaced everything between the agentbell markers.
+  Codex stores `[hooks.state]`, `[tui]`, `[notice.*]` and `[plugins.*]`
+  and writes them between those markers. `hooks install` and `uninstall`
+  deleted them. A hook command that is not ours, sitting in the same
+  region, went with them.
+- `_codex_insert_features_flag` concatenated `features.hooks = true` onto
+  the last line when the file had no trailing newline. Codex then refused
+  the file, and uninstall's line-anchored removal could not see the glued
+  flag, so it could not repair it.
+- `_write_text_atomic` opened `path + ".tmp"` with a plain `open`. A repo
+  that ships `AGENTS.md.tmp` as a symlink to `~/.bashrc` was written
+  through. The same rewrite also created the temp file at the umask mode,
+  so a Codex or Kimi `config.toml` that was `0600` came back `0644`.
+
+**Decision.** Foreign TOML tables between the markers are moved to after
+the end marker on install, and left in the file on uninstall. A table is
+foreign when its command is not our hook; a header-only parent we also
+emit stays with the table that follows it, so a user's `[[hooks.Stop]]`
+is not beheaded. The features flag is always its own line, and both
+install and uninstall recognize a copy glued onto the previous line.
+The temp file is created with `O_EXCL` and `O_NOFOLLOW`; an existing
+symlink at that name is unlinked (the link, not its target) and a real
+file is created. The replacement keeps the mode the destination already
+had. A Codex block with no end marker is left untouched instead of
+raising.
+
+## 22. Review of the 2026-09-22 fixes (2026-09-22)
+
+The first pass (§20, §21) was re-checked against the real behavior. Five
+corrections:
+
+**`approved` means an explicit yes.** §20 left free text as
+`approved: true` so that `staging` would stay an answer. That made the
+heading "fail closed" false: replies such as `Stopp`, `noch nicht`,
+`nö`, `not now`, `please don't`, `absolutely not`, `wait`, ❌ and 🛑
+still came back as approvals, and a word list cannot cover the rest.
+`cmd_ask` does not look at `approved`. It exits 0 unless the reply was
+denied or timed out. So `staging` can stay exit 0 with the text on
+stdout while `approved` is false. `yes, but use staging` is the same:
+the instruction is kept, and it is not a bare approval. Denial phrases
+still exit 1, because `ask && deploy` only sees the exit code. `not`
+and `wait` deny only when they are the whole reply; as a prefix they
+would swallow real answers.
+
+**A dead ntfy channel must not cancel Telegram.** The prime check from
+§20 raised before any other channel was started, so an unreachable
+response topic turned a two-channel ask into exit 3 and never sent the
+Telegram question. Prime now runs beside the Telegram send. If it
+fails, ntfy is not published and not waited on. The ask fails only when
+nothing else can carry it. ntfy alone still refuses to wait.
+
+**Telegram replay is ordered by message id.** The two-second clock skew
+in §20 rejects a live reply when the local clock is ahead of Telegram
+and accepts an old one when the clock is behind. That repeats the
+mistake §16i already fixed for ntfy. The question's Telegram message id
+is stored when the send succeeds. A free-text reply counts only when
+its id is greater. Buttons were already bound to the approval id.
+
+**One chunk of lookahead is not enough.** §21 keeps a header-only
+`[[hooks.Stop]]` with the table that follows it. Our own hook is that
+next table, so a user's `[[hooks.Stop.hooks]]` further down the same
+group lost its parent on uninstall and `hooks.Stop` became a table.
+The parent stays if any later child of that header is not our hook.
+
+**The MCP remover was a second temp-file writer.** §21 closed the
+symlink hole for rule files. `_remove_mcp_server_key` still opened
+`path.tmp` with a plain `open`, so `mcp.json.tmp` pointing at another
+file was followed, and the rewrite also widened `0600` to `0644`. It
+now uses `write_json_atomic`, which already creates with `O_EXCL` and
+keeps the existing mode.
+
+**Kimi without markers is not the Kimi case §21 fixed.** The marker
+rules apply only while the markers are present. A config that still
+contains the hook commands but no longer the comments is reported as
+installed, and install refuses to append a second block. Uninstall
+does not guess which lines to delete. *(§27 revises the last sentence:
+a command that matches `_is_our_hook_command` exactly is not a guess,
+and uninstall removes those tables.)*
+
+## 23. A dropped connection is a retry, not a crash (2026-09-22)
+
+**What was wrong.** `http_request` caught `URLError` and `socket.timeout`.
+urllib wraps some socket errors in `URLError` and does not wrap others.
+`getresponse()` sits outside that wrapper, and `resp.read()` is ours.
+`RemoteDisconnected`, `ConnectionResetError` and `IncompleteRead`
+therefore left the function as themselves. They are not
+`TransientError`, so nothing retried them and nothing queued them.
+`cmd_hook` then swallowed the crash to protect the agent's turn, which
+deleted the push with no history line. `run_watch` never got back to
+the command's exit code. `doctor` and the bot loop only catch
+`RuntimeError`, so they died. The approval stream reader caught
+`OSError` but not `IncompleteRead`, so one short read ended that thread.
+
+**Decision.** Both the open and the body read treat `OSError` and
+`http.client.HTTPException` as `TransientError`. A 4xx (except 408 and
+429) stays permanent, including when the error page itself cannot be
+read. Subscribe raises `RuntimeError` for the same failures so the
+stream loop reconnects; that loop also catches a short read on the
+body. Callers that already retry or queue a `TransientError` need no
+new policy.
+
+## 24. Windows toast text is data, not script (2026-09-22)
+
+**What was wrong.** The Windows notification built a PowerShell `-Command`
+and wrapped the title and message in single quotes, doubling only the
+ASCII apostrophe. Windows PowerShell 5.1 treats the typographic
+apostrophes U+2018–U+201B as quotes. A message containing `’` ended the
+string. The toast failed, and text after that character was executed.
+Shown on PowerShell 5.1 with a crafted message.
+
+**Decision.** The script is a constant. Title and message are placed in
+`AGENTBELL_OS_TITLE` and `AGENTBELL_OS_MESSAGE` on the child environment,
+and the script reads those. A NUL byte is stripped first, because an
+environment block cannot hold one. No quoting of the notification text
+remains.
+
+## 25. Re-init keeps the ntfy server you already have (2026-09-22)
+
+**What was wrong.** `init` is the documented way to add Telegram later.
+The server prompt defaulted to `https://ntfy.sh`, and a non-interactive
+run applied that default without asking. The topic was rolled again.
+`ntfy.auth` was left as it was. The test push at the end of `init` then
+sent the self-hosted password to ntfy.sh.
+
+**Decision.** The server and topic already stored are the defaults.
+Pressing Enter, or running `init --non-interactive` without `--server`,
+does not move them. If the server does change and this run did not pass
+`--ntfy-auth`, the saved password is not reused: an interactive run asks
+for the new server's credential, and a non-interactive run clears it
+before anything is published.
+
+## 26. Start markers are per session (2026-09-22)
+
+**What was wrong.** `hook started` wrote `<state>/runs/<agent>.json` and
+`run_completed` consumed that one file. Two Claude sessions running at
+once share the agent name. The second start overwrote the first. The
+long turn then measured itself from the short turn's start, fell under
+`--min-duration`, and was dropped. The short turn found no marker and
+notified, because an unknown duration always notifies.
+
+**Decision.** The file is keyed by `session_id` (or `sessionId`) from the
+JSON the host passes on stdin. A session id wins over the directory, so
+two sessions in one repo stay apart. With no session id, the working
+directory (`--cwd` or the payload's `cwd`) is the key. With neither, the
+old per-agent file remains, so a hand-run `hook started` / `hook
+run_completed` pair still matches. The stdin read never blocks: a
+terminal is ignored, and a pipe is read only when data is already
+waiting.
+
+## 27. The second review of the 2026-09-22 fixes (2026-09-23)
+
+The fixes through §26 were re-checked. Eight gaps remained. None of
+them change the exit-code contract from §22: free text that is not a
+denial is still exit 0, and `approved` is still false for that reply.
+
+**The denial list had holes the exit code falls through.** `ask &&
+deploy` only sees the exit code. `not now` denied and `nicht jetzt`
+did not; `Not` denied and `Nicht` did not; 🚫 denied and ⛔ did not.
+`nicht jetzt`, `bloß nicht`, `bloss nicht`, `halt`, `hold on`,
+`later` and `moment` are leading denials. `nicht` denies only as the
+whole reply, same as `not`, so `nicht staging` stays an answer. ✋ and
+⛔ are leading marks. The list is still not complete. `examples/custom-agent.sh`
+no longer shows a production deploy gated on exit 0; it reads
+`approved` from `--json`. A `--strict` exit code for every free-text
+reply was not added: §22 already decided that reply stays exit 0.
+
+**An exact yes label wins over the denial list.** `--yes-label "Stop
+it"` tells the user to reply `Stop it`. That reply matched the leading
+denial `stop` and exited 1. The label alone is checked first. `Stop it
+now` is not the label, so it still denies.
+
+**Kimi uninstall lied when the markers were gone.** Status saw the
+commands, the removal plan said it would remove them, and the result
+said they were already gone. The three `[[hooks]]` tables stayed, and
+Kimi kept calling a binary that was no longer there. Uninstall now
+removes a `[[hooks]]` table only when every command is exactly ours
+(`_is_our_hook_command`). A wrapper that merely mentions agentbell is
+left, and the note says so. Install still refuses to append a second
+copy. The machine this was written on already has its markers back;
+this is for the next time Kimi strips them.
+
+**`ntfy.action_auth` is the password's neighbor.** §25 drops `ntfy.auth`
+when the server changes. The button token was left behind and the next
+`ask` published it on the new server. It is cleared on every server
+change, including when `--ntfy-auth` supplies a new password. The same
+server keeps it.
+
+**A `#` inside quotes is not a TOML comment.**
+`[projects."/home/u/C#/app"]` was cut at `#`, not seen as a header, and
+deleted with the hook table above it. Comment stripping now tracks
+basic and literal strings. A `#` outside quotes is still a comment.
+
+**A config symlink is the user's file.** `_write_text_atomic` replaced
+the symlink with a regular file, so uninstall updated a copy and the
+dotfiles repo kept the hooks. The rewrite now replaces the file the
+link points at. A symlink at the temp name is still unlinked rather
+than followed. Rule files in a repository still refuse to write through
+a symlink; that threat is a repo choosing the destination, not a
+home-directory config the user linked on purpose.
+
+**Start markers older than the read window are deleted.** §26 keys one
+file per session. A session whose last turn never hits Stop left that
+file forever. Files older than the one-day read window are removed when
+a marker is written or read. `runs/last-sent.json` is not a start
+marker and stays. A turn already longer than that window was not going
+to get a duration; the read ignored it.
+
+**`approved: false` is a behavior change, not a patch note.** JSON, MCP
+and the webhook changed for every free-text reply. The changelog
+records it under Changed. The version string stays 1.6.3 until a real
+release, and that release should be a minor version.
+
+## 28. `watch` waits for the command to finish (2026-09-23)
+
+**What was wrong.** `run_watch` used `subprocess.run`. On Ctrl-C that
+helper waits 0.25s and then sends SIGKILL. A migration that traps
+SIGINT to roll back or commit the current step was killed instead.
+The completion push never ran, because the exception left `run_watch`
+before `send_notification`. The same happened for SIGTERM: the process
+died and the child was left without a push.
+
+**Decision.** The command is started in its own session and `watch`
+forwards SIGINT and SIGTERM to that process group, once per signal.
+It then waits until the command exits. There is no 0.25s kill. The
+push is sent afterwards with the command's status. A negative wait
+status (died from a signal) becomes 128+signal, which is what a shell
+reports for Ctrl-C. A command that handles the signal and exits 0 is
+a success. The session is its own so one Ctrl-C is one signal: if the
+command stayed in agentbell's process group, the terminal would deliver
+SIGINT and a forward would deliver it again, and a second interrupt is
+how tools such as Terraform abandon a graceful shutdown. `watch` is for
+a command that runs to completion. It does not put that command in the
+foreground of the terminal.
+
+## 29. Five smaller holes from the same audit (2026-09-23)
+
+**23:59 is inside a window that ends at 23:59.** End times are exclusive:
+`13:00-14:00` is quiet through 13:59 and loud at 14:00. `23:59` is the
+last minute the parser accepts, so that exclusive rule dropped the last
+minute of `00:00-23:59`. A window ending at 23:59 runs until midnight.
+Nothing else changed.
+
+**An HTTP hook is not a crash.** Install compares hook entries by putting
+them in a set. `headers` is an object and `args` can be a list, and
+neither is hashable. The comparison now freezes JSON values into tuples.
+The user's hook is left in place.
+
+**The bot lock has to name one process, not a pid.** SIGTERM killed the
+daemon before the lock was removed. The next start treated a live pid as
+"the bot is running" even after that pid had been given to another
+program. The lock stores the Linux start-time field, and a mismatch is a
+stale lock. SIGTERM now unwinds the daemon so the lock is removed. A host
+without `/proc` still has only the pid, which is what it had before.
+
+**Secrets stay out of `config show` and out of token errors.**
+`ntfy.action_auth` is redacted like the other credentials. A Telegram
+token is stripped of surrounding whitespace, so a pasted newline still
+works. Whitespace or a control character inside it raises `invalid bot
+token` without the text that was pasted. The URL scrubber redacts from
+`/bot<id>:` up to the next slash, so a space or CR in the middle cannot
+leave a tail.
+
+**The flaky Telegram tests counted too late.** They sampled the mock's
+request list after the ask thread had started, so a fast `sendMessage`
+was treated as "already there" and the test waited 20 seconds. The count
+is taken before the thread starts.

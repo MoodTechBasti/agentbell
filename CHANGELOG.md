@@ -1,5 +1,131 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`approved: true` is only an explicit yes.** `ask --json`, the MCP tool
+  `ask_approval`, and the webhook used to report `approved: true` for any
+  free-text reply. `approved` is now true only for the Approve button, a
+  bare `yes` / `ok` / `y` / `ja`, or the yes button's label alone. `staging`
+  is still exit 0 with the text on stdout, and `approved` is false. A caller
+  that treated `approved` as "the user answered" has to read `answer` as
+  well. This is a behavior change for those consumers and should ship in a
+  minor version, not as 1.6.4. This tree is still 1.6.3.
+
+### Fixed
+
+- **A quiet window ending at 23:59 includes that minute.** `00:00-23:59`
+  used to go quiet for the minute 23:59, because the end minute is exclusive
+  and 24:00 cannot be written. The window now runs until midnight. Any other
+  end minute stays exclusive, so 14:00 is not quiet in `13:00-14:00`.
+- **`hooks install` no longer crashes on an HTTP hook.** A hook whose
+  `headers` are an object (or any list) could not be compared, so install
+  for Claude, and `hooks install all`, died before changing the file. The
+  user's hook is kept.
+- **A dead bot lock no longer blocks the next start after the pid is reused.**
+  The lock remembers the process start time. SIGTERM releases the lock on
+  the way out; a kill that cannot run cleanup is recognized as stale once
+  that pid belongs to a different process.
+- **A bot token with a space or carriage return is not copied into the error.**
+  A trailing newline is still accepted as the same token. `config show`
+  redacts `ntfy.action_auth`.
+- **Ctrl-C during `watch` no longer kills the command after 0.25s.**
+  `subprocess.run` sent SIGKILL when the command was still exiting, so a
+  migration could not finish and the completion push was never sent.
+  SIGINT and SIGTERM are forwarded to the command's own process group, and
+  `watch` waits for it to exit before notifying. A signal death is reported
+  as exit 128+signal.
+- **More refusals are denials, and a deploy example no longer trusts exit 0.**
+  `nicht jetzt`, a bare `Nicht`, `halt`, `hold on`, `later`, `bloß nicht`,
+  `bloss nicht`, `Moment`, ✋ and ⛔ exit 1, same as `not now` and `Not`.
+  `nicht staging` stays an answer, as `not staging` does. Typing the yes
+  button's label approves even when that label starts with a no-word
+  (`--yes-label "Stop it"`). `examples/custom-agent.sh` gates a production
+  deploy on `--json` and `approved`, not on `ask && deploy`.
+- **An explicit yes is the only approval.** `approved: true` is reserved
+  for the Approve button, a bare `yes` / `ok` / `y` / `ja`, or the yes
+  button's label alone. `Abort` (or whatever the no button is labeled),
+  `Nein`, `Stopp`, `noch nicht`, `nö`, `not yet`, `not now`, `please don't`,
+  `absolutely not`, `wait`, 👎, ❌ and 🛑 are denials (exit 1), including
+  from the MCP tool `ask_approval`. Other text, such as `staging` or
+  `yes, but use staging`, stays exit 0 with the text on stdout. See Changed
+  for `approved: false`.
+- **Kimi uninstall removes our hooks after the markers are gone.** Kimi
+  deletes the marker comments and leaves the `[[hooks]]` tables. Uninstall
+  used to report those hooks as already gone. A table whose command is
+  exactly ours is now removed. A wrapper that only mentions agentbell is
+  left in place, and the command says so.
+- **A server change drops `ntfy.action_auth` with the password.** The old
+  token stayed in the config, and the next `ask` published it inside the
+  button headers on the new server, where those buttons do not work.
+- **A `#` inside a quoted TOML key is not a comment.**
+  `[projects."/home/u/C#/app"]` between the markers is kept on install and
+  uninstall. A `#` outside quotes still starts a comment.
+- **A symlinked Codex or Kimi config stays a symlink.** The rewrite updates
+  the file the link points at, so a dotfiles checkout does not keep a stale
+  copy. A symlink planted at the temp name is still not followed. Rule files
+  inside a repository still refuse a symlink destination.
+- **Session start markers older than a day are deleted.** A turn that never
+  reaches Stop left `runs/<agent>-<session>.json` on disk, including files
+  months old. `last-sent.json` is the dedupe record and is kept.
+- **A failed check for old ntfy replies no longer fails open.** If the
+  response topic cannot be listed and ntfy is the only channel, `ask`
+  stops (exit 3) instead of letting a previous question's `yes` approve
+  the new one after a short blip. A single blip is retried first. When
+  Telegram is also configured, that failure drops ntfy only: Telegram is
+  still asked, and it is not held back while ntfy retries.
+- **A restarted Telegram bot no longer accepts a `yes` from before the
+  question.** A free-text reply is accepted only when its Telegram
+  message id is newer than the question's. That does not depend on the
+  local clock.
+- **Codex's own config is no longer deleted on install or uninstall.**
+  Tables Codex writes between the agentbell markers (`[tui]`, `[plugins.*]`,
+  `[notice.*]`, `[hooks.state]`, and a hook you added yourself) are moved
+  out of the block and kept. The same marker rules apply to a Kimi config
+  that still has its markers. A Kimi config whose markers were removed but
+  whose hook commands are still there is left unchanged, so `hooks install
+  kimi` does not add a second copy.
+- **A hook appended to agentbell's own `hooks.Stop` group stays an array.**
+  Uninstall keeps the `[[hooks.Stop]]` parent when a later
+  `[[hooks.Stop.hooks]]` in that group is not ours. Without the parent,
+  TOML reads `hooks.Stop` as a table.
+- **Removing an MCP entry no longer follows `mcp.json.tmp`.** That write
+  goes through the same atomic JSON helper as the other config files, so a
+  symlink at the temp name is not followed and a `0600` file stays `0600`.
+- **Queued notifications keep their order when several land in the same
+  second.** Eviction sorts by `created_ns`, not only by the
+  second-resolution `created` timestamp. The sort landed after 1.6.3 and
+  had no changelog line.
+- **A dropped connection is retried instead of crashing.** A reset or a
+  short read (`RemoteDisconnected`, `ConnectionResetError`,
+  `IncompleteRead`) used to escape the HTTP helper. Hook pushes were then
+  lost with no queue and no history entry, `watch` never returned the
+  command's exit code, and `doctor` and the Telegram bot died. Those
+  failures are transient: the push is retried and, if it still fails,
+  queued. The approval stream reconnects.
+- **Windows toast text is no longer PowerShell source.** A typographic
+  apostrophe (`’`) closed the quoted string on Windows PowerShell 5.1, so
+  the toast broke and the rest of the message ran as code. Title and
+  message are passed in the child process environment. The script itself
+  does not contain them.
+- **Re-running `init` no longer posts a self-hosted ntfy password to
+  ntfy.sh.** The server and topic already in the config stay the defaults.
+  If the server does change, the saved password is dropped (or asked for
+  again) before the test push.
+- **Parallel sessions no longer share one start time.** The marker was
+  one file per agent, so a second Claude session overwrote it. A long
+  turn was then dropped as short, and the short turn notified. The marker
+  is now per `session_id` from the hook payload, or per working directory
+  when the host does not send one.
+- **A Codex config with no trailing newline stays valid.** `features.hooks
+  = true` is written on its own line. A copy already glued to the last line
+  is removed by uninstall instead of being left where Codex cannot parse it.
+- **`AGENTS.md.tmp` as a symlink is no longer followed.** `hooks install`
+  for a rule file creates that temp name with `O_EXCL`, so a prepared link
+  to `~/.bashrc` is removed rather than written through. Rewritten Codex
+  and Kimi configs keep their existing file mode.
+
 ## 1.6.3 — 2026-09-03 — review hardening
 
 The thirteen findings from the 2026-08-22 review were re-verified against

@@ -113,7 +113,9 @@ only, so it cannot use a local stdio server at all.
 The pattern for a long-running script, CI job or agent wrapper of your own:
 run the work, notify on success, notify *and* pass the exit code through on
 failure. The failure branch is part of the `if` on purpose — under
-`set -e` a `$?` check on the following line would never be reached.
+`set -e` a `$?` check on the following line would never be reached. The
+commented approval gate does not use `ask && deploy`: exit 0 is also a
+free-text answer, so a deploy has to read `approved` from `--json`.
 
 ### `watch.sh`
 

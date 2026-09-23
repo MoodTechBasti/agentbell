@@ -27,9 +27,13 @@ fi
 #
 #   agentbell watch -- npm run build
 #
-# Approval gate: ask before a risky step, wait up to 10 minutes.
-# `ask` exits 0 = approved or answered, 1 = denied, 2 = timeout, 3 = error.
+# Approval gate for a real deploy. Exit 0 is not enough: a free-text reply
+# is also exit 0, and `approved` is false then. `ask && ./deploy.sh` would
+# ship on "later" or "nicht jetzt" whenever those words are not in the
+# denial list. `--json` prints the verdict. Denied (1), timeout (2) and
+# errors (3) abort before the deploy; only an explicit yes has
+# `approved: true`.
 #
-#   if agentbell ask "Deploy to production?" --timeout 600; then
-#       ./deploy.sh
-#   fi
+#   answer=$(agentbell ask "Deploy to production?" --timeout 600 --json) || exit $?
+#   printf '%s' "$answer" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("approved") is True else 1)'
+#   ./deploy.sh

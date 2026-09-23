@@ -105,20 +105,20 @@ The answer travels **through ntfy itself** — you don't expose an endpoint:
 - Buttons and app replies publish to a dedicated `<topic>-responses` topic.
 - `ask` waits on a live stream **plus** a polling fallback (robust when a server buffers streams).
 
-**Button answers never get crossed.** Every question carries a 64-bit request ID, and button answers are matched to exactly that ID. Free-text replies carry no ID, so they always go to the newest open question — with two asks in flight, answer with the buttons. Answers that were already on the topic when a question is asked are ignored, so a new `ask` can never inherit an old answer.
+**Button answers never get crossed.** Every question carries a 64-bit request ID, and button answers are matched to exactly that ID. Free-text replies carry no ID, so they always go to the newest open question — with two asks in flight, answer with the buttons. Answers that were already on the topic when a question is asked are ignored, so a new `ask` can never inherit an old answer. If that check cannot be read and ntfy is the only channel, `ask` stops (exit 3) instead of guessing. When Telegram is also configured, that channel is still asked and ntfy is skipped.
 
 **How your reply is read:**
 
 | You reply | Result | Exit |
 |---|---|---|
-| tap **Approve**, or type `yes` / `ok` / `y` | approved | 0 |
-| tap **Deny**, or type `no` / `deny` / `stop` | denied | 1 |
+| tap **Approve**, or type `yes` / `ja` / `ok` / `y` | approved | 0 |
+| tap **Deny**, type that button's label, or type `no` / `deny` / `stop` / `stopp` / `halt` / `not yet` / `noch nicht` / `nicht jetzt` / `nein` / `nö` / `later` / 👎 / ❌ / ✋ / ⛔ | denied | 1 |
 | `no, not before the release` | denied, reason kept | 1 |
 | `use the staging cluster` | answered (text on stdout) | 0 |
 | `yes, but use staging` | answered, **not** a bare approval | 0 |
 | nothing | timeout | 2 |
 
-Exit 0 means "approved **or** answered" — so if you chain `agentbell ask "Deploy?" && deploy`, a free-text reply also proceeds. For a strict gate, read the `--json` output and check `approved` together with `answer`.
+Exit 0 means "approved **or** answered". In `--json`, `approved` is true only for an explicit yes: the Approve button, `yes` / `ok` / `y` / `ja`, or the yes button's label alone. A free-text reply such as `staging` or `yes, but use staging` is exit 0 with the text on stdout and `approved: false`. A denial is exit 1. Chaining `agentbell ask "Deploy?" && deploy` still runs the command for any reply that is not a denial, because that chain only sees the exit code. A production deploy should use `--json` and require `approved` to be true. `examples/custom-agent.sh` shows that.
 
 > **Before you gate anything real on this:** the answer path is only as private as your topic name, and on public ntfy.sh anyone who knows that name can approve your questions. Read the [trust model](#trust-model) — for sensitive approvals, self-host ntfy with auth.
 
