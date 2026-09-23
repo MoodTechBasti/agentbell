@@ -36,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.6.3"
+VERSION = "1.7.0"
 PROG = "agentbell"
 
 # The self-integration contract printed by `agentbell integrate` (bumped only
