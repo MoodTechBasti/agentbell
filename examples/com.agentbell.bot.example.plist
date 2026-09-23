@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  What `agentbell bot install-service` writes on macOS to
+  ~/Library/LaunchAgents/com.agentbell.bot.plist, then loads with launchctl.
+  Prefer the command: it fills in the absolute path of your actual install
+  and the config and state paths it uses. This copy assumes /Users/you and
+  the default directories. From a git checkout, ProgramArguments starts with
+  the Python interpreter, then the path to agentbell.py.
+  KeepAlive restarts the bot when it exits with an error, not after a clean exit.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.agentbell.bot</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/you/.local/bin/agentbell</string><string>bot</string><string>run</string></array>
+  <key>EnvironmentVariables</key><dict><key>AGENTBELL_CONFIG</key><string>/Users/you/.config/agentbell/config.json</string><key>AGENTBELL_STATE_DIR</key><string>/Users/you/.local/state/agentbell</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+</dict>
+</plist>

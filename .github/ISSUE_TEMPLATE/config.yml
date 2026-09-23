@@ -1,1 +1,5 @@
 blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/MoodTechBasti/agentbell/security/advisories/new
+    about: Please report security issues privately through GitHub's private vulnerability reporting, not as a public issue.

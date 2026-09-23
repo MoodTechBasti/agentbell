@@ -1,14 +1,26 @@
 # agentbell Telegram answer daemon (premium)
 #
-# Prefer: agentbell bot install-service (it writes the correct absolute path for your install)
+# Prefer: agentbell bot install-service (it writes the correct absolute paths for your install)
 #
 # You normally do NOT need this file. The CLI writes the unit itself, with the
-# absolute path of your actual install — the ExecStart below assumes
-# %h/.local/bin, which is only right for the plain-copy and `pip --user`
-# install paths. A pipx or venv install lives somewhere else entirely.
+# absolute path of your actual install and the config and state directories it
+# uses. This copy assumes %h/.local/bin and the default directories, which is
+# only right for the plain-copy and `pip --user` install paths; a pipx or venv
+# install lives somewhere else entirely. From a git checkout, agentbell.py is
+# not executable, so ExecStart runs it with the interpreter:
+#   ExecStart="/usr/bin/python3" "/path/to/agentbell/agentbell.py" bot run
 #
-# This copy is here for reference and for hand-editing. To use it directly,
-# check the ExecStart path first (`command -v agentbell`), then:
+# A service does not see your shell's AGENTBELL_* or XDG_* variables. The two
+# Environment= lines pin the config file and state directory, so the bot reads
+# the same config as `agentbell ask` and `ask` sees its heartbeat. Change them
+# if you moved either one.
+#
+# Type=exec makes `systemctl start` fail when ExecStart cannot be executed.
+# The bot exits 0 on SIGTERM, so `systemctl --user stop agentbell-bot` leaves
+# the unit inactive, not failed. Restart=on-failure restarts it after 10 s
+# only when it exits with an error.
+#
+# To use this copy directly, check the paths first (`command -v agentbell`), then:
 #   cp examples/agentbell-bot.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now agentbell-bot
@@ -19,8 +31,10 @@ Description=agentbell Telegram answer daemon
 After=network-online.target
 
 [Service]
-Type=simple
+Type=exec
 ExecStart="%h/.local/bin/agentbell" bot run
+Environment="AGENTBELL_CONFIG=%h/.config/agentbell/config.json"
+Environment="AGENTBELL_STATE_DIR=%h/.local/state/agentbell"
 Restart=on-failure
 RestartSec=10
 

@@ -139,10 +139,10 @@ fixed here; the disposition and rejected alternatives are in
   source distribution, check their metadata, transfer the exact artifacts to
   a separate publish job and upload through PyPI Trusted Publishing. The
   workflow uses the protected `pypi` GitHub environment and OIDC; no upload
-  token is stored in the repository. The README presents `pipx install
-  agentbell` as the pending primary path without claiming publication before
-  a fresh-environment field test. The release gate also asserts that the only
-  Python runtime file in wheel and sdist is `agentbell.py`, that the console
+  token is stored in the repository. v1.6.3 was published to PyPI through
+  this workflow on 2026-09-03, and `pipx install agentbell` is the primary
+  install path. The release gate also asserts that the only Python runtime
+  file in wheel and sdist is `agentbell.py`, that the console
   entry point is present, and that tests, `internal/` and `.license-secret`
   are absent. Rationale: `DECISIONS.md` §19.
 
@@ -151,8 +151,9 @@ fixed here; the disposition and rejected alternatives are in
 - `agentbell uninstall` recognizes a pipx-managed package and delegates its
   removal to `pipx uninstall agentbell`; regression tests cover both pipx
   detection and the purge action. A real isolated pipx artifact test is
-  recorded in `FIELD_TEST.md`, while installation from public PyPI remains
-  pending publication.
+  recorded in `FIELD_TEST.md`. After publication, `pip install agentbell`
+  from public PyPI was verified on 2026-09-05 (`FIELD_TEST.md`); a `pipx
+  install` from public PyPI is not recorded there.
 
 ### Fixed
 
@@ -318,6 +319,29 @@ needs to know an agent to work with it: it **publishes a contract** and
   (sanitized; a bad value drops the attribution, never kills the server).
   Tool descriptions now state the notification policy and that a timeout
   is not an approval.
+- **Windows onboarding.** The README documents a PowerShell setup from a
+  checkout (`py -m pip install --user .`, then `py -m agentbell init`, which
+  works before the Python Scripts folder is on `PATH`). When `agentbell` is
+  not on `PATH`, `doctor` on Windows now prints a PowerShell command that
+  adds the user Scripts folder to the user `PATH`, instead of the POSIX
+  `export PATH=…` line. The config file's POSIX mode check (`chmod 600`) is
+  skipped on Windows, where it does not apply.
+- **Warning for sensitive approvals without ntfy authentication.** When an
+  `ask` goes out over ntfy without `ntfy.auth` and the question matches a
+  narrow set of high-impact patterns (production deploys; deleting a
+  database, cluster, bucket or production resource; rotating, revoking or
+  exposing credentials; money transfers; firewall or access-control
+  changes), agentbell writes a warning to stderr: anyone who knows the
+  topic can answer the question. The warning is a reminder, not a block, and
+  it cannot judge every action's real impact. In this release it fired once
+  per process; 1.6.3 made it fire for every matching ask.
+- **`hooks status` shows how reliable each integration is.** A new column
+  reads `hook` for deterministic lifecycle hooks and plugins, and `~ rule`
+  for rule-file instructions the agent is asked to follow (best effort by
+  construction).
+- **CI runs on Windows.** The test matrix gained Windows jobs (Python 3.11
+  and 3.13), and one job per OS installs the package and runs
+  `agentbell --help` as a packaging smoke test.
 
 ### Changed
 
@@ -361,6 +385,13 @@ needs to know an agent to work with it: it **publishes a contract** and
 
 ### Fixed (found by CI)
 
+- **A free-text reply can no longer answer two parallel asks.** On ntfy
+  every open `ask` polls the same response topic. When the newest ask took a
+  free-text reply and removed its pending marker, an older ask polling the
+  same topic could find the marker gone, promote itself to newest and
+  consume the same reply. The claim is now recorded durably in the state
+  directory (`ntfy-consumed`, the last 200 message ids) before the marker is
+  removed, and every poller skips claimed ids. Found on a slow CI runner.
 - **A published contract can no longer carry the calling context as its
   executable.** `agentbell_binary()` fell back to `sys.argv[0]` verbatim;
   under `python -m unittest` the stdlib rewrites argv[0] to the literal
@@ -523,7 +554,8 @@ below cost the user something during that run.
 - **`agentbell config set <key> <value>`** — change one setting without
   re-running the wizard (`ntfy.topic`, `ntfy.server`, `ntfy.auth`,
   `telegram.chat_id`, `channels`, `quiet_hours`, `quiet_hours_mode`,
-  `quiet_hours_min_priority`, `approval_timeout`). Values are validated:
+  `quiet_hours_min_priority`, `approval_timeout`; 1.5.0 and later also
+  accept `webhook.token`). Values are validated:
   unlike the tolerant config reader, a malformed quiet-hours window is
   rejected rather than silently dropped. `doctor`'s short-topic warning now
   fixes itself with one pasteable line instead of "run init again".
