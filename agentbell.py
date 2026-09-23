@@ -2106,15 +2106,20 @@ _LOCK_BUSY = (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES)
 _BOT_LOCK_BYTE = 1 << 20
 
 
-def _lock_bot_fd(fd, unlock=False):
-    """Take (or drop) the bot lock on `fd` without waiting; OSError when busy."""
+def _lock_bot_fd(fd, unlock=False, shared=False):
+    """Take (or drop) the bot lock on `fd` without waiting; OSError when busy.
+
+    A `shared` lock is a probe's: probes never block each other, only a bot
+    does. Windows has no shared lock and takes an exclusive one.
+    """
     if os.name == "nt":
         import msvcrt
         os.lseek(fd, _BOT_LOCK_BYTE, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK, 1)
     else:
         import fcntl
-        fcntl.flock(fd, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        fcntl.flock(fd, fcntl.LOCK_UN if unlock else mode | fcntl.LOCK_NB)
 
 
 def bot_running():
@@ -2125,7 +2130,13 @@ def bot_running():
     except OSError:
         return False
     try:
-        _lock_bot_fd(fd)
+        try:
+            _lock_bot_fd(fd, shared=True)
+        except OSError as exc:
+            if os.name != "nt" or exc.errno not in _LOCK_BUSY:
+                raise
+            time.sleep(0.05)          # maybe another probe's moment, not a bot
+            _lock_bot_fd(fd)
         _lock_bot_fd(fd, unlock=True)
     except OSError as exc:
         return exc.errno in _LOCK_BUSY
@@ -7125,10 +7136,13 @@ def purge_report(project=None):
     entries.extend(_mcp_entries(project))
 
     # 5. A running bot would recreate state files; warn but do not kill it
+    #    (step 0 stops the service's bot, not one started by hand)
     if bot_running():
         warnings.append(
-            f"an agentbell bot is running (pid {_read_bot_lock().get('pid')}); stop it first, "
-            "otherwise it will recreate state files"
+            f"an agentbell bot is running (pid {_read_bot_lock().get('pid')}); "
+            + ("unless it is the bot service, which is stopped first, stop it yourself"
+               if entries and entries[0]["kind"] == "service" else "stop it first")
+            + ", otherwise it will recreate state files"
         )
 
     return {"entries": entries, "warnings": warnings}
@@ -8282,8 +8296,9 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
     topic = (cfg.data.get("ntfy") or {}).get("topic") or ""
     # the problem text never contains the topic itself (see the docstring)
     topic_status, topic_problem = rate_topic(topic)
+    ntfy_used = _ntfy_in_use(cfg)
     server_valid = True
-    if _ntfy_in_use(cfg):
+    if ntfy_used:
         try:
             NtfyChannel(cfg).server()
         except RuntimeError:
@@ -8291,6 +8306,10 @@ def verify_report(cfg, agent=None, since_seconds=None, project=None, now=None):
     if not os.path.exists(cfg.path):
         checks.append(_check(FAIL, "delivery", "no config yet - nothing can be delivered",
                              "agentbell init"))
+    elif not ntfy_used:
+        # doctor's rule: the ntfy topic and server are not judged then
+        checks.append(_check(OK, "delivery", "ntfy not used - Telegram carries "
+                             "notifications and approvals (offline check, nothing sent)"))
     elif not topic:
         checks.append(_check(FAIL, "delivery", "no ntfy topic configured", "agentbell init"))
     elif topic_status == FAIL:
@@ -9218,6 +9237,28 @@ def _terminal_foreground():
         os.close(tty)
 
 
+def _kills_its_group(pid):
+    """Whether process `pid` is timeout(1), which signals its child and then
+    its whole group; with --foreground it signals the child alone."""
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as fh:
+            if fh.read().strip() != "timeout":
+                return False
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            args = fh.read().decode("utf-8", "replace").split("\0")[1:]
+    except OSError:
+        return False
+    options = iter(args)
+    for arg in options:
+        if arg == "-f" or (len(arg) > 2 and "--foreground".startswith(arg)):
+            return False
+        if arg in ("-k", "-s", "--kill-after", "--signal"):
+            next(options, None)
+        elif arg == "--" or not arg.startswith("-"):
+            break             # the duration; the command's own options follow
+    return True
+
+
 def _command_got_it_too(signum, had_tty, info=None):
     """True when the watched command got `signum` as well, so watch keeps it.
 
@@ -9231,9 +9272,12 @@ def _command_got_it_too(signum, had_tty, info=None):
 
     `info` is the sender from sigtimedwait (Linux): the kernel for a key or
     a hangup, else a process. A process in watch's own group (timeout(1),
-    the command's own `kill 0`) signaled that group; anything else is taken
-    to have signaled watch alone, although `kill %1` and systemd reach the
-    group from outside and the command then gets their SIGTERM twice.
+    the command's own `kill 0`) signaled that group, except watch's parent
+    when it is not timeout(1): uv run, a nested watch or a wrapper script
+    relays a signal to its child alone, and its relay counts as a signal
+    without `info`. Anything else is taken to have signaled watch alone,
+    although `kill %1` and systemd reach the group from outside and the
+    command then gets their SIGTERM twice.
     Without `info`, Ctrl-C and Ctrl-\\ count as keys while watch is the
     terminal's foreground job. On Windows every process on the console gets
     Ctrl-C and Ctrl-Break, and no other signal reaches watch from outside. A
@@ -9245,7 +9289,9 @@ def _command_got_it_too(signum, had_tty, info=None):
     if info is not None and info.si_code <= 0 and info.si_pid > 0:
         try:
             if os.getpgid(info.si_pid) == os.getpgrp():
-                return True
+                if info.si_pid != os.getppid() or _kills_its_group(info.si_pid):
+                    return True
+                info = None
         except OSError:
             pass              # the sender is gone
     if signum == signal.SIGHUP:

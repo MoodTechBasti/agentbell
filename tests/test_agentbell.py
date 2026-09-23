@@ -5163,6 +5163,9 @@ class TestSecurityAuditRegressions(unittest.TestCase):
 
             def do_POST(self):
                 holder["auth"] = self.headers.get("Authorization")
+                # an unread body makes Windows reset the connection, and the
+                # client never sees the 302
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 self.send_response(302)
                 self.send_header("Location", "http://127.0.0.1:1/stolen")
                 self.send_header("Content-Length", "0")

@@ -6,8 +6,8 @@ W1/IW-1  Windows: a .bat or .cmd gets its arguments as typed. cmd.exe does
 W6       Windows: what CreateProcess finds is started as before; the PATH
          fallback takes only files CreateProcess can start.
 W2/W3    Linux: a signal from watch's own process group (timeout(1)) is not
-         passed on a second time; one sent to watch alone is, also while
-         watch is the terminal's foreground job.
+         passed on a second time (tested in test_audit4_runtime); one sent to
+         watch alone is, also while watch is the terminal's foreground job.
 W7       A hangup sent to watch without a terminal reaches the command.
 W4/HR-3  A bad config value or an unusable state dir costs the push, never
          the command's exit code.
@@ -60,21 +60,6 @@ while time.monotonic() < deadline:
 with open(state + ".senders", "w") as fh:
     fh.write(" ".join("%d:%d" % (i.si_signo, i.si_pid) for i in got))
 sys.exit(EXIT[first.si_signo])
-'''
-
-# What timeout(1) does when its time is up: signal watch, then the whole
-# process group it shares with watch and the command. It fires on ".fire".
-GROUP_KILLER = r'''
-import os, signal, subprocess, sys, time
-signal.signal(signal.SIGTERM, lambda signum, frame: None)
-state, argv = sys.argv[1], sys.argv[2:]
-watch = subprocess.Popen(argv)
-deadline = time.monotonic() + 20
-while not os.path.exists(state + ".fire") and time.monotonic() < deadline:
-    time.sleep(0.02)
-os.kill(watch.pid, signal.SIGTERM)
-os.killpg(0, signal.SIGTERM)
-sys.exit(watch.wait())
 '''
 
 
@@ -211,35 +196,6 @@ class TestBatchFilesOnWindows(unittest.TestCase):
         result = an.run_watch(self.cfg, ["abtool", "plain"])
         self.assertEqual(result["exit_code"], 5, result["message"])
         self.assertEqual(self.received(), ["plain"])
-
-
-@unittest.skipUnless(LINUX_SIGINFO, "the sender of a signal is known on Linux")
-class TestWatchKnowsWhoSentASignal(w2._WatchProcessCase):
-
-    def test_a_group_signal_from_inside_the_group_is_not_passed_on_again(self):
-        """W2: timeout(1) signals watch and then its whole group, command included."""
-        with open(self.child, "w", encoding="utf-8") as fh:
-            fh.write(SENDER_CHILD)
-        killer = os.path.join(self.tmp, "killer.py")
-        with open(killer, "w", encoding="utf-8") as fh:
-            fh.write(GROUP_KILLER)
-        proc = subprocess.Popen(
-            [sys.executable, killer, self.state] + self.watch_argv(),
-            env=self.env, cwd=self.tmp, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        try:
-            _, watch = self.ready()
-            w2._wait_for(lambda: _blocked(watch, signal.SIGTERM), what="watch to wait")
-            open(self.state + ".fire", "w").close()
-            self.assertEqual(proc.wait(timeout=30), 4)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-        with open(self.state + ".senders", encoding="utf-8") as fh:
-            senders = fh.read().split()
-        self.assertEqual(senders, ["%d:%d" % (signal.SIGTERM, proc.pid)])
-        self.assertIn("failed (exit 4)", self.wait_for_push()[-1]["body"])
 
 
 @unittest.skipUnless(LINUX_SIGINFO and w2.HAS_PTY, "Linux pseudo-terminal")
