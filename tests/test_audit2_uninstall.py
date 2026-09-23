@@ -59,12 +59,12 @@ class _UninstallFixture(unittest.TestCase):
             self.addCleanup(patch.stop)
 
     def tearDown(self):
-        base._restore_home(self.old_home)
         for key, value in self.old_env.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        base._restore_home(self.old_home)       # last: it saved APPDATA & co first
         sys.argv[0] = self.old_argv0
         shutil.rmtree(self.root, ignore_errors=True)
 

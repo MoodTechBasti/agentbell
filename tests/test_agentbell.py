@@ -31,6 +31,7 @@ import agentbell as an  # noqa: E402
 _TEST_ROOT = tempfile.mkdtemp(prefix="agentbell-tests-")
 os.environ["AGENTBELL_STATE_DIR"] = os.path.join(_TEST_ROOT, "state")
 os.environ["AGENTBELL_CONFIG_DIR"] = os.path.join(_TEST_ROOT, "config")
+os.environ.pop("AGENTBELL_CONFIG", None)
 
 # Many tests fire the same hook push back to back; the identical-push window
 # would turn them into `hook.skipped_duplicate`. Off here, on (patched) in
@@ -41,13 +42,26 @@ an.HOOK_DEDUPE_WINDOW_SECONDS = 0
 HAS_TOMLLIB = sys.version_info >= (3, 11)
 
 
+# Env vars that move a location agentbell (or `python -m site`, `pipx`) reads
+# away from the home dir. Unset, each one falls back to a path under HOME.
+_HOME_OVERRIDES = ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_BIN_HOME",
+                   "KIMI_CODE_HOME", "QWEN_HOME", "PYTHONUSERBASE", "PIPX_HOME",
+                   "PIPX_BIN_DIR")
+
+
 def _set_home(home):
     """Point every home-dir mechanism at `home`. Windows expanduser ignores
-    HOME and reads USERPROFILE, so tests must move both - otherwise they
-    read and write the real profile of the machine running the tests."""
-    old = {key: os.environ.get(key) for key in ("HOME", "USERPROFILE")}
+    HOME and reads USERPROFILE, and Windows paths come from APPDATA, so tests
+    must move all of them - otherwise they read and write the real profile,
+    agent configs and pip --user install of the machine running the tests."""
+    old = {key: os.environ.get(key)
+           for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA") + _HOME_OVERRIDES}
     os.environ["HOME"] = home
     os.environ["USERPROFILE"] = home
+    os.environ["APPDATA"] = os.path.join(home, "AppData", "Roaming")
+    os.environ["LOCALAPPDATA"] = os.path.join(home, "AppData", "Local")
+    for key in _HOME_OVERRIDES:
+        os.environ.pop(key, None)
     return old
 
 
@@ -57,6 +71,12 @@ def _restore_home(old):
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+
+
+# The whole suite runs in a temp home; a test's own _set_home() moves it
+# further and _restore_home() comes back here, never to the real one.
+os.makedirs(os.path.join(_TEST_ROOT, "home"))
+_set_home(os.path.join(_TEST_ROOT, "home"))
 
 
 def _fake_launcher(tmpdir, name="agentbell"):
@@ -3193,6 +3213,12 @@ class TestPurge(unittest.TestCase):
         self.old_home = _set_home(self.home)
         self.old_argv0 = sys.argv[0]
         sys.argv[0] = _fake_launcher(self.home)
+        # tests here apply what purge finds: never the real pipx / pip --user install
+        self.real_pipx_installed = an._pipx_installed
+        for name, value in (("_pipx_installed", None), ("_user_site_dirs", (None, None))):
+            patcher = unittest.mock.patch.object(an, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         _restore_home(self.old_home)
@@ -3235,7 +3261,7 @@ class TestPurge(unittest.TestCase):
         }))
         # opencode project block + MCP entry
         agents_md = os.path.join(self.project, "AGENTS.md")
-        self._write(agents_md, f"# Rules\n{an.BLOCK_START}\ninstructions\n{an.BLOCK_END}\n")
+        self._write(agents_md, f"# Rules\n{an.BLOCK_START}\n{an.OPENCODE_INSTRUCTIONS}{an.BLOCK_END}\n")
         oc_json = os.path.join(self.project, "opencode.json")
         self._write(oc_json, json.dumps({
             "$schema": "https://opencode.ai/config.json",
@@ -3332,7 +3358,7 @@ class TestPurge(unittest.TestCase):
                 side_effect=lambda name: "/tools/pipx" if name == "pipx" else None), \
                 unittest.mock.patch.object(
                     an.subprocess, "run", return_value=completed) as run:
-            self.assertEqual(an._pipx_installed(), "/tools/pipx")
+            self.assertEqual(self.real_pipx_installed(), "/tools/pipx")
         run.assert_called_once_with(
             ["/tools/pipx", "list"], capture_output=True, text=True, timeout=30)
 
@@ -3378,14 +3404,16 @@ class TestPurge(unittest.TestCase):
     def test_cmd_uninstall_dry_run_deletes_nothing(self):
         import io as _io
         from contextlib import redirect_stdout
+        self._write(an.config_path(), "{}")
         parser = an.build_parser()
-        args = parser.parse_args(["uninstall"])
+        args = parser.parse_args(["uninstall", "--project", self.project])
         buffer = _io.StringIO()
         with redirect_stdout(buffer):
             args.func(args)
         out = buffer.getvalue()
         self.assertIn("dry run", out)
         self.assertIn("--yes", out)
+        self.assertTrue(os.path.exists(an.config_path()))
 
     def test_purge_env_override_warning(self):
         old = os.environ.get(an.CONFIG_DIR_ENV)
@@ -6093,7 +6121,7 @@ class TestIntegrationGuide(unittest.TestCase):
         started = guide.index(manifest["commands"]["started_silent"])
         completed = guide.index(manifest["commands"]["completed_min_duration"])
         self.assertLess(started, completed)
-        self.assertLess(completed - started, 200)   # same section, adjacent lines
+        self.assertEqual(guide.count("\n", started, completed), 1)   # adjacent lines
         self.assertIn("BOTH", guide)
 
     def test_rules_block_uses_slug_scoped_markers_only(self):

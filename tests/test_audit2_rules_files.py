@@ -182,7 +182,7 @@ class TestAiderInstallMessage(_ProjectCase):
     `hooks status` said "not installed"."""
 
     CASES = {
-        "a doc mentions the start marker": "# Docs\n\nOur marker is `" + an.BLOCK_START + "`.\n",
+        "a stray start marker line": "# Docs\n\n" + an.BLOCK_START + "\nold notes\n",
         "the legacy OpenCode block": _block("opencode") + "\n",
         "the Aider block next to a second block": _block("aider") + "\n\n" + _block("opencode") + "\n",
     }

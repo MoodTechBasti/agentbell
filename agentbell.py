@@ -4596,6 +4596,29 @@ def _line_ending(text):
     return "\r\n" if crlf > lf else "\n"
 
 
+# A marker counts only on a line of its own, which is how agentbell writes it.
+# One inside a sentence or backticks (a doc about agentbell) is user text.
+_BLOCK_RE = re.compile("^" + re.escape(BLOCK_START) + r"(?=\r?$)(.*?)^"
+                       + re.escape(BLOCK_END) + r"(?=\r?$)", re.S | re.M)
+_MARKER_LINE_RE = re.compile(
+    "^(?:" + re.escape(BLOCK_START) + "|" + re.escape(BLOCK_END) + r")(?=\r?$)", re.M)
+_AGENTBELL_COMMAND_RE = re.compile(r"agentbell[^\n]*--agent [^\s`]+")
+
+
+def _agentbell_blocks(text):
+    """Our marked blocks in `text`, or None when the markers are ambiguous.
+
+    A marker line without its partner, or a marker inside a block, could put
+    user text between a start and an end. Never guess which text is ours.
+    """
+    blocks = list(_BLOCK_RE.finditer(text))
+    if len(_MARKER_LINE_RE.findall(text)) != 2 * len(blocks) or any(
+            BLOCK_START in block.group(1) or BLOCK_END in block.group(1)
+            for block in blocks):
+        return None
+    return blocks
+
+
 def _install_block_file(path, content, add=True, replace_stale=False, notes=None):
     """Add, repair or remove our marked block in a rule file others share.
 
@@ -4611,33 +4634,38 @@ def _install_block_file(path, content, add=True, replace_stale=False, notes=None
         if not exists:
             return False
         text = _read_rule_file(path)
-        if BLOCK_START not in text:
-            return False
-        pattern = re.compile(
-            re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END), re.S
-        )
         # Removal is owner-scoped like repair: a shared file (AGENTS.md) can
         # hold another agent's block between the same markers, and "only
         # entries whose content is ours are ever touched" applies on the way
         # out too. v1.6.1's OpenCode install wiped a project's Aider block
         # this way. A block that does not name the owner is left alone.
-        # content=None (purge) means every agentbell block: a full reset is
-        # the one caller entitled to all of them.
-        owner = re.search(r"--agent ([^\s`]+)", content) if content else None
-        matches = [m for m in pattern.finditer(text)
-                   if owner is None or owner.group(0) in m.group(0)]
+        # content=None (purge) means every block that runs an agentbell
+        # command: a full reset is the one caller entitled to all of them.
+        owner = re.search(r"--agent ([^\s`]+)", content).group(0) if content else None
+        blocks = _agentbell_blocks(text)
+        if blocks is None:
+            if owner is None or owner in text:
+                notes.append(f"{name} has an agentbell marker line without its partner "
+                             "(or inside a block); left it unchanged so none of your text "
+                             "is lost. Remove agentbell's block and the stray marker yourself")
+            return False
+        matches = [m for m in blocks if (owner in m.group(1) if owner
+                                         else _AGENTBELL_COMMAND_RE.search(m.group(1)))]
         if not matches:
             return False
         new_text = text
         for match in reversed(matches):
-            new_text = new_text[:match.start()] + new_text[match.end():]
-        eol = _line_ending(new_text)
-        new_text = new_text.strip()
-        if not new_text:
+            # the block and the one line end written after it; every other
+            # byte stays as the user left it
+            end = match.end()
+            end += len(re.match(r"\r?\n?", text[end:]).group(0))
+            new_text = new_text[:match.start()] + new_text[end:]
+        # a `.clinerules` file is the user's (it picks Cline's layout): kept even empty
+        if not new_text and name != ".clinerules":
             os.remove(path)
         else:
             with _open_nofollow(path, "w", newline="") as fh:
-                fh.write(new_text + eol)
+                fh.write(new_text)
         return True
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -4653,16 +4681,13 @@ def _install_block_file(path, content, add=True, replace_stale=False, notes=None
         notes.append(f"{name} is saved as UTF-16 (or is not text); left it unchanged. "
                      "Save it as UTF-8, then run this again")
         return False
-    if BLOCK_START in text:
-        if not replace_stale:
+    matches = _agentbell_blocks(text)
+    if matches is None or matches:
+        if matches and not replace_stale:
             return False
-        pattern = re.compile(
-            re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END), re.S
-        )
-        matches = list(pattern.finditer(text))
         # An unmatched or duplicated marker is ambiguous. Never guess which
         # surrounding user text belongs to agentbell.
-        if len(matches) != 1:
+        if matches is None or len(matches) != 1:
             notes.append(f"{name} does not hold exactly one complete agentbell block "
                          "(a stray marker or a second block); left it unchanged so none "
                          "of your text is lost. Remove the extra marker or block, then "
@@ -4790,13 +4815,10 @@ def aider_block_state(project=None):
             text = fh.read()
     except (FileNotFoundError, OSError):
         return "absent"
-    pattern = re.compile(
-        re.escape(BLOCK_START) + r"(.*?)" + re.escape(BLOCK_END), re.S
-    )
-    matches = pattern.findall(text)
-    if len(matches) != 1:
+    matches = _agentbell_blocks(text)
+    if matches is None or len(matches) != 1:
         return "absent"
-    aider_marked = [body for body in matches if "--agent aider" in body]
+    aider_marked = [m.group(1) for m in matches if "--agent aider" in m.group(1)]
     if not aider_marked:
         return "absent"
     expected = _instructions_text("aider").strip()
@@ -5050,10 +5072,11 @@ def _kimi_install(add):
 
 def _opencode_result(project, add):
     result = install_opencode_plugin(project=project, add=add)
-    legacy = os.path.join(_project_dir(project), "AGENTS.md")
-    if _install_block_file(legacy, OPENCODE_INSTRUCTIONS, add=False):
+    legacy = _block_file_result("opencode", project, "AGENTS.md", OPENCODE_INSTRUCTIONS, False)
+    if legacy["changed"]:
         result["changed"] = True     # migrate away from the v1.3rc AGENTS.md block
-    return {"agent": "opencode", "changed": result["changed"], "path": result["path"]}
+    return {"agent": "opencode", "changed": result["changed"], "path": result["path"],
+            "notes": legacy["notes"]}
 
 
 AGENTS = ["claude", "codex", "gemini", "kimi", "qwen-code",
@@ -6348,16 +6371,29 @@ def _same_path(a, b):
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
+# What agentbell writes inside its state subdirectories (queue, runs,
+# tg-pending ...): <id>.json, a claimed <id>.json.sending, <name>.json.tmp.
+# Their names are generic, so anything else in there is someone else's.
+_OWN_STATE_FILE_RE = re.compile(r"\.json(\.sending|(\.\d+)?\.tmp)?$")
+
+
 def _split_owned(directory, names):
-    """(ours, theirs): the entries of `directory` agentbell wrote, and the rest."""
+    """(ours, theirs): the entries of `directory` agentbell wrote, and the
+    rest - including foreign files inside a subdirectory with one of our names
+    (as "runs/x"). Raises OSError when `directory` cannot be listed."""
     ours, theirs = [], []
-    try:
-        present = sorted(os.listdir(directory))
-    except OSError:
-        return ours, theirs
-    for entry in present:
+    for entry in sorted(os.listdir(directory)):
         if entry in names or any(entry.startswith(name + ".")
                                  and entry.endswith((".tmp", ".lock")) for name in names):
+            path = os.path.join(directory, entry)
+            if os.path.isdir(path) and not os.path.islink(path):
+                inside = sorted(os.listdir(path))
+                foreign = [f"{entry}/{name}" for name in inside
+                           if not _OWN_STATE_FILE_RE.search(name)
+                           or os.path.isdir(os.path.join(path, name))]
+                theirs += foreign
+                if inside and len(foreign) == len(inside):
+                    continue                    # nothing of agentbell's in there
             ours.append(entry)
         else:
             theirs.append(entry)
@@ -6372,29 +6408,46 @@ def _names_preview(names, limit=5):
 def _delete_owned(directory, names):
     """Delete agentbell's entries of a shared directory, then the directory
     itself if nothing else is in it. What stays is reported by the caller."""
-    ours, theirs = _split_owned(directory, names)
+    ours, _theirs = _split_owned(directory, names)
     for entry in ours:
         path = os.path.join(directory, entry)
         if os.path.isdir(path) and not os.path.islink(path):
-            shutil.rmtree(path)
+            for name in os.listdir(path):
+                if (_OWN_STATE_FILE_RE.search(name)
+                        and not os.path.isdir(os.path.join(path, name))):
+                    os.remove(os.path.join(path, name))
+            if not os.listdir(path):
+                os.rmdir(path)
         else:
             os.remove(path)
-    if ours and not theirs and not os.path.islink(directory):
+    if ours and not os.listdir(directory) and not os.path.islink(directory):
         os.rmdir(directory)
     return bool(ours)
 
 
 def _shared_dir_entry(kind, directory, names):
-    ours, theirs = _split_owned(directory, names)
-    if not ours:
+    try:
+        ours, theirs = _split_owned(directory, names)
+    except FileNotFoundError:
         return None
-    if theirs:
-        rest = f"the directory stays: it also holds {_names_preview(theirs)}"
+    except OSError as exc:
+        # listed anyway: `--yes` then fails on it instead of calling the
+        # removal complete while history.jsonl may still be in there
+        action = (f"cannot list {exc.filename or directory} ({exc.strerror}); delete "
+                  f"agentbell's files ({_names_preview(list(names))}) there yourself")
     else:
-        rest = "then the directory (nothing else is in it)"
+        if not ours:
+            return None
+        if os.path.islink(directory):
+            rest = "the link and the directory it points to stay"
+        elif theirs:
+            rest = f"the directory stays: it also holds {_names_preview(theirs)}"
+        else:
+            rest = "then the directory (nothing else is in it)"
+        action = f"delete {_names_preview(ours)}; {rest}"
     return {
         "kind": kind.split()[0], "label": f"agentbell's {kind} files in {directory}",
-        "action": f"delete {_names_preview(ours)}; {rest}",
+        "action": action,
         "apply": lambda d=directory, n=names: _delete_owned(d, n),
         "shared_dir": (directory, names),
     }
@@ -6534,7 +6587,7 @@ def _project_entries(project):
         entries.append({
             "kind": "hooks", "label": f"{agent} rule {path}",
             "action": action,
-            "apply": lambda a=agent, s=spec, p=project: s["install"](p, add=False)["changed"],
+            "apply": lambda s=spec, p=project: _removed_or_raise(s["install"](p, add=False)),
         })
     for scope, target in (("global", None), ("project", project)):
         preferred, others = opencode_plugin_paths(target)
@@ -6546,13 +6599,25 @@ def _project_entries(project):
                     "apply": lambda p=path: _delete_path(p),
                 })
     agents_md = os.path.join(project, "AGENTS.md")
-    if _file_contains(agents_md, BLOCK_START):
+    try:
+        blocks = _agentbell_blocks(_read_rule_file(agents_md))
+    except OSError:
+        blocks = []
+    if blocks is None or any(_AGENTBELL_COMMAND_RE.search(m.group(1)) for m in blocks):
         entries.append({
             "kind": "hooks", "label": f"agentbell block(s) in {agents_md} (Aider, or pre-1.3 OpenCode)",
             "action": "remove every agentbell block (the rest of the file stays)",
-            "apply": lambda p=agents_md: _install_block_file(p, None, add=False),
+            "apply": lambda p=project: _removed_or_raise(
+                _block_file_result("agentbell", p, "AGENTS.md", None, False)),
         })
     return entries
+
+
+def _removed_or_raise(result):
+    """A rule file left alone must fail the removal, not read as 'already gone'."""
+    if result.get("notes"):
+        raise RuntimeError("; ".join(result["notes"]))
+    return result["changed"]
 
 
 def _mcp_entries(project):
@@ -6635,7 +6700,7 @@ def purge_report(project=None):
     if user_site and os.path.isdir(user_site):
         pip_user_data = sorted(
             name for name in os.listdir(user_site)
-            if name.startswith("agentbell") and name.endswith((".dist-info", ".egg-info"))
+            if re.match(r"agentbell(-\d.*)?\.(dist|egg)-info$", name)
         )
     if user_base and pip_user_data:
         # pip's console script: <user base>/bin/agentbell on Linux and macOS,
@@ -6672,9 +6737,8 @@ def purge_report(project=None):
                     "apply": lambda p=module: _delete_path(p),
                 })
         cache = os.path.join(user_site, "__pycache__")
-        if os.path.isdir(cache) and any(n.startswith("agentbell")
-                                        for n in os.listdir(cache)):
-            for cached in sorted(n for n in os.listdir(cache) if n.startswith("agentbell")):
+        if os.path.isdir(cache):
+            for cached in sorted(n for n in os.listdir(cache) if n.split(".")[0] == "agentbell"):
                 path = os.path.join(cache, cached)
                 entries.append({
                     "kind": "binary", "label": f"pip --user bytecode {path}",
@@ -6715,6 +6779,10 @@ def purge_report(project=None):
             same[2] += names
         else:
             shared.append([kind, directory, tuple(names)])
+    if os.path.islink(cfile) and os.path.isfile(cfile):
+        warnings.append(f"{cfile} is a link: only the link is removed; "
+                        f"{os.path.realpath(cfile)} keeps the license key and tokens "
+                        "(delete it yourself if you want them gone)")
     if os.environ.get(CONFIG_FILE_ENV) and os.path.isfile(cfile):
         home = next((item for item in shared
                      if _same_path(os.path.dirname(cfile), item[1])), None)
@@ -6723,7 +6791,8 @@ def purge_report(project=None):
         else:
             entries.append({
                 "kind": "config", "label": f"config file {cfile} ({CONFIG_FILE_ENV})",
-                "action": "delete file (incl. license key)",
+                "action": ("remove the link (see the note above)" if os.path.islink(cfile)
+                           else "delete file (incl. license key)"),
                 "apply": lambda p=cfile: _delete_path(p),
             })
     entries.extend(whole)
@@ -6804,9 +6873,14 @@ def cmd_uninstall(args):
                       "delete it by hand once nothing uses it any more")
     for entry in entries:
         directory, names = entry.get("shared_dir") or (None, ())
-        theirs = _split_owned(directory, names)[1] if directory else []
+        try:
+            theirs = _split_owned(directory, names)[1] if directory else []
+        except OSError:
+            theirs = []                     # gone, or its failure is printed above
         if theirs:
             print(f"kept     {directory}: {_names_preview(theirs)} (not agentbell's)")
+        if directory and os.path.islink(directory):
+            print(f"kept     {directory} (a link) and {os.path.realpath(directory)}")
     print()
     print("not removed automatically: " + "; ".join(PURGE_NOT_REMOVED))
     if failures:
