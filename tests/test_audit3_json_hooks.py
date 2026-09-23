@@ -46,8 +46,13 @@ class _HomeCase(unittest.TestCase):
         ]
         for patch in self.patches:
             patch.start()
+        # project status reads the cwd: rule files in the developer's
+        # checkout must not decide what these tests see
+        self.old_cwd = os.getcwd()
+        os.chdir(self.tmp)
 
     def tearDown(self):
+        os.chdir(self.old_cwd)
         for patch in reversed(self.patches):
             patch.stop()
         base._restore_home(self.old_home)

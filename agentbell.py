@@ -3760,6 +3760,23 @@ def _is_our_hook_command(command):
     return _parse_our_hook_command(command) is not None
 
 
+def _hook_after_gone_file(command):
+    """The words from `hook` on when an agentbell hook `command` starts from a
+    path that no longer exists (the checkout moved, the venv was deleted),
+    else None. Every such hook fails, so status must not call it installed.
+    A bare name on PATH, or a path this OS cannot judge, is not flagged."""
+    try:
+        parts = [part.strip("'\"") for part in shlex.split(command)]
+    except ValueError:
+        return None
+    if not (_is_our_hook_command(command) and "hook" in parts):
+        return None
+    at = parts.index("hook")
+    if any(os.path.isabs(part) and not os.path.exists(part) for part in parts[:at]):
+        return parts[at:]
+    return None
+
+
 def _with_tuned_min_duration(new, commands, agent):
     """`new` (a hook command or block) with the --min-duration the user set in
     agentbell's own run_completed hook for `agent` among `commands`, so a
@@ -4077,20 +4094,22 @@ def _codex_hooks_flag_is_top_level(text):
 
 
 def _codex_flag_pattern(marked_only):
-    """A `features.hooks = true` line we wrote, or any such line on install.
+    """A `features.hooks = true` line we wrote.
 
-    Install consolidates every top-level copy into one marked line. Uninstall
-    (`marked_only`) deletes only the line carrying our comment, so a flag the
-    user wrote themselves stays. The second alternative is not anchored: a
-    file with no trailing newline used to get the flag glued onto the last
-    line, and a `^...\\n` pattern could neither prevent that nor remove it.
+    Uninstall (`marked_only`) deletes only the line carrying our comment.
+    Install also takes the bare line a <=1.3.0rc1 install put right above
+    our start marker, where it belonged to the table before it. A flag the
+    user set anywhere else ([profiles.x] included) stays. The second
+    alternative is not anchored: a file with no trailing newline used to get
+    the flag glued onto the last line, and a `^...\\n` pattern could neither
+    prevent that nor remove it.
     """
     marker = re.escape(CODEX_FLAG_MARKER)
-    comment = marker if marked_only else r"(?:#[^\n]*)?"
-    return re.compile(
-        r"(?m)^[ \t]*features\.hooks[ \t]*=[ \t]*true[ \t]*" + comment + r"[ \t]*\n?"
-        + r"|features\.hooks[ \t]*=[ \t]*true[ \t]*" + marker + r"[ \t]*"
-    )
+    flag = r"features\.hooks[ \t]*=[ \t]*true[ \t]*"
+    legacy = ("" if marked_only else
+              r"|^[ \t]*" + flag + r"\n(?=(?:[ \t]*\n)*" + re.escape(TOML_START) + ")")
+    return re.compile(r"(?m)^[ \t]*" + flag + marker + r"[ \t]*\n?"
+                      + r"|" + flag + marker + r"[ \t]*" + legacy)
 
 
 def _strip_codex_flag(text, marked_only):
@@ -4101,7 +4120,7 @@ def _codex_insert_features_flag(text):
     """Put `features.hooks = true` above the first [table] header.
 
     After a table header TOML would attach it to that table, so an older
-    install wrote it where it never applied - drop those copies on the way.
+    install wrote it where it never applied - drop that copy on the way.
 
     The line carries a marker comment: uninstall must delete the line *we*
     added and keep an identical line the user wrote themselves. The flag is
@@ -4456,10 +4475,16 @@ def _read_toml(path):
 
     Universal newlines turned a CRLF config into LF on the next write, and
     on Windows an LF config into CRLF. The block helpers work on \\n;
-    `_write_toml` puts the file's own line end back.
+    `_write_toml` puts the file's own line end back. A file that is not
+    UTF-8 (Codex and Kimi refuse it too) raises RuntimeError, which every
+    caller reports as "not changed" like a refused JSON settings file.
     """
-    with open(path, "r", encoding="utf-8", newline="") as fh:
-        raw = fh.read()
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as fh:
+            raw = fh.read()
+    except UnicodeDecodeError:
+        raise RuntimeError(f"{path} is not UTF-8 text (saved in a legacy encoding?) "
+                           "- not touching it") from None
     return raw.replace("\r\n", "\n"), _line_ending(raw)
 
 
@@ -4500,6 +4525,46 @@ def _unmarked_hook_state(text, block):
     return state
 
 
+def _runs_a_gone_path(text, block):
+    """Does a hook command install would repair start agentbell from a path
+    that is gone? Those are the commands in our marked block (none while
+    its end marker is missing: install refuses that file), or, with no
+    markers, in the tables `_unmarked_hook_state` counts as ours."""
+    if TOML_START in text:
+        end = text.find(TOML_END)
+        values = _toml_command_values(text[text.index(TOML_START):max(end, 0)])
+    else:
+        owned = {_toml_hook_key(chunk) for chunk in _iter_toml_chunks(block)} - {None}
+        values = [_toml_command_values(chunk)[0] for chunk in _iter_toml_chunks(text)
+                  if _toml_hook_key(chunk) in owned]
+    return any(_hook_after_gone_file(_toml_unquote(value)) for value in values)
+
+
+def _repair_unmarked_hooks(agent, path, text, eol, block):
+    """Install's answer to hooks that are ours but carry no markers (Kimi
+    drops them). A command that starts agentbell from a path that is gone
+    gets the current one in place; its flags and every other byte stay. A
+    command that still runs is left as the user has it."""
+    owned = {_toml_hook_key(chunk) for chunk in _iter_toml_chunks(block)} - {None}
+
+    def repair(match):
+        rest = _hook_after_gone_file(_toml_unquote(match.group(2)))
+        if rest is None:
+            return match.group(0)
+        return match.group(1) + toml_string(f"{_hook_prefix(agent)} {' '.join(rest)}")
+
+    new_text = "".join(
+        re.sub(r"(?m)^([ \t]*command[ \t]*=[ \t]*)(.*?)[ \t]*$", repair, chunk, count=1)
+        if _toml_hook_key(chunk) in owned else chunk
+        for chunk in _iter_toml_chunks(text))
+    if new_text == text:
+        return {"changed": False, "notes": [_unmarked_hooks_note(agent, "ours")]}
+    _write_toml(path, new_text, eol)
+    return {"changed": True,
+            "notes": [f"{agent}: updated the hook commands, which ran agentbell from a path "
+                      "that is gone; their agentbell markers are gone, so nothing was added"]}
+
+
 def _unmarked_hooks_note(agent, state):
     if state == "wrapper":
         return _wrapped_hook_note(agent)
@@ -4509,7 +4574,8 @@ def _unmarked_hooks_note(agent, state):
 
 
 def _toml_hooks_state(agent):
-    """"marked", "ours", "wrapper" or "" for the Codex or Kimi config."""
+    """"marked", "ours", "stale" (either, running a path that is gone),
+    "wrapper" or "" for the Codex or Kimi config."""
     path, block = ((codex_config_path(), codex_hooks_block) if agent == "codex"
                    else (kimi_config_path(), kimi_hooks_block))
     try:
@@ -4517,7 +4583,10 @@ def _toml_hooks_state(agent):
             text = fh.read()
     except OSError:
         return ""
-    return "marked" if TOML_START in text else _unmarked_hook_state(text, block())
+    state = "marked" if TOML_START in text else _unmarked_hook_state(text, block())
+    if state in ("marked", "ours") and _runs_a_gone_path(text, block()):
+        return "stale"
+    return state
 
 
 def install_codex_hooks():
@@ -4549,6 +4618,8 @@ def install_codex_hooks():
     else:
         text, eol = "", os.linesep
     state = _unmarked_hook_state(text, codex_hooks_block())
+    if state == "ours":
+        return _repair_unmarked_hooks("codex", path, text, eol, codex_hooks_block())
     if state:
         return {"changed": False, "notes": [_unmarked_hooks_note("codex", state)]}
     notes = []
@@ -4841,7 +4912,7 @@ def _install_block_file(path, content, add=True, replace_stale=False, notes=None
     notes = [] if notes is None else notes
     name = os.path.basename(path)
     exists = os.path.exists(path)
-    if os.path.lexists(path) and _is_symlink_refused(path):
+    if add and os.path.lexists(path) and _is_symlink_refused(path):
         return False
     if not add:
         if not exists:
@@ -4865,6 +4936,12 @@ def _install_block_file(path, content, add=True, replace_stale=False, notes=None
         matches = [m for m in blocks if (owner in m.group(1) if owner
                                          else _AGENTBELL_COMMAND_RE.search(m.group(1)))]
         if not matches:
+            return False
+        if os.path.islink(path):
+            # AGENTS.md -> CLAUDE.md is common. The block is read through the
+            # link and still in force, so this is not "already gone".
+            notes.append(f"{name} is a symlink; agentbell does not write through it. "
+                         f"Remove agentbell's block from {os.path.realpath(path)} yourself")
             return False
         new_text = text
         for match in reversed(matches):
@@ -5132,6 +5209,8 @@ def install_kimi_hooks():
     # hook tables in place. Appending a second block would run every hook
     # twice. Uninstall removes those tables (_drop_unmarked_hooks).
     state = _unmarked_hook_state(text, kimi_hooks_block())
+    if state == "ours":
+        return _repair_unmarked_hooks("kimi", path, text, eol, kimi_hooks_block())
     if state:
         return {"changed": False, "notes": [_unmarked_hooks_note("kimi", state)]}
     clash = _toml_array_clash(text, [("hooks",)])
@@ -5166,7 +5245,19 @@ def _drop_unmarked_hooks(text, block):
                 and not any(_is_child_header(_chunk_header(chunk), parent)
                             for chunk in chunks[index + 1:index + 2])):
             drop.add(index - 1)
-    kept = [chunk for index, chunk in enumerate(chunks) if index not in drop]
+    kept = []
+    for index, chunk in enumerate(chunks):
+        if index in drop:
+            # A table ends at its last key line, as in _codex_mcp_spans: the
+            # comments and blank lines after it introduce what follows.
+            lines = chunk.splitlines(keepends=True)
+            last = max(i for i, line in enumerate(lines) if _strip_toml_comment(line).strip())
+            chunk = "".join(lines[last + 1:])
+            before = "".join(kept)
+            # with a blank line (or nothing) above, a blank line here doubles it
+            if not before or re.search(r"(?:^|\n)[ \t]*\n\Z", before):
+                chunk = re.sub(r"^(?:[ \t]*\n)+", "", chunk)
+        kept.append(chunk)
     leftover = sum(1 for chunk in kept for value in _toml_command_values(chunk)
                    if _OUR_HOOK_RE.search(_toml_unquote(value)))
     return "".join(kept), len(drop), leftover
@@ -5540,6 +5631,8 @@ def _install_and_report(agent, project=None, add=True, indent=""):
         ok = _hooks_in_place(agent, project)
     for note in result.get("notes", []):
         print(f"{indent}  note: {note}")
+    if not add and not result["changed"] and result.get("notes"):
+        ok = False      # left in place, and the note says why
     return ok
 
 
@@ -5564,6 +5657,8 @@ def hooks_status(project=None):
             except OSError:
                 installed = False
         status = "installed" if installed else "not installed"
+        if agent in ("codex", "kimi") and _toml_hooks_state(agent) == "stale":
+            status = "update needed"
         if ((agent in ("claude", "gemini", "qwen-code") and _has_user_wrapped_hook(path))
                 or (agent in ("codex", "kimi") and _toml_hooks_state(agent) == "wrapper")):
             status = "user wrapper"
@@ -6243,8 +6338,9 @@ def integration_manifest(agent=None, project=None):
         },
         "mcp": {
             "tools": ["notify", "ask_approval"],
+            # the entry `mcp add` writes: the bare agentbell.py cannot start
             "canonical_config": {"mcpServers": {"agentbell": {
-                "command": binary, "args": ["mcp"]}}},
+                "command": argv[0], "args": argv[1:] + ["mcp"]}}},
             "attribution": f'pass agent:"{slug}" on notify calls so pushes are '
                            "attributed to you",
             "other_formats": commands["mcp_snippets"],
@@ -6710,7 +6806,7 @@ def _mcp_registrations():
             rows.append((name, command if isinstance(command, str) else None))
     try:
         table = _codex_mcp_table(_read_toml(codex_config_path())[0])
-    except (OSError, ValueError):
+    except (OSError, RuntimeError):
         table = None
     if table is not None:
         keys = table[1]
@@ -6742,15 +6838,14 @@ def _remove_mcp_server_key(path, container):
 def _remove_codex_mcp_block():
     """Remove the [mcp_servers.agentbell] TOML block added by mcp add.
 
-    Only our table and its sub-tables go; every other byte stays, CRLFs
-    included. Deleting up to the next header took the comment lines after
-    our table with it - an agent-ops marker block, for one.
+    Only our table and its sub-tables go; every other line stays, with the
+    file's line end. Deleting up to the next header took the comment lines
+    after our table with it - an agent-ops marker block, for one.
     """
     path = codex_config_path()
     if not os.path.exists(path):
         return False
-    with open(path, "r", encoding="utf-8", newline="") as fh:
-        text = fh.read()
+    text, eol = _read_toml(path)
     lines = text.splitlines(keepends=True)
     spans = _codex_mcp_spans(lines)
     if not spans:
@@ -6761,7 +6856,7 @@ def _remove_codex_mcp_block():
             while end < len(lines) and not lines[end].strip():
                 end += 1
         del lines[start:end]
-    _write_text_atomic(path, "".join(lines), newline="")
+    _write_toml(path, "".join(lines), eol)
     return True
 
 
@@ -6862,7 +6957,15 @@ def _mcp_entries(project):
             "apply": lambda p=path, c=container: _remove_mcp_server_key(p, c),
         })
     codex = codex_config_path()
-    if _file_contains(codex, "[mcp_servers.agentbell]"):
+    try:
+        # the table the removal and doctor parse, not a substring (a comment
+        # or a quoted header). Undecodable bytes still list it: the removal
+        # then says why it cannot touch the file.
+        with open(codex, "r", encoding="utf-8", errors="replace") as fh:
+            registered = _codex_mcp_table(fh.read()) is not None
+    except OSError:
+        registered = False
+    if registered:
         entries.append({
             "kind": "mcp", "label": f"Codex + ChatGPT Desktop MCP entry in {codex}",
             "action": "remove the [mcp_servers.agentbell] block",
@@ -7855,7 +7958,7 @@ def doctor_checks(cfg, send=False):
         if self_integrated:
             checks.append(_check(OK, "agent hooks",
                                  "self-integrated: " + ", ".join(self_integrated)))
-        else:
+        elif not outdated_hooks:
             checks.append(_check(WARN, "agent hooks", "no agent is wired up yet",
                                  "agentbell hooks install all"))
 
@@ -9696,6 +9799,8 @@ def cmd_mcp(args):
     print("Restart the client so it picks up the new MCP server. It can then call:")
     print("  notify(message, title, priority, tags)      - push to your phone")
     print("  ask_approval(message, timeout_seconds)      - ask and wait for your answer")
+    if any(message.startswith("FAILED") for _client, message in rows):
+        raise SystemExit(1)     # a refused config fails like `hooks install` does
 
 
 def cmd_history(args):
