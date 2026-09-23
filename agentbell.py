@@ -579,30 +579,11 @@ def write_json_atomic(path, data, mode=None):
     `mode` (e.g. 0o600) is what a file we own must end up as. Without it the
     file belongs to someone else (~/.claude.json, an agent's settings.json):
     keep the mode it already has, and use 0644 only when we create it.
+
+    A symlinked config (a dotfiles checkout) is updated where it points,
+    same as the TOML configs: see _write_text_atomic.
     """
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    if mode is None:
-        try:
-            mode = os.stat(path).st_mode & 0o777
-        except OSError:
-            mode = 0o644
-    tmp = path + ".tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    try:
-        handle = os.open(tmp, flags, mode)
-    except FileExistsError:
-        # leftover from a crashed write; it is ours, so drop it and retry once
-        os.unlink(tmp)
-        handle = os.open(tmp, flags, mode)
-    with os.fdopen(handle, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-        fh.write("\n")
-    # O_CREAT applies the umask, so the file can only be *tighter* than `mode`
-    # at this point - never wider. Set it exactly before the rename.
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    _write_text_atomic(path, json.dumps(data, indent=2) + "\n", mode=mode)
 
 
 class Config:
@@ -3214,43 +3195,128 @@ def agentbell_binary():
     return os.path.abspath(__file__)
 
 
+def agentbell_command():
+    """The argv that runs this CLI from a hook.
+
+    agentbell.py (a checkout, or the module pip installed when its launcher
+    is not on PATH) is not executable: a hook that runs it by path fails
+    with exit 126. Run it with the interpreter that runs agentbell now.
+    """
+    binary = agentbell_binary()
+    if binary.lower().endswith(".py") and sys.executable:
+        return [sys.executable, binary]
+    return [binary]
+
+
+# How each host runs a hook's command string on Windows (host sources and
+# docs, 2026-09): Gemini CLI uses PowerShell -Command. Codex uses the session
+# shell, usually PowerShell (cmd /C only when none is known). Kimi Code uses
+# cmd.exe (Node `shell: true`). Claude Code uses Git Bash. Qwen Code uses
+# PowerShell for a hook that says "shell": "powershell", which ours do on
+# Windows (qwen_event_hooks). The rest get double quotes, which Git Bash and
+# a verbatim cmd line both read. Codex's cmd fallback cannot run a quoted
+# path; a plain one runs everywhere. Elsewhere it is sh.
+WINDOWS_HOOK_SHELLS = {"gemini": "powershell", "codex": "powershell", "qwen-code": "powershell"}
+_WINDOWS_BARE_ARG = re.compile(r"[A-Za-z0-9_.:/~-]+$")
+
+
+def _windows_command_line(argv, shell):
+    """`argv` as a command line for a Windows host shell ("powershell" or "cmd").
+
+    Forward slashes work in cmd, PowerShell and Git Bash alike, so a path of
+    plain characters runs unquoted in all three, whichever the host picks.
+    Anything else (a space in C:/Users/Jo Do) needs the host's own quoting:
+    PowerShell runs a quoted path only behind `&`, and a POSIX 'single
+    quote' is not a quote in cmd. Double quotes work in Git Bash and in a
+    command line cmd gets verbatim (Node `shell: true`).
+    """
+    parts = [part.replace("\\", "/") for part in argv]
+    if all(_WINDOWS_BARE_ARG.match(part) for part in parts):
+        return " ".join(parts)
+    if shell == "powershell":
+        # PowerShell also ends a single-quoted string at a typographic quote
+        return "& " + " ".join("'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", part) + "'"
+                               for part in parts)
+    return " ".join(f'"{part}"' for part in parts)
+
+
+def _hook_prefix(agent):
+    """The part of a hook command that starts agentbell, quoted for the shell
+    `agent` runs hook commands in."""
+    argv = agentbell_command()
+    if os.name == "nt":
+        return _windows_command_line(argv, WINDOWS_HOOK_SHELLS.get(agent, "cmd"))
+    return " ".join(shlex.quote(part) for part in argv)
+
+
 def _hook_command(event, agent):
-    return f"{shlex.quote(agentbell_binary())} hook {event} --agent {agent}"
+    return f"{_hook_prefix(agent)} hook {event} --agent {agent}"
 
 
 def _contains_our_hook(entry):
     return _is_our_hook_command(entry.get("command") or "")
 
 
-def _is_our_hook_command(command):
-    """The command is ours, whatever shape agentbell_binary() had at install
-    time - launcher on PATH, standalone copy, agentbell.py from a checkout,
-    agentbell.exe on Windows, quoted or not. The old substring test
-    ('agentbell hook') recognized only the bare launcher shape, so uninstall
-    and self-heal were blind to hooks installed from the other shapes."""
+def _command_stem(token):
+    return os.path.splitext(os.path.basename(token.replace("\\", "/")))[0].lower()
+
+
+_HOOK_WORD = re.compile(r"[A-Za-z0-9_.-]+$")
+_PYTHON_STEM = re.compile(r"(python[0-9.]*|py)w?$")
+
+
+def _parse_our_hook_command(command):
+    """(event, agent) when `command` is exactly a hook command agentbell
+    writes, else None.
+
+    Every binary shape agentbell_command() had at install time counts: the
+    launcher on PATH, a standalone copy, agentbell.exe, an interpreter plus
+    agentbell.py, quoted or not, behind PowerShell's `&`. After
+    `hook <event> --agent <slug>` only the flags agentbell adds may follow.
+    Anything else (`; afplay done.aiff`, `&& say done`, `--priority high`)
+    makes the command the user's, and install/uninstall leave it alone.
+    """
     # POSIX parsing handles the single-quoted paths written by shlex.quote;
     # the non-POSIX fallback preserves backslashes in legacy bare Windows
     # paths. Trying both also supports Windows config fixtures on other hosts.
     for posix in (True, False):
         try:
-            parts = shlex.split(command, posix=posix)
+            parts = [part.strip("'\"") for part in shlex.split(command, posix=posix)]
         except ValueError:
             continue
-        if len(parts) < 2 or parts[1].strip("'\"") != "hook":
+        if parts[:1] == ["&"]:
+            parts = parts[1:]
+        if len(parts) > 1 and _PYTHON_STEM.match(_command_stem(parts[0])):
+            parts = parts[1:]
+        if (len(parts) < 5 or _command_stem(parts[0]) != PROG or parts[1] != "hook"
+                or parts[3] != "--agent"
+                or not (_HOOK_WORD.match(parts[2]) and _HOOK_WORD.match(parts[4]))):
             continue
-        executable = parts[0].strip("'\"")
-        stem = os.path.splitext(os.path.basename(executable.replace("\\", "/")))[0]
-        if stem.lower() == PROG:
-            return True
-    return False
+        rest = parts[5:]
+        while rest:
+            if rest[0] == "--silent":
+                rest = rest[1:]
+            elif rest[0] == "--min-duration" and rest[1:2] and rest[1].isdigit():
+                rest = rest[2:]
+            else:
+                break
+        if not rest:
+            return parts[2], parts[4]
+    return None
+
+
+def _is_our_hook_command(command):
+    return _parse_our_hook_command(command) is not None
 
 
 # Status probe over raw settings text. Deliberately looser than
 # _is_our_hook_command: a user-wrapped command (bash -c '... hook ...') is a
 # working integration and should read as installed - uninstall still leaves
-# it alone, because removal is gated on the strict parser above.
+# it alone, because removal is gated on the strict parser above. The quote
+# after the name may be escaped: raw JSON and TOML text hold a Windows
+# "C:/.../agentbell.exe" hook command as \"C:/.../agentbell.exe\" hook.
 _OUR_HOOK_RE = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(PROG)
-                          + r"(\.[A-Za-z0-9]+)?['\"]? hook ")
+                          + r"(\.[A-Za-z0-9]+)?(\\?['\"])? hook ")
 
 
 def _file_contains_our_hook(path):
@@ -3291,8 +3357,54 @@ def _has_user_wrapped_hook(path):
                for command in _json_hook_commands(path))
 
 
-def _has_owned_json_hook(path):
-    return any(_is_our_hook_command(command) for command in _json_hook_commands(path))
+def _matcher_key(group):
+    # an omitted matcher, "" and "*" all match every occurrence of the event
+    matcher = group.get("matcher")
+    return "*" if matcher in (None, "", "*") else matcher
+
+
+def _group_entries(group):
+    entries = group.get("hooks") if isinstance(group, dict) else None
+    return entries if isinstance(entries, list) else []
+
+
+def _iter_json_hooks(hooks):
+    """(event, group, entry) for each hook entry of a settings "hooks" object."""
+    for event, groups in (hooks.items() if isinstance(hooks, dict) else ()):
+        for group in (groups if isinstance(groups, list) else ()):
+            for entry in _group_entries(group):
+                yield event, group, entry
+
+
+def _json_hook_owner_keys(event_hooks):
+    """Where agentbell writes each hook: (event, matcher, hook event, agent)."""
+    keys = set()
+    for event, group, entry in _iter_json_hooks(event_hooks):
+        parsed = _parse_our_hook_command(entry["command"])
+        if parsed:
+            keys.add((event, _matcher_key(group)) + parsed)
+    return keys
+
+
+def _is_owned_json_hook(event, group, entry, owner_keys):
+    """An entry agentbell wrote: its exact command shape, under the event and
+    matcher agentbell writes that command to. The user's own `agentbell hook`
+    under another matcher (permission_prompt) or another event is theirs."""
+    command = entry.get("command") if isinstance(entry, dict) else None
+    parsed = _parse_our_hook_command(command) if isinstance(command, str) else None
+    return bool(parsed) and (event, _matcher_key(group)) + parsed in owner_keys
+
+
+def _has_owned_json_hook(path, event_hooks):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    owner_keys = _json_hook_owner_keys(event_hooks)
+    return any(_is_owned_json_hook(event, group, entry, owner_keys)
+               for event, group, entry in _iter_json_hooks(
+                   data.get("hooks") if isinstance(data, dict) else None))
 
 
 def _hook_key(hook):
@@ -3320,67 +3432,95 @@ def _freeze_json(value):
     return value
 
 
+def _load_hook_settings(path, event_hooks, add):
+    """The settings object, or a RuntimeError that says what to do by hand.
+
+    A settings.json can be JSONC (comments, trailing commas). json.load
+    stops there, and a rewrite would drop every comment, so the file is
+    refused and left exactly as it is.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        problem = ("has comments that a rewrite would drop" if jsonc_has_comments(text)
+                   else f"is not valid JSON ({exc})")
+    else:
+        if isinstance(data, dict):
+            return data
+        problem = "does not contain a JSON object"
+    todo = ("Add these hooks to its \"hooks\" object yourself:\n" + json.dumps(event_hooks, indent=2)
+            if add else "Remove the hooks that run agentbell from it yourself.")
+    raise RuntimeError(f"{path} {problem} - not touching it. {todo}")
+
+
 def _merge_json_hooks(path, event_hooks, add=True):
     """Add or remove our hooks in an agent's settings.json.
 
-    event_hooks: {event: [matcher-group, ...]}. Only entries whose command is
-    ours are ever touched - the user's own hooks, matchers and every unrelated
-    config key survive unchanged.
+    event_hooks: {event: [matcher-group, ...]}. Only entries agentbell wrote
+    (_is_owned_json_hook) are ever replaced or removed - the user's own
+    hooks, matchers and every unrelated config key survive unchanged.
     """
-    data = {}
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    elif not add:
+        data = _load_hook_settings(path, event_hooks, add)
+    elif add:
+        data = {}
+    else:
         return False
     hooks = data.get("hooks") or {}
+    if not isinstance(hooks, dict):
+        raise RuntimeError(f"{path}: \"hooks\" is not an object - not touching it")
+    owner_keys = _json_hook_owner_keys(event_hooks)
+    wanted_keys = ({_hook_key(entry) for _event, _group, entry in _iter_json_hooks(event_hooks)}
+                   if add else set())
     changed = False
+    # Drop our own entries: all of them on uninstall; on install those that
+    # differ from what we write now - after the binary moves (pipx -> copy),
+    # the flags change, or a hook gains/loses a field (qwen `async` in
+    # 1.4.1), an exact-match check would leave the old one behind.
+    for event in list(hooks):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            continue
+        kept_groups = []
+        for group in groups:
+            entries = _group_entries(group)
+            kept = [entry for entry in entries
+                    if not (_is_owned_json_hook(event, group, entry, owner_keys)
+                            and _hook_key(entry) not in wanted_keys)]
+            if len(kept) != len(entries):
+                changed = True
+                group["hooks"] = kept
+                if not kept:
+                    continue            # a group we emptied goes with it
+            kept_groups.append(group)
+        if groups and not kept_groups:
+            del hooks[event]            # never leave an event we emptied behind
+        else:
+            hooks[event] = kept_groups
     if add:
-        wanted = [h for g in event_hooks.values() for g in g for h in g.get("hooks", [])]
-        wanted_keys = {_hook_key(h) for h in wanted}
         for event, groups in event_hooks.items():
             existing = hooks.setdefault(event, [])
-            # Drop our own hooks that differ from what we want to write now:
-            # after the binary moves (pipx -> copy), the flags change, or a
-            # hook gains/loses a field (qwen `async` in 1.4.1), an exact-match
-            # check would leave the old one behind.
-            pruned = []
-            for group in existing:
-                kept = [h for h in group.get("hooks", [])
-                        if not (_contains_our_hook(h) and _hook_key(h) not in wanted_keys)]
-                if len(kept) != len(group.get("hooks", [])):
-                    changed = True
-                    group["hooks"] = kept
-                if kept:
-                    pruned.append(group)
-            existing[:] = pruned
-            present = {_hook_key(h) for g in existing for h in g.get("hooks", [])}
+            if not isinstance(existing, list):
+                raise RuntimeError(f"{path}: hooks.{event} is not a list - not touching it")
+            present = {_hook_key(entry) for group in existing for entry in _group_entries(group)
+                       if _is_owned_json_hook(event, group, entry, owner_keys)}
             for group in groups:
-                if any(_hook_key(h) in present for h in group.get("hooks", [])):
+                if any(_hook_key(entry) in present for entry in group["hooks"]):
                     continue        # already installed (idempotent)
                 existing.append(group)
                 changed = True
-    else:
-        for event in list(hooks):
-            kept_groups = []
-            for group in hooks[event] or []:
-                ours = [h for h in group.get("hooks", []) if _contains_our_hook(h)]
-                kept = [h for h in group.get("hooks", []) if not _contains_our_hook(h)]
-                changed = changed or bool(ours)
-                if kept:
-                    group["hooks"] = kept
-                    kept_groups.append(group)
-            if kept_groups:
-                hooks[event] = kept_groups
-            else:
-                del hooks[event]    # never leave an empty event behind
+    if not changed:
+        return False
     if hooks:
         data["hooks"] = hooks
     else:
         data.pop("hooks", None)
-    if changed or add:
-        write_json_atomic(path, data)
-    return changed
+    write_json_atomic(path, data)
+    return True
 
 
 def claude_event_hooks():
@@ -3422,7 +3562,7 @@ def codex_config_path():
 
 
 def codex_hooks_block():
-    binary = shlex.quote(agentbell_binary())
+    binary = _hook_prefix("codex")
     started = f"{binary} hook started --agent codex --silent"
     done = f"{binary} hook run_completed --agent codex --min-duration {HOOK_MIN_DURATION}"
     return "\n".join([
@@ -3509,7 +3649,7 @@ def _codex_insert_features_flag(text):
             + "".join(lines[index:]))
 
 
-def _write_text_atomic(path, text, newline=None):
+def _write_text_atomic(path, text, newline=None, mode=None):
     """Replace `path` without following a symlink planted at the temp name.
 
     A hostile repo can ship `AGENTS.md.tmp` as a symlink to `~/.bashrc`.
@@ -3521,30 +3661,42 @@ def _write_text_atomic(path, text, newline=None):
     When `path` itself is a symlink, replace the file it points at.
     `os.replace` on the link would swap that link for a regular file and
     leave a dotfiles checkout holding the old hooks. Rule files still
-    refuse a symlink destination before they call this. Keep the mode the
-    destination already had, so a 0600 Codex or Kimi config stays 0600.
-    `newline=""` writes `text` as is: text read with newline="" keeps its
-    CRLFs on every OS.
+    refuse a symlink destination before they call this. Without `mode`,
+    keep the mode the destination already had, so a 0600 Codex or Kimi
+    config stays 0600 (0644 for a new file). `newline=""` writes `text` as
+    is: text read with newline="" keeps its CRLFs on every OS.
+
+    A destination that cannot be written (a link into a read-only Nix
+    store) raises an OSError that says which file and what to do.
     """
     destination = os.path.realpath(path) if os.path.islink(path) else path
-    directory = os.path.dirname(destination)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    try:
-        mode = os.stat(destination).st_mode & 0o777
-    except OSError:
-        mode = 0o644
     tmp = destination + ".tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     handle = None
-    for _attempt in range(2):
-        try:
-            handle = os.open(tmp, flags, mode)
-            break
-        except OSError as exc:
-            if exc.errno not in (errno.EEXIST, errno.ELOOP):
-                raise
-            os.unlink(tmp)
+    try:
+        directory = os.path.dirname(destination)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        if mode is None:
+            try:
+                mode = os.stat(destination).st_mode & 0o777
+            except OSError:
+                mode = 0o644
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        for _attempt in range(2):
+            try:
+                handle = os.open(tmp, flags, mode)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EEXIST, errno.ELOOP):
+                    raise
+                os.unlink(tmp)
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise
+        where = path if destination == path else f"{path} (a symlink to {destination})"
+        raise OSError(f"cannot write {where}: {exc.strerror}. agentbell left it unchanged. "
+                      "If a tool generates this file (Nix/home-manager, a dotfiles "
+                      "manager), make the change in its source instead") from exc
     if handle is None:
         raise OSError(errno.EEXIST, "cannot create temp file", tmp)
     try:
@@ -4266,7 +4418,7 @@ def kimi_mcp_path(project=None):
 def kimi_hooks_block():
     """Kimi's [[hooks]] tables accept ONLY event/matcher/command/timeout -
     any other key (async) makes it refuse to load the whole config."""
-    binary = shlex.quote(agentbell_binary())
+    binary = _hook_prefix("kimi")
     started = f"{binary} hook started --agent kimi --silent"
     done = f"{binary} hook run_completed --agent kimi --min-duration {HOOK_MIN_DURATION}"
     failed = f"{binary} hook run_failed --agent kimi"
@@ -4319,11 +4471,14 @@ def install_kimi_hooks():
     clash = _toml_array_clash(text, [("hooks",)])
     if clash:
         return {"changed": False, "notes": [_inline_hooks_note("kimi", clash, "[[hooks]]")]}
-    block = kimi_hooks_block()
-    with open(path, "a", encoding="utf-8") as fh:
-        if text and not text.endswith("\n"):
-            fh.write("\n")
-        fh.write("\n" + block)
+    # Append to the bytes as they are (CRLF included), through a symlink.
+    raw = ""
+    if text:
+        with open(path, "r", encoding="utf-8", newline="") as fh:
+            raw = fh.read()
+    if raw and not raw.endswith("\n"):
+        raw += "\n"
+    _write_text_atomic(path, raw + "\n" + kimi_hooks_block(), newline="")
     return {"changed": True, "notes": []}
 
 
@@ -4420,44 +4575,55 @@ def qwen_settings_path(project=None):
 def qwen_event_hooks():
     """Qwen Code speaks Claude's hooks.json format. Command hooks support
     `async: true` (verified against qwenlm.github.io/qwen-code-docs, 2026-08),
-    which keeps a notification send from blocking the end of a turn."""
+    which keeps a notification send from blocking the end of a turn.
+
+    On Windows Qwen runs a hook through cmd.exe and escapes its quotes as
+    \\" on the way, which cmd does not read: no quoted path survives. A
+    hook with "shell": "powershell" runs in PowerShell instead."""
+    def group(command):
+        entry = {"type": "command", "async": True, "command": command}
+        if os.name == "nt":
+            entry["shell"] = "powershell"
+        return [{"hooks": [entry]}]
+
     return {
-        "UserPromptSubmit": [{"hooks": [{"type": "command", "async": True,
-                                         "command": _hook_command("started", "qwen-code")
-                                                    + " --silent"}]}],
-        "Stop": [{"hooks": [{"type": "command", "async": True,
-                             "command": _hook_command("run_completed", "qwen-code")
-                                        + f" --min-duration {HOOK_MIN_DURATION}"}]}],
-        "StopFailure": [{"hooks": [{"type": "command", "async": True,
-                                    "command": _hook_command("run_failed", "qwen-code")}]}],
+        "UserPromptSubmit": group(_hook_command("started", "qwen-code") + " --silent"),
+        "Stop": group(_hook_command("run_completed", "qwen-code")
+                      + f" --min-duration {HOOK_MIN_DURATION}"),
+        "StopFailure": group(_hook_command("run_failed", "qwen-code")),
     }
 
 
 def _qwen_result(project, add):
     path = qwen_settings_path()
-    if add and _has_user_wrapped_hook(path) and not _has_owned_json_hook(path):
-        return {"agent": "qwen-code", "changed": False, "path": path,
-                "notes": [_wrapped_hook_note("qwen-code")]}
-    changed = _merge_json_hooks(path, qwen_event_hooks(), add=add)
-    notes = []
-    if add and changed:
-        notes.append("qwen-code: hooks are enabled by default; to disable all hooks, "
-                     "set 'disableAllHooks': true in " + path)
-    return {"agent": "qwen-code", "changed": changed, "path": path, "notes": notes}
+    result = _json_hooks_install("qwen-code", path, qwen_event_hooks(), add)
+    if add and result["changed"]:
+        result["notes"].append("qwen-code: hooks are enabled by default; to disable all hooks, "
+                               "set 'disableAllHooks': true in " + path)
+    return result
 
 
 def _json_hooks_install(agent, path, event_hooks, add):
-    if add and _has_user_wrapped_hook(path) and not _has_owned_json_hook(path):
+    if add and _has_user_wrapped_hook(path) and not _has_owned_json_hook(path, event_hooks):
         return {"agent": agent, "changed": False, "path": path,
                 "notes": [_wrapped_hook_note(agent)]}
-    return {"agent": agent, "changed": _merge_json_hooks(path, event_hooks, add=add),
-            "path": path}
+    changed = _merge_json_hooks(path, event_hooks, add=add)
+    notes = []
+    left = [] if add else [command for command in _json_hook_commands(path)
+                           if _OUR_HOOK_RE.search(command)]
+    if left:
+        # still calling agentbell after an uninstall - say so, like Kimi does
+        notes.append(f"{agent}: {len(left)} hook command(s) mention agentbell but are not "
+                     "exactly agentbell's own (you wrote or changed them), so they were "
+                     f"left in place in {path}")
+    return {"agent": agent, "changed": changed, "path": path, "notes": notes}
 
 
 def _wrapped_hook_note(agent):
-    return (f"{agent}: found a user-owned shell wrapper around an agentbell hook; "
-            "left it unchanged and did not add a second lifecycle hook. Remove or "
-            "update the wrapper yourself before running hooks install again")
+    return (f"{agent}: found a user-owned hook command that runs agentbell (a shell "
+            "wrapper, or flags agentbell does not write); left it unchanged and did "
+            "not add a second lifecycle hook. Remove or update it yourself before "
+            "running hooks install again")
 
 
 def _codex_install(add):
@@ -4634,8 +4800,11 @@ def opencode_plugin_paths(project=None):
 
 
 def _render_opencode_plugin():
+    # Bun's $ passes a string as one argument and an array as one argument
+    # per element; a one-element command stays a string, as before.
+    command = agentbell_command()
     return (OPENCODE_PLUGIN
-            .replace("__AGENTBELL_BIN__", json.dumps(agentbell_binary()))
+            .replace("__AGENTBELL_BIN__", json.dumps(command[0] if len(command) == 1 else command))
             .replace("__MIN_DURATION__", str(HOOK_MIN_DURATION)))
 
 
@@ -7323,7 +7492,11 @@ def cmd_init(args):
             print(f"\nDetected agents: {', '.join(detected)}")
             for agent in detected:
                 if ask(f"Install hooks for {agent}? (y/n)", "y").lower().startswith("y"):
-                    result = install_hooks(agent)
+                    try:
+                        result = install_hooks(agent)
+                    except (OSError, RuntimeError) as exc:
+                        print(f"  hooks for {agent} not installed: {exc}")
+                        continue
                     if result["changed"]:
                         print(f"  installed hooks for {agent} -> {result['path']}")
                     else:
@@ -8057,8 +8230,15 @@ def cmd_hooks(args):
                   "and will not add a second hook")
         return
     agents = AGENTS if "all" in args.agent else args.agent
+    failed = []
     for agent in agents:
-        result = install_hooks(agent, project=project, add=args.sub == "install")
+        try:
+            result = install_hooks(agent, project=project, add=args.sub == "install")
+        except (OSError, RuntimeError) as exc:
+            # one config agentbell cannot rewrite must not stop the others
+            print(f"{PROG}: hooks for {agent} not changed: {exc}", file=sys.stderr)
+            failed.append(agent)
+            continue
         if args.sub == "install":
             if result["changed"]:
                 print(f"installed hooks for {agent}: {result['path']}")
@@ -8068,6 +8248,8 @@ def cmd_hooks(args):
             print(f"{'removed' if result['changed'] else 'nothing to remove'} for {agent}")
         for note in result.get("notes", []):
             print(f"  note: {note}")
+    if failed:
+        raise SystemExit(1)
 
 
 def cmd_server(args):
