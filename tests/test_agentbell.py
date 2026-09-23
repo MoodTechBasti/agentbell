@@ -2621,8 +2621,17 @@ class TestAskParallelChannels(_TelegramFixture):
         holder, thread = self._run_ask_async(cfg, message="Deploy?", timeout_seconds=20)
         body = self._wait_new_request("sendMessage", before=holder["tg_before"])["body"]
         match = an.re.search(r"ID: ([0-9a-f]+)", body["text"])
-        with open(an._pending_path("tg-pending", match.group(1)), encoding="utf-8") as fh:
-            question_id = json.load(fh).get("question_message_id")
+        # the marker learns the message id only after sendMessage has answered
+        question_id = None
+        deadline = time.monotonic() + 10
+        while question_id is None and time.monotonic() < deadline:
+            try:
+                with open(an._pending_path("tg-pending", match.group(1)), encoding="utf-8") as fh:
+                    question_id = json.load(fh).get("question_message_id")
+            except (OSError, ValueError):
+                pass
+            if question_id is None:
+                time.sleep(0.02)
         self.assertIsInstance(question_id, int)
         self.assertGreater(question_id, 0)
         an.write_tg_answer(match.group(1), "approved")
