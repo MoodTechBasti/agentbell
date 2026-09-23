@@ -4,7 +4,7 @@
 
 Fixes from the 2026-09-22 audit (69 findings) and three review rounds of
 those fixes. Several changes are visible to scripts that call agentbell:
-read Changed before upgrading. Rationale: `DECISIONS.md` §20–§29.
+read Changed before upgrading. Rationale: `DECISIONS.md` §20–§37.
 
 After upgrading, re-run `agentbell hooks install <agent>` for each wired
 agent (Claude Code gets its permission hook, checkout installs and Windows
