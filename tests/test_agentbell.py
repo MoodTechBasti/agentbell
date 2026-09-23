@@ -4299,8 +4299,8 @@ class TestAuditRegressions(unittest.TestCase):
         self.assertEqual(seen, [f"https://api.telegram.org/bot123456:{secret}/getMe"])
 
     def test_header_with_newline_does_not_crash(self):
-        self.assertEqual(an._latin1_header("a\nb\tc"), "a b c")
-        self.assertEqual(an._latin1_header(None), "")
+        self.assertEqual(an._ntfy_header("a\nb\tc"), "a b c")
+        self.assertEqual(an._ntfy_header(None), "")
 
     def test_broken_quiet_hours_config_does_not_crash(self):
         for broken in ("22:00-07:30", ["22:00-07:30"], {"start": "22:00", "end": "07:30"},

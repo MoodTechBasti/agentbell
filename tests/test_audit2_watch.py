@@ -419,7 +419,7 @@ class TestWatchReportsAFailedPush(unittest.TestCase):
         cfg = base.make_config("http://example.test")
         outcome = {"delivered": [], "transient": {"ntfy": "connection refused"}, "permanent": {}}
         with unittest.mock.patch.object(an, "_publish_item_channels", return_value=outcome), \
-                unittest.mock.patch.object(an, "enqueue_item"):
+                unittest.mock.patch.object(an, "enqueue_item", return_value="q-watch"):
             _, lines = self._run(cfg)
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("queued for later delivery", lines[0])

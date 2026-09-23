@@ -825,7 +825,7 @@ def http_request(url, method="GET", headers=None, body=None, timeout=10.0):
 
 
 def clamp_message(text, limit=3900):
-    text = text or ""
+    text = _sendable_text(text) or ""
     raw = text.encode("utf-8")
     if len(raw) <= limit:
         return text
@@ -852,7 +852,7 @@ def _sendable_text(value):
     return _UNSENDABLE_RE.sub(lambda m: "" if m.group() == "\x00" else "\ufffd", str(value))
 
 
-def _latin1_header(value):
+def _ntfy_header(value):
     """Make a value safe as an ntfy HTTP header.
 
     Newlines and control characters would make http.client raise
@@ -904,16 +904,16 @@ class NtfyChannel:
     def publish(self, topic, message, title=None, priority=3, tags=None, actions=None, timeout=10.0):
         validate_topic(topic)
         headers = self._headers()
-        headers["Title"] = _latin1_header(title) or "Notification"
+        headers["Title"] = _ntfy_header(title) or "Notification"
         headers["Priority"] = str(int(priority))
         if tags:
             if isinstance(tags, str):
                 tags = [t.strip() for t in tags.split(",") if t.strip()]
-            headers["Tags"] = _latin1_header(",".join(tags))
+            headers["Tags"] = _ntfy_header(",".join(tags))
         if actions:
-            headers["Actions"] = _latin1_header(json.dumps(actions, separators=(",", ":")))
+            headers["Actions"] = _ntfy_header(json.dumps(actions, separators=(",", ":")))
         url = f"{self.server()}/{topic}"
-        _, raw = http_request(url, "POST", headers, clamp_message(_sendable_text(message)),
+        _, raw = http_request(url, "POST", headers, clamp_message(message),
                               timeout)
         result = {"channel": "ntfy", "ok": True}
         # ntfy answers with the stored message. Its `time` is the server's
@@ -1012,7 +1012,7 @@ class TelegramChannel:
         return self._call(self._token(), method, body, timeout)
 
     def send(self, message, title=None, priority=3, timeout=10.0):
-        text = html.escape(clamp_message(_sendable_text(message), 3800))
+        text = html.escape(clamp_message(message, 3800))
         if title:
             text = f"<b>{html.escape(_sendable_text(title))}</b>\n{text}"
         if int(priority) <= 2:
@@ -1031,7 +1031,7 @@ class TelegramChannel:
         as plain text; the bot can still pick up free-text replies later.
         """
         text = ("\U0001f534 <b>Approval requested</b>\n"
-                + html.escape(clamp_message(_sendable_text(message), 3800))
+                + html.escape(clamp_message(message, 3800))
                 + f"\n\nID: {approval_id}")
         body = {"chat_id": self.tg.get("chat_id"), "parse_mode": "HTML"}
         if buttons:
@@ -1167,6 +1167,9 @@ def os_notify(title, message, priority=3, timeout=None):
                 check=True, timeout=limit(15), capture_output=True, env=env,
             )
             return {"channel": "os", "ok": True}
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"OS notification helper did not finish within {exc.timeout:g}s") from exc
     except (OSError, subprocess.SubprocessError):
         pass
     raise RuntimeError("native OS notifications unavailable on this system")
@@ -2180,11 +2183,34 @@ def _publish_item_channels(cfg, item, timeout=10.0, deadline=None):
         channels = [c.strip() for c in channels.split(",") if c.strip()]
 
     def attempt(channel):
-        wait = timeout
-        if deadline is not None:
-            # never below a useful minimum: that is at most 0.5s over budget
-            wait = min(timeout, max(0.5, deadline - time.time()))
-        return _publish_channel(cfg, channel, item, wait)
+        if deadline is None:
+            return _publish_channel(cfg, channel, item, timeout)
+        # never below a useful minimum: that is at most 0.5s over budget
+        wait = min(timeout, max(0.5, deadline - time.time()))
+        # A socket timeout bounds each read, not a DNS lookup or a server
+        # that trickles bytes, and the host kills a hook that overruns: the
+        # try runs aside and is given up - queued - 0.5s after its own
+        # timeouts (which also kill a slow OS helper) should have fired.
+        outcome = {}
+
+        def run():
+            try:
+                outcome["result"] = _publish_channel(cfg, channel, item, wait)
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(wait + 0.5)
+        if "result" in outcome:
+            return outcome["result"]
+        error = outcome.get("error")
+        if error is None:
+            raise TransientError("no answer within the send time budget")
+        if isinstance(error.__cause__, subprocess.TimeoutExpired):
+            # the budget cut the OS helper short: it is not missing
+            raise TransientError(str(error)) from error
+        raise error
 
     delivered, transient, permanent = [], {}, {}
     interrupted = None
@@ -2402,7 +2428,7 @@ def drain_queue(cfg, limit=None, timeout=QUEUE_TIMEOUT, deadline=None):
             if outcome["delivered"]:
                 stats["delivered"] += 1
                 write_history({"event": "queued_delivered", "message": item.get("message"),
-                               "original_event": item.get("event"),
+                               "original_event": item.get("event"), "queue_id": item.get("id"),
                                "channels": outcome["delivered"],
                                "queued_at": item.get("created"),
                                "partial_errors": outcome["permanent"] or None})
@@ -2698,7 +2724,7 @@ def send_notification(cfg, message, title=None, priority="normal", tags=None,
                  "last_error": outcome["transient"]}
         if force:
             retry["force"] = True     # the retry ignores quiet hours too
-        enqueue_item(cfg, retry)
+        queue_id = enqueue_item(cfg, retry)
         errors.extend(f"{ch}: {msg} (queued for later delivery)"
                       for ch, msg in outcome["transient"].items())
     history_entry = {
@@ -2712,6 +2738,7 @@ def send_notification(cfg, message, title=None, priority="normal", tags=None,
     }
     if queued:
         history_entry["queued_channels"] = queued
+        history_entry["queue_id"] = queue_id    # `verify` pairs it with queued_delivered
         if not outcome["delivered"]:
             history_entry["event"] = "queued"
     if outcome["permanent"]:
@@ -7926,9 +7953,17 @@ def hook_observations(records, since_seconds, now=None, project=None):
     now = time.time() if now is None else now
     cutoff = now - since_seconds
     agents = {}
+    held_in_queue = {}    # queue id -> the observation counting it as held
     for rec in records:
         if not isinstance(rec, dict):
             continue          # a malformed history line must not crash verify
+        if rec.get("event") == "queued_delivered":
+            # the queue delivered a push counted as held: it reached the phone
+            obs = held_in_queue.pop(str(rec.get("queue_id")), None)
+            if obs is not None:
+                obs["held"] -= 1
+                obs["delivered"] += 1
+            continue
         agent = rec.get("agent")
         # Only slugs our own writers can produce: a hand-forged history line
         # with a hostile agent value must not become a report heading.
@@ -7986,6 +8021,8 @@ def hook_observations(records, since_seconds, now=None, project=None):
         delivered = bool(rec.get("delivered"))
         if event in ("suppressed", "deferred", "queued"):
             obs["held"] += 1
+            if event == "queued" and rec.get("queue_id"):
+                held_in_queue[str(rec["queue_id"])] = obs
         elif delivered:
             obs["delivered"] += 1
         else:
@@ -8879,7 +8916,8 @@ def _record_hook_error(event, args, exc):
     else:
         detail = f"{type(exc).__name__}: {exc}"
     record = {"event": "hook.error", "agent": args.agent,
-              "source_event": f"hook.{event}", "error": detail}
+              "source_event": f"hook.{event}", "error": detail,
+              "message": f"{args.agent} {event}: {detail}"}
     if args.force:
         record["forced"] = True
     where = "recorded in 'agentbell history'"

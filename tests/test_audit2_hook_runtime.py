@@ -389,7 +389,7 @@ class TestNtfyHeaderEncoding(unittest.TestCase):
         self.assertEqual(self._decode(headers["Tags"]), "bär,done")
 
     def test_the_approval_title_keeps_its_emoji(self):
-        encoded = an._latin1_header("❓ Approval requested")
+        encoded = an._ntfy_header("❓ Approval requested")
         self.assertEqual(base64.b64decode(encoded[10:-2]).decode("utf-8"),
                          "❓ Approval requested")
 
@@ -398,7 +398,7 @@ class TestNtfyHeaderEncoding(unittest.TestCase):
         headers = self.ntfy.posts["hrtitle"][-1]["headers"]
         self.assertEqual(headers["Title"], "Build done")
         self.assertEqual(headers["Tags"], "build")
-        self.assertEqual(an._latin1_header(" a\r\nb\x00\x7fc "), "a bc")
+        self.assertEqual(an._ntfy_header(" a\r\nb\x00\x7fc "), "a bc")
 
 
 class TestClampMessage(unittest.TestCase):
