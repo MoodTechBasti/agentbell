@@ -7459,6 +7459,11 @@ def cmd_ask(args):
     raise SystemExit(0)
 
 
+# The signals that end a terminal job. `watch` outlives them until the push
+# is sent. SIGBREAK is Ctrl-Break on Windows.
+WATCH_SIGNALS = ("SIGINT", "SIGQUIT", "SIGHUP", "SIGTERM", "SIGBREAK")
+
+
 def _restore_signals(previous):
     for signum, handler in previous:
         try:
@@ -7467,32 +7472,81 @@ def _restore_signals(previous):
             pass
 
 
-def _forward_watch_signal(pid, signum):
-    """Send `signum` to the watched command's process group.
+def _terminal_already_sent(signum):
+    """True when the watched command got `signum` from the terminal itself.
 
-    The command is its own session, so a Ctrl-C delivered to agentbell does
-    not already reach it. Signaling the group reaches the command and the
-    children it started. A dead pid is not an error: it exited between the
-    signal and this call.
+    The command runs in watch's own process group, the terminal's foreground
+    job. Ctrl-C and Ctrl-\\ reach every process of that job, and so does the
+    SIGHUP a shell sends its jobs when the terminal closes. Passing those on
+    as well would deliver them twice, and a second interrupt is how tools
+    such as Terraform abandon a graceful shutdown. A hangup reaches a session
+    leader alone (ssh -t host agentbell watch ..., docker run -it). On
+    Windows every process on the console gets Ctrl-C and Ctrl-Break, and no
+    other signal reaches watch from outside. A console event aimed at the
+    command's pid lands on watch itself, or kills the command while it is
+    still starting.
     """
-    if not pid:
-        return
     if os.name == "nt":
-        try:
-            if signum == signal.SIGINT and hasattr(signal, "CTRL_BREAK_EVENT"):
-                os.kill(pid, signal.CTRL_BREAK_EVENT)
-            else:
-                os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        return True
+    if signum == signal.SIGHUP:
+        return os.getsid(0) != os.getpid()
+    if signum not in (signal.SIGINT, signal.SIGQUIT):
+        return False
+    try:
+        tty = os.open("/dev/tty", os.O_RDONLY)
+    except OSError:
+        return False          # no terminal: the signal was sent to watch
+    try:
+        return os.tcgetpgrp(tty) == os.getpgrp()
+    except OSError:
+        return False
+    finally:
+        os.close(tty)
+
+
+def _forward_watch_signal(proc, signum):
+    """Pass `signum` on to the watched command unless it has it already.
+
+    Only the command itself is signaled: its process group is watch's own
+    and can hold the rest of a pipeline. Popen.send_signal skips a command
+    that has exited, whose pid may belong to another process by now.
+    """
+    if proc is None or _terminal_already_sent(signum):
         return
     try:
-        os.killpg(pid, signum)
+        proc.send_signal(signum)
     except OSError:
+        pass                  # it exited between the signal and this call
+
+
+def _shield_watch_signals(state):
+    """Keep watch alive through WATCH_SIGNALS; returns the previous handlers.
+
+    Each signal is passed on to the running command, state["proc"]. One
+    that arrives while the command is being started waits in
+    state["pending"]. A signal that is ignored (nohup, a background job of
+    a script) stays ignored, so the command inherits that as well.
+    """
+    def on_signal(signum, _frame):
+        if state["proc"] is None:
+            state["pending"].append(signum)
+        else:
+            _forward_watch_signal(state["proc"], signum)
+
+    previous = []
+    for name in WATCH_SIGNALS:
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
         try:
-            os.kill(pid, signum)
-        except OSError:
-            pass
+            handler = signal.getsignal(signum)
+            if handler is None or handler == signal.SIG_IGN:
+                continue      # None: set outside Python, cannot be put back
+            signal.signal(signum, on_signal)
+        except (OSError, ValueError):
+            continue          # not the main thread
+        previous.append((signum, handler))
+    return previous
 
 
 def _watch_status(returncode):
@@ -7504,38 +7558,25 @@ def _watch_status(returncode):
     return returncode
 
 
-def _watch_command(cmd):
-    """Run `cmd` and wait for it. Forward SIGINT and SIGTERM; do not SIGKILL.
+def _watch_command(cmd, state):
+    """Start `cmd` in watch's own job and wait for it, however long it takes.
 
     `subprocess.run` waits 0.25s after Ctrl-C and then kills the child.
     A migration that traps the signal to finish the current step dies
-    instead, and `watch` never gets far enough to send the push. Each
-    caught signal is forwarded once. The command is its own session, so
-    a terminal Ctrl-C is not delivered twice (once by the terminal and
-    again by us). It may take as long as it needs to exit.
+    instead, and `watch` never gets far enough to send the push. Here the
+    command keeps the terminal (password prompts, Ctrl-Z) and gets each
+    signal once (see _shield_watch_signals).
     """
     argv = [str(part) for part in cmd]
-    holder = {"pid": None, "pending": None}
-
-    def on_signal(signum, _frame):
-        holder["pending"] = signum
-        _forward_watch_signal(holder["pid"], signum)
-
-    previous = []
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        try:
-            previous.append((signum, signal.getsignal(signum)))
-            signal.signal(signum, on_signal)
-        except (OSError, ValueError):
-            continue
-    try:
-        proc = subprocess.Popen(argv, start_new_session=True)
-        holder["pid"] = proc.pid
-        if holder["pending"] is not None and proc.poll() is None:
-            _forward_watch_signal(proc.pid, holder["pending"])
-        return proc.wait()
-    finally:
-        _restore_signals(previous)
+    if os.name == "nt":
+        # CreateProcess only tries ".exe": npm, yarn and pnpm are .cmd files.
+        # Look the name up the way the shell does, with PATHEXT.
+        argv[0] = shutil.which(argv[0]) or argv[0]
+    proc = subprocess.Popen(argv)
+    state["proc"] = proc
+    for signum in state["pending"]:
+        _forward_watch_signal(proc, signum)
+    return proc.wait()
 
 
 def run_watch(cfg, cmd, title=None, priority=None, fail_priority=None,
@@ -7545,41 +7586,53 @@ def run_watch(cfg, cmd, title=None, priority=None, fail_priority=None,
     Returns {"exit_code", "message", "notification"}. The command's exit code
     is what `watch` exits with; notification failures are reported on stderr
     and do not change the exit code. A command that cannot be spawned at all
-    yields exit code 127. Ctrl-C and SIGTERM are forwarded and the command is
-    allowed to finish; the push is sent either way (DECISIONS §28).
+    yields exit code 127. Ctrl-C, Ctrl-\\, a closing terminal and SIGTERM do
+    not stop watch: the command gets the signal, may finish its cleanup, and
+    the push is sent either way (DECISIONS §28).
     """
     label = " ".join(shlex.quote(str(part)) for part in cmd)
     started = time.monotonic()
+    state = {"proc": None, "pending": []}
+    previous = _shield_watch_signals(state)
     try:
-        returncode = _watch_status(_watch_command(cmd))
-        duration = time.monotonic() - started
-        ok = returncode == 0
-        if ok:
-            message = f"\u2705 {label} succeeded (exit 0) in {format_duration(duration)}"
-            title = title or "Command finished"
-            prio = priority or "normal"
-        else:
-            message = (f"\U0001f534 {label} failed (exit {returncode}) "
-                       f"in {format_duration(duration)}")
+        try:
+            returncode = _watch_status(_watch_command(cmd, state))
+            duration = time.monotonic() - started
+            ok = returncode == 0
+            if ok:
+                message = f"\u2705 {label} succeeded (exit 0) in {format_duration(duration)}"
+                title = title or "Command finished"
+                prio = priority or "normal"
+            else:
+                message = (f"\U0001f534 {label} failed (exit {returncode}) "
+                           f"in {format_duration(duration)}")
+                title = title or "Command failed"
+                prio = fail_priority or "urgent"
+            exit_code = returncode
+        except OSError as exc:
+            exit_code = 127
+            message = f"\U0001f534 {label} could not be started ({exc})"
             title = title or "Command failed"
             prio = fail_priority or "urgent"
-        exit_code = returncode
-    except OSError as exc:
-        exit_code = 127
-        message = f"\U0001f534 {label} could not be started ({exc})"
-        title = title or "Command failed"
-        prio = fail_priority or "urgent"
-    notification = None
-    try:
-        notification = send_notification(
-            cfg, message, title=title, priority=prio, tags=tags,
-            force=force, event="watch",
-        )
-        if notification.get("queued"):
+        notification = None
+        try:
+            notification = send_notification(
+                cfg, message, title=title, priority=prio, tags=tags,
+                force=force, event="watch",
+            )
+        except RuntimeError as exc:
+            sys.stderr.write(f"{PROG}: notification not sent - {exc}\n")
+        if notification and not notification["ok"]:
+            sent = ", ".join(r["channel"] for r in notification.get("results") or [])
+            sys.stderr.write(
+                f"{PROG}: notification not sent - {'; '.join(notification.get('errors') or [])}"
+                + (f" (sent via {sent})" if sent else "")
+                + f" - see '{PROG} doctor'\n")
+        elif notification and notification.get("queued"):
             sys.stderr.write(f"{PROG}: {', '.join(notification['queued'])} unreachable "
                              f"- notification queued for later delivery\n")
-    except RuntimeError as exc:
-        sys.stderr.write(f"{PROG}: {exc}\n")
+    finally:
+        _restore_signals(previous)
     return {"exit_code": exit_code, "message": message, "notification": notification}
 
 

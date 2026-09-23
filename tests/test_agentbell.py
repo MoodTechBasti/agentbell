@@ -2153,9 +2153,10 @@ class TestWatch(unittest.TestCase):
     def _interrupt_child(self, signum, exit_code, topic):
         """A child that takes longer than subprocess.run's 0.25s SIGKILL window.
 
-        The signal is sent only to this process. The child is in its own
-        session, so it sees the signal only if watch forwards it, and it
-        exits with `exit_code` only if it is allowed to finish.
+        The signal is sent only to this process, so the child sees it only
+        if watch forwards it, and it exits with `exit_code` only if it is
+        allowed to finish. Watch forwards Ctrl-C only when no terminal sent
+        it; that is pinned here, since the suite may run in a terminal.
         """
         directory = tempfile.mkdtemp()
         ready = os.path.join(directory, "ready")
@@ -2188,7 +2189,8 @@ class TestWatch(unittest.TestCase):
         thread.start()
         started = time.monotonic()
         try:
-            result = an.run_watch(cfg, [sys.executable, script])
+            with unittest.mock.patch.object(an, "_terminal_already_sent", return_value=False):
+                result = an.run_watch(cfg, [sys.executable, script])
         finally:
             thread.join(timeout=5)
             shutil.rmtree(directory, ignore_errors=True)
