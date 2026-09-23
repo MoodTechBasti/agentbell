@@ -675,7 +675,7 @@ class TestApprovalFlow(unittest.TestCase):
         deadline = time.monotonic() + 5
         while not self.ntfy.posts.get("approvals3") and time.monotonic() < deadline:
             time.sleep(0.05)
-        headers, body = self.ntfy.posts["approvals3"][-1]["headers"], self.ntfy.posts["approvals3"][-1]["body"]
+        headers = self.ntfy.posts["approvals3"][-1]["headers"]
         self.assertNotIn("Actions", headers)
         urllib.request.urlopen(
             urllib.request.Request(
@@ -2732,7 +2732,6 @@ class TestRetryAndQueue(unittest.TestCase):
 
     def test_persistent_failure_queued(self):
         cfg = make_config(self.ntfy.url, topic="down")
-        old_url = self.ntfy.url
         self.ntfy.stop()
         try:
             result = an.send_notification(cfg, "while offline", priority="normal")

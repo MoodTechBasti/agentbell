@@ -604,6 +604,26 @@ def write_json_atomic(path, data, mode=None):
     _write_text_atomic(path, json.dumps(data, indent=2) + "\n", mode=mode)
 
 
+class _NotJsonObject(ValueError):
+    """A JSON file that parses, but holds something other than an object."""
+
+
+def _read_json_object(path):
+    """The JSON object stored in `path`.
+
+    Every JSON file agentbell reads goes through here, so they all agree.
+    utf-8-sig accepts the BOM that Windows editors and PowerShell's
+    `Set-Content -Encoding UTF8` write. Anything but an object raises
+    _NotJsonObject, a ValueError. OSError and ValueError reach the caller,
+    which decides whether a missing or broken file is an error or a default.
+    """
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise _NotJsonObject("not a JSON object")
+    return data
+
+
 class Config:
     def __init__(self, data=None, path=None):
         self.path = path or config_path()
@@ -613,12 +633,7 @@ class Config:
         if not os.path.exists(self.path):
             return default_config()
         try:
-            # utf-8-sig: Windows editors and PowerShell's `Set-Content
-            # -Encoding UTF8` start the file with a BOM
-            with open(self.path, "r", encoding="utf-8-sig") as fh:
-                data = json.load(fh)
-            if not isinstance(data, dict):
-                raise ValueError("not a JSON object")
+            data = _read_json_object(self.path)
         except (OSError, ValueError) as exc:
             raise SystemExit(f"{PROG}: cannot read config {self.path}: {exc}")
         merged = default_config()
@@ -1474,9 +1489,8 @@ def _run_marker_is_stale(path, max_age, now):
         return False
     started = None
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict) and data.get("started_at") is not None:
+        data = _read_json_object(path)
+        if data.get("started_at") is not None:
             started = float(data.get("started_at"))
     except (OSError, ValueError, TypeError):
         started = None
@@ -1528,8 +1542,7 @@ def read_start_marker(agent, max_age=86400, session_id=None, cwd=None):
     path = _run_marker_path(agent, _marker_scope(session_id, cwd))
     age = None
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = _read_json_object(path)
         age = time.time() - float(data.get("started_at", 0))
         if not 0 <= age <= max_age:
             age = None
@@ -1570,10 +1583,7 @@ def claim_hook_send(agent, event, message, window=None, now=None):
     path = _dedupe_path()
     key = _dedupe_key(agent, event, message)
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            seen = json.load(fh)
-        if not isinstance(seen, dict):
-            seen = {}
+        seen = _read_json_object(path)
     except (OSError, ValueError):
         seen = {}
     last = seen.get(key)
@@ -1611,9 +1621,7 @@ def write_tg_answer(approval_id, answer):
 
 def read_tg_answer(approval_id):
     try:
-        with open(_tg_answer_path(approval_id), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data.get("answer", "")
+        return _read_json_object(_tg_answer_path(approval_id)).get("answer", "")
     except (OSError, ValueError):
         return None
 
@@ -1665,11 +1673,8 @@ def open_pendings(name):
             continue
         path = os.path.join(directory, entry)
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+            data = _read_json_object(path)
         except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
             continue
         if float(data.get("expires", 0)) < now:
             try:
@@ -1743,14 +1748,11 @@ def _remember_question(name, approval_id, fields):
     """
     path = os.path.join(_pending_dir(name), f"{approval_id}.json")
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if not isinstance(data, dict):
-            return
+        data = _read_json_object(path)
         data.update(fields)
         with open_private(path, "w") as fh:
             json.dump(data, fh)
-    except FileNotFoundError:
+    except (FileNotFoundError, _NotJsonObject):
         return
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"{PROG}: cannot record the question in {name} "
@@ -1978,9 +1980,8 @@ def _bot_state_path():
 
 def _read_bot_state():
     try:
-        with open(_bot_state_path(), "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError, TypeError):
+        return _read_json_object(_bot_state_path())
+    except (OSError, ValueError):
         return {}
 
 
@@ -2036,11 +2037,9 @@ def _bot_lock_path():
 
 def _read_bot_lock(path=None):
     try:
-        with open(path or _bot_lock_path(), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        return _read_json_object(path or _bot_lock_path())
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
 
 
 # What a lock held by someone else raises: EAGAIN/EWOULDBLOCK from flock,
@@ -2261,8 +2260,7 @@ def _read_item_files(directory):
         if not name.endswith(".json"):
             continue
         try:
-            with open(os.path.join(directory, name), "r", encoding="utf-8") as fh:
-                items.append((name, json.load(fh)))
+            items.append((name, _read_json_object(os.path.join(directory, name))))
         except (OSError, ValueError):
             continue
     return items
@@ -3706,8 +3704,7 @@ def _file_contains_our_hook(path):
 def _json_hook_commands(path):
     """Command strings in a JSON hook file, without interpreting wrappers."""
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = _read_json_object(path)
     except (OSError, ValueError):
         return []
     commands = []
@@ -3723,7 +3720,7 @@ def _json_hook_commands(path):
             for child in value:
                 visit(child)
 
-    visit(data.get("hooks") if isinstance(data, dict) else None)
+    visit(data.get("hooks"))
     return commands
 
 
@@ -3773,14 +3770,12 @@ def _is_owned_json_hook(event, group, entry, owner_keys):
 
 def _has_owned_json_hook(path, event_hooks):
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = _read_json_object(path)
     except (OSError, ValueError):
         return False
     owner_keys = _json_hook_owner_keys(event_hooks)
     return any(_is_owned_json_hook(event, group, entry, owner_keys)
-               for event, group, entry in _iter_json_hooks(
-                   data.get("hooks") if isinstance(data, dict) else None))
+               for event, group, entry in _iter_json_hooks(data.get("hooks")))
 
 
 def _hook_key(hook):
@@ -3816,7 +3811,8 @@ def _load_hook_settings(path, event_hooks, add):
     refused and left exactly as it is.
     """
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        # utf-8-sig like _read_json_object; the text is kept for the JSONC check
+        with open(path, "r", encoding="utf-8-sig") as fh:
             text = fh.read()
         if not text.strip():
             return {}
@@ -5745,12 +5741,11 @@ def _mcp_upsert_json(path, container, entry, project=None):
     data = {}
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+            data = _read_json_object(path)
+        except _NotJsonObject:
+            raise RuntimeError(f"{path} does not contain a JSON object - not touching it")
         except ValueError as exc:
             raise RuntimeError(f"{path} is not valid JSON ({exc}) - not touching it")
-        if not isinstance(data, dict):
-            raise RuntimeError(f"{path} does not contain a JSON object - not touching it")
     servers = data.setdefault(container, {})
     if not isinstance(servers, dict):
         raise RuntimeError(f"{path}: '{container}' is not an object - not touching it")
@@ -6595,11 +6590,9 @@ def _mcp_entry(path, container):
     if not os.path.exists(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        servers = _read_json_object(path).get(container)
     except (OSError, ValueError):
         return None
-    servers = data.get(container) if isinstance(data, dict) else None
     if not (isinstance(servers, dict) and "agentbell" in servers):
         return None
     return servers["agentbell"] if isinstance(servers["agentbell"], dict) else {}
@@ -6642,8 +6635,7 @@ def _remove_mcp_server_key(path, container):
     if not os.path.exists(path):
         return False
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = _read_json_object(path)
     except (OSError, ValueError):
         return False
     servers = data.get(container)
