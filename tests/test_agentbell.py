@@ -360,8 +360,10 @@ class TestAnswerParsing(unittest.TestCase):
         self.assertEqual(an._parse_answer("do nothing yet")[0], "answer")
         self.assertEqual(an._parse_answer("yesterday")[0], "answer")
         self.assertEqual(an._parse_answer("use the staging cluster")[0], "answer")
-        # a longer instruction is not the standalone refusal "wait" / "not"
-        self.assertEqual(an._parse_answer("wait for CI, then ship")[0], "answer")
+        # a longer instruction is not the standalone refusal "not" / "nicht";
+        # "wait" is a postponement, so "wait for CI, then ship" must not let
+        # `ask && deploy` ship now
+        self.assertEqual(an._parse_answer("wait for CI, then ship")[0], "denied")
         self.assertEqual(an._parse_answer("not staging — use prod")[0], "answer")
         self.assertEqual(an._parse_answer("nicht staging — use prod")[0], "answer")
         # "halt" denies; a longer word that merely starts with it does not
