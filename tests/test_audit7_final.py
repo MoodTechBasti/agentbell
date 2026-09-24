@@ -13,6 +13,9 @@ DOC-4  the send-time topic error said "max 64 chars" while the documented
        limit is 54; a 55-64 character topic still notifies, `ask` refuses it
        with the reason, doctor and verify explain it
 S-1    HTTPError objects were never closed (Python 3.14 ResourceWarning)
+CI-1   items queued within one step of a coarse clock (Windows before 3.13)
+       tied and sorted by their random id, so the queue overflow could drop
+       a newer item than the oldest
 """
 
 import contextlib
@@ -663,6 +666,31 @@ class TestHttpErrorsAreClosed(unittest.TestCase):
         self.assertEqual([str(w.message) for w in caught
                           if issubclass(w.category, ResourceWarning)
                           and "HTTPError" in str(w.message)], [])
+
+
+class TestQueueOrderOnACoarseClock(unittest.TestCase):
+    def setUp(self):
+        for name in ("queue", "deferred"):
+            shutil.rmtree(os.path.join(an.state_dir(), name), ignore_errors=True)
+        self.addCleanup(shutil.rmtree, os.path.join(an.state_dir(), "queue"), True)
+
+    def test_items_queued_in_one_clock_step_keep_their_order(self):
+        cfg = base.make_config("http://127.0.0.1:9", topic="audit7coarse")
+        frozen = time.time_ns()
+        with unittest.mock.patch.object(an, "QUEUE_MAX_ITEMS", 3), \
+                unittest.mock.patch.object(an.time, "time_ns", return_value=frozen):
+            ids = [an.enqueue_item(cfg, {"message": f"m{i}", "channels": ["ntfy"],
+                                         "priority": "normal", "id": f"{9 - i:016x}"})
+                   for i in range(4)]
+        items = sorted(an._read_item_files(an.queue_dir()),
+                       key=lambda pair: an._item_sort_key(pair[1]))
+        # the ids sort in reverse creation order, so a tie would keep ids[0]
+        self.assertEqual([item["id"] for _, item in items], ids[1:])
+
+    def test_the_stamp_is_strictly_increasing(self):
+        with unittest.mock.patch.object(an.time, "time_ns", return_value=1):
+            stamps = [an._item_time_ns() for _ in range(5)]
+        self.assertEqual(stamps, sorted(set(stamps)))
 
 
 if __name__ == "__main__":

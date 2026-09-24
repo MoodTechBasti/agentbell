@@ -553,13 +553,15 @@ class TestWebhookListen(_Sandbox):
 
         threading.Thread(target=run, daemon=True).start()
         deadline = time.monotonic() + 5
+        last = None
         while time.monotonic() < deadline and not errors:
             try:
                 with urllib.request.urlopen(f"http://[::1]:{port}/healthz", timeout=0.5) as r:
                     return json.loads(r.read())
-            except OSError:
+            except OSError as exc:
+                last = exc
                 time.sleep(0.05)
-        self.fail(f"webhook on {listen} never answered: {errors!r}")
+        self.fail(f"webhook on {listen} never answered: {errors!r}, last error {last!r}")
 
     @unittest.skipUnless(_ipv6_loopback_available(), "no IPv6 loopback on this machine")
     def test_listens_on_ipv6_loopback(self):

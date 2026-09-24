@@ -2676,6 +2676,24 @@ def _item_sort_key(item):
     return float(item.get("created", 0)), int(item.get("created_ns", 0))
 
 
+_item_clock_lock = threading.Lock()
+_item_clock_last_ns = 0
+
+
+def _item_time_ns():
+    """time.time_ns(), but strictly increasing within this process.
+
+    Windows before Python 3.13 reads the wall clock in steps of about 16 ms,
+    so items queued within one step tied and sorted by their random id: the
+    overflow could drop a newer item than the oldest.
+    """
+    global _item_clock_last_ns
+    with _item_clock_lock:
+        now = max(time.time_ns(), _item_clock_last_ns + 1)
+        _item_clock_last_ns = now
+        return now
+
+
 def _prune_items(directory, max_items, overflow_event):
     items = sorted(_read_item_files(directory), key=lambda pair: _item_sort_key(pair[1]))
     dropped = 0
@@ -2694,7 +2712,7 @@ def enqueue_item(cfg, item):
     """Persist a failed notification for later delivery (bounded queue)."""
     directory = ensure_state_dir(queue_dir())
     item = dict(item)
-    created_ns = time.time_ns()
+    created_ns = _item_time_ns()
     item.setdefault("id", secrets.token_hex(8))
     item.setdefault("created", created_ns / 1_000_000_000)
     item.setdefault("created_ns", created_ns)
@@ -2714,7 +2732,7 @@ def defer_item(cfg, message, title=None, priority="normal", tags=None,
     queue. Back in the queue it keeps that age, so a channel that stays
     down still expires it instead of cycling it through every night.
     """
-    created_ns = time.time_ns()
+    created_ns = _item_time_ns()
     created = created_ns / 1_000_000_000
     deliver_after = next_quiet_end(cfg.data.get("quiet_hours") or []) or created
     item = {
@@ -7647,6 +7665,7 @@ def webhook_server(cfg):
     listen = cfg.data.get("webhook", {}).get("listen", "127.0.0.1")
     port = int(cfg.data.get("webhook", {}).get("port", DEFAULT_WEBHOOK_PORT))
     token = cfg.data.get("webhook", {}).get("token")
+    import socketserver
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
@@ -7813,6 +7832,13 @@ def webhook_server(cfg):
     class Server(ThreadingHTTPServer):
         # the stock server is IPv4-only, so "::1" failed to bind
         address_family = socket.AF_INET6 if ":" in listen else socket.AF_INET
+
+        def server_bind(self):
+            # the stock server_bind resolves the address with getfqdn(), a
+            # reverse DNS lookup that can stall startup for seconds (macOS,
+            # "::1"); nothing here uses server_name
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
 
     try:
         server = Server((listen, port), Handler)

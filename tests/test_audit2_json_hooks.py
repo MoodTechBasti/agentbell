@@ -350,7 +350,8 @@ class TestReadOnlyLinkTarget(_HomeCase):
         os.chmod(store, 0o555)
         link = self._path(rel)
         os.symlink(target, link)
-        return link, target
+        # the message names the resolved target (/var is /private/var on macOS)
+        return link, os.path.realpath(target)
 
     def test_toml_and_json_writers_explain_and_change_nothing(self):
         cases = {

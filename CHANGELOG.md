@@ -256,7 +256,8 @@ that is still running from an earlier version. Until it restarts, `ask`,
 - Items the quiet-hours drain holds overnight keep their original queue
   time, so the 24-hour expiry still applies while a channel stays down.
 - Queued notifications keep their order when several land in the same
-  second.
+  second, also on a clock that advances in coarse steps (Windows before
+  Python 3.13), so a full queue drops the oldest item.
 - A numeric priority (`4` from the webhook or MCP, or stored by an older
   version) is used as that priority (`high`). It used to go out as
   `normal`, ignore the quiet-hours threshold and crash `history`,
@@ -508,7 +509,8 @@ that is still running from an earlier version. Until it restarts, `ask`,
   "not registered" and "not wired up" and suggested `mcp add` or `hooks
   install`, which refuse the same file.
 - The webhook server reports a port already in use as an error instead of
-  a traceback.
+  a traceback. It no longer looks up its own address in DNS at start,
+  which could delay the start by several seconds (macOS, `::1`).
 - The webhook server reads the request body before it refuses a request
   (401, 403, 413; up to 1 MiB of a body over the cap). Before, a
   client on Windows got a connection reset instead of the answer.
