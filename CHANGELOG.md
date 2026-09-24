@@ -40,14 +40,20 @@ that is still running from an earlier version. Until it restarts, `ask`,
   open. An ask counts while its process waits for the answer. After it
   ends without an answer on that channel (timed out, failed to send,
   killed, or answered on the other channel), its question keeps counting
-  for 60 seconds. A question the server refused outright (an HTTP error
-  status, Telegram `ok: false`) never reached the phone and does not
-  count. Otherwise the reply is refused, recorded as `stale_answer`, and a
-  "Reply not used" notice on the same channel says to tap a button, use
-  Reply (Telegram), or send `APPROVED <id>` / `DENIED <id>` (ntfy). A
-  reply written before the question went out is stale; replies are
-  ordered by Telegram message id or by the ntfy server's time, not by the
-  local clock.
+  for 60 seconds. A question the server rejected (an HTTP 4xx other than
+  408, Telegram `ok: false`) never reached the phone and does not count;
+  after a 5xx, a timeout or a dropped connection it may have, and it
+  counts. The questions are those that could be on the phone when the
+  reply was sent, not when agentbell reads it: a reply that reaches
+  agentbell more than 30 seconds after it was sent (after a lost
+  connection, or from a Telegram bot that was down) is not used. Otherwise
+  the reply is refused, recorded as `stale_answer`, and a "Reply not used"
+  notice on the same channel says to tap a button, use Reply (Telegram),
+  or send `APPROVED <id>` / `DENIED <id>` (ntfy). A reply written before
+  the question went out is stale; replies are ordered by Telegram message
+  id or by the ntfy server's time, not by the local clock, and their age
+  is measured so that a clock difference between this machine and the
+  server cannot make a late reply look fresh.
 - **`watch` keeps the terminal and survives signals until the push is
   sent.** The command runs in `watch`'s own process group, the terminal's
   foreground job, so sudo, ssh and gpg password prompts work and Ctrl-Z
@@ -225,6 +231,19 @@ that is still running from an earlier version. Until it restarts, `ask`,
   filesystem without file locks) makes `ask` fail with one error line and
   exit 3, also when Telegram is configured. Before, the ntfy half ended in
   a thread traceback and the ask went on with Telegram alone.
+- An HTTP 500 no longer counts as proof that a question never reached the
+  phone. ntfy delivers a message to its subscribers before it writes its
+  cache, and answers 500 when that write fails; each retry delivered
+  another copy. The question's marker was deleted, and a `yes` typed under
+  those copies approved another open ask. Only a 4xx other than 408, or
+  Telegram `ok: false`, deletes it now.
+- A typed reply that reached agentbell late was judged against the
+  questions open at that moment. After a lost connection, or while the
+  Telegram bot was down, a `yes` typed while two questions were open went
+  to the one still open once the other had ended, or had been answered
+  with its button in the meantime. It is now refused when it arrives more
+  than 30 seconds after it was sent, and an ended question counts for
+  every reply that may have been sent while it counted.
 
 #### Queue and quiet hours
 
@@ -465,9 +484,13 @@ that is still running from an earlier version. Until it restarts, `ask`,
 
 - `doctor` no longer crashes on an invalid ntfy server and no longer
   suggests ntfy.sh for one; `verify` fails its delivery check for it.
-- One topic rule everywhere: longer than 54 characters fails (the
-  `-responses` topic must fit ntfy's 64), a trailing newline is refused,
-  shorter than 16 characters warns (`config set ntfy.topic` included).
+- One topic rule for `doctor`, `verify`, `init` and `config set ntfy.topic`:
+  longer than 54 characters fails (`ask` adds `-responses`, and ntfy
+  allows 64), a trailing newline is refused, shorter than 16 characters
+  warns. Sending still accepts up to ntfy's 64, so a longer topic from an
+  older config keeps notifying; `ask` refuses it with that reason, and
+  `doctor` and `verify` say that notifications still go out. The send-time
+  error names both limits instead of "max 64 chars".
 - A damaged history line no longer crashes `history` or `verify`: bytes
   that are not UTF-8 show as U+FFFD, lines that are not a record are
   skipped and counted. An unreadable history is a warning in `verify`
@@ -541,6 +564,9 @@ that is still running from an earlier version. Until it restarts, `ask`,
 - The test suite removes its temp dirs at exit. Every temp dir a test
   makes lives under one root, and a part that cannot be removed is
   reported on stderr.
+- HTTP error responses are closed once their body is read, in agentbell
+  and in the tests' own HTTP clients, so Python 3.14 prints no
+  `ResourceWarning`. One Telegram test no longer reaches the real Bot API.
 
 ## 1.6.3 — 2026-09-03 — review hardening
 

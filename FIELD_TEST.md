@@ -149,6 +149,7 @@ evidence".
 | 43 | Tuned `--min-duration` survives reinstall | change `--min-duration 60` to `120` in agentbell's `Stop` hook in `~/.claude/settings.json`, run `agentbell hooks install claude` | the hook still says `120` | [ ] |
 | 44 | OpenCode plugin update | after upgrading, `agentbell hooks status` (shows `update needed`), `agentbell hooks install opencode`, then the three turns of row 11 | status `installed`; row 11's expectations hold with the 1.7.0 plugin | [ ] |
 | 45 | Purge with a shared state dir | `AGENTBELL_STATE_DIR` pointing at a directory that also holds a foreign file, plus a foreign file inside its `runs/`; `agentbell uninstall`, then `--yes` | the dry run lists the foreign files as kept; after `--yes` they are still there and only agentbell's entries are gone | [ ] |
+| 46 | Typed reply after a lost connection | `agentbell ask "A?" --timeout 300` on a laptop; disconnect the laptop (Wi-Fi off), type `yes` as a reply in the ntfy app, wait about a minute, reconnect | `A` is not approved; a "Reply not used" notification says the reply arrived more than 30 s after it was sent; `agentbell history` has `stale_answer` with that reason; the Approve button still answers `A` | [ ] |
 
 ## Agent wiring — all 12
 
@@ -288,7 +289,7 @@ second (the near-duplicate heuristic now only covers per-turn events).
 ## Known limitations (expected, not bugs)
 
 - **Possible duplicate on retry**: a timed-out POST may have been delivered anyway, so a rare duplicate push can occur (approval answers are deduplicated by request ID). The same holds for a hook send given up at the 6 s hook budget and queued: if the server had accepted it, the queued retry repeats it.
-- **Typed replies need a single open question**: a typed reply is used only when exactly one approval question can still be on the phone. With two asks open, or for about a minute after an ask ended unanswered (its timeout plus 60 s from its start at the latest), it is refused with a notice ("Reply not used" on ntfy, a reply from the Telegram bot) and recorded as `stale_answer`. Buttons, a typed `APPROVED <id>` / `DENIED <id>` and Telegram's Reply on the question always name their question.
+- **Typed replies need a single open question**: a typed reply is used only when exactly one approval question can still be on the phone. With two asks open, or for 60 seconds after an ask ended without an answer on that channel (timeout, a send that timed out or got a server error, killed, or answered on the other channel; an ask killed without closing its question ends when the first reader finds it), it is refused with a notice ("Reply not used" on ntfy, a reply from the Telegram bot) and recorded as `stale_answer`. A question the server rejected (HTTP 4xx, Telegram `ok: false`) does not count. A reply that reaches agentbell more than 30 seconds after it was sent (a lost connection, a Telegram bot that was down) is refused as well. Buttons, a typed `APPROVED <id>` / `DENIED <id>` and Telegram's Reply on the question always name their question.
 - **Deferred delivery needs activity**: without the `bot` daemon, deferred items go out with the next notification/`queue flush` after the window — not exactly at window end.
 - **Queue/defer are local**: no multi-device sync; they live in the state dir on this machine.
 - **Caps**: 200 deferred items, 100 queued items / 24 h age (counted from the first queueing, also across a quiet-hours defer), history rotated at 2 MB.
@@ -301,9 +302,9 @@ second (the near-duplicate heuristic now only covers per-turn events).
 ## When something surprises you
 
 ```bash
-agentbell doctor              # what is broken + the fix
+agentbell verify              # what is broken, without your topic or server
 agentbell history --limit 10  # what the tool thought it did
 agentbell queue list          # what is still waiting
 ```
 
-Paste those three outputs plus the command you ran — that is everything needed to diagnose it.
+Paste those three outputs plus the command you ran — that is everything needed to diagnose it (redact message text you would not share). `agentbell doctor` prints the fix for each problem, but it also prints your topic, which is a credential: read it, do not paste it.

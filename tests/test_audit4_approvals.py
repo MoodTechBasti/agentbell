@@ -167,6 +167,10 @@ class TestNtfyOneCandidateRule(unittest.TestCase):
         self._reply(f"APPROVED {a_id}")
         self.assertTrue(self._finish("a", first)["approved"])
         self.assertEqual(_marker("ntfy-pending", a_id)["answered"], True)
+        # A counts for a reply that may have been sent before its answer; with
+        # whole-second server times "may" reaches about two seconds back
+        ended = _marker("ntfy-pending", a_id)["ended"]
+        _wait_for(lambda: time.time() > ended + 2.5)
         second, _ = self._ask("b", "Second: restart staging?")
         self._id_of("Second:")
         self._reply("yes")
@@ -230,7 +234,8 @@ class TestNtfyRoute(unittest.TestCase):
     def _open(self, approval_id, question_time="unset"):
         an.write_ntfy_pending(approval_id, "Q?", 60)
         if question_time != "unset":
-            an.remember_ntfy_question(approval_id, question_time)
+            # the fake server clock (1000, ...) was read just now
+            an.remember_ntfy_question(approval_id, question_time, time.time())
 
     def test_single_open_ask_takes_a_newer_reply(self):
         self._open(A, 1000)
@@ -298,10 +303,12 @@ class TestTelegramOneCandidateRule(base._TelegramFixture):
     def _open(self, approval_id, message_id=None):
         an.write_tg_pending(approval_id, f"{approval_id[:1]}?", 60)
         if message_id is not None:
-            an.remember_tg_question_message(approval_id, message_id)
+            an.remember_tg_question_message(approval_id, message_id,
+                                            int(time.time()), time.time())
 
     def _reply(self, message_id, text, reply_to=None):
-        message = {"message_id": message_id, "chat": {"id": 42}, "text": text}
+        message = {"message_id": message_id, "chat": {"id": 42}, "text": text,
+                   "date": int(time.time())}
         if reply_to is not None:
             message["reply_to_message"] = reply_to
         an.handle_bot_update(self.cfg, {"update_id": message_id, "message": message})
@@ -463,7 +470,8 @@ class TestUnreadableMarkers(unittest.TestCase):
         self._open("ntfy-pending", A)
         self._tear("ntfy-pending", A)
         path = an._pending_path("ntfy-pending", A)
-        old = time.time() - an.PENDING_TOMBSTONE_GRACE_SECONDS - 5
+        old = (time.time() - an.PENDING_TOMBSTONE_GRACE_SECONDS
+               - an.LATE_REPLY_SECONDS - 5)
         os.utime(path, (old, old))
         with unittest.mock.patch.object(an, "PENDING_REREAD_SECONDS", 0):
             [held] = an.pending_markers("ntfy-pending")

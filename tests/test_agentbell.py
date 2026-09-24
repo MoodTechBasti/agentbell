@@ -146,6 +146,7 @@ class MockNtfy:
         self.subscribers = {}    # topic -> list of queue.Queue
         self.stream_enabled = stream_enabled
         self.post_503_count = post_503_count  # transient failures on the first N POSTs
+        self.post_fail_status = 503           # ...answered with this status
         self.get_503_count = 0                # transient failures on the next N polls
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.server.server_address[1]
@@ -166,7 +167,7 @@ class MockNtfy:
                 body = self.rfile.read(length).decode("utf-8")
                 if server.post_503_count > 0:
                     server.post_503_count -= 1
-                    self.send_response(503)
+                    self.send_response(server.post_fail_status)
                     self.send_header("Content-Type", "text/plain")
                     self.end_headers()
                     self.wfile.write(b"temporarily unavailable")
@@ -2093,6 +2094,7 @@ class MockTelegram:
                     self._reply({"ok": True, "result": {
                         "message_id": server._message_id,
                         "chat": {"id": body.get("chat_id")},
+                        "date": int(time.time()),
                     }})
                 elif method in ("answerCallbackQuery", "editMessageText"):
                     self._reply({"ok": True, "result": True})
@@ -2113,6 +2115,9 @@ class MockTelegram:
         return Handler
 
     def queue_update(self, update):
+        # Telegram stamps every message with its server time
+        if isinstance(update.get("message"), dict):
+            update["message"].setdefault("date", int(time.time()))
         self.updates.append(update)
 
     def last(self, method):
@@ -2483,11 +2488,13 @@ class TestBotDaemon(_TelegramFixture):
         an.remove_tg_answer("deadbeef")
         _remove_pending("tg-pending", "deadbeef")
 
-    def _stamp_question(self, approval_id, message_id):
+    def _stamp_question(self, approval_id, message_id, date=None):
         path = an._pending_path("tg-pending", approval_id)
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         data["question_message_id"] = message_id
+        data["question_date"] = int(time.time()) if date is None else date
+        data["question_sent_at"] = time.time()
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
 
@@ -2495,13 +2502,16 @@ class TestBotDaemon(_TelegramFixture):
         """A restarted bot replays backlog. A lower message id is not this answer.
 
         Ordering is by message id, not by the local clock. A reply dated in
-        the future still predates the question when its id is lower, and a
-        higher id still counts when its date is ancient.
+        the future still predates the question when its id is lower. A
+        higher id counts however far Telegram's clock is from the local one
+        (here five hours behind it); one that reached the bot long after it
+        was sent does not (audit 7, AF-1).
         """
         cfg = self._tg_cfg()
         self.tg.updates.clear()
         an.write_tg_pending("deadbeef", "Deploy?", 60)
-        self._stamp_question("deadbeef", 20)
+        skew = -5 * 3600
+        self._stamp_question("deadbeef", 20, date=int(time.time()) + skew)
         self.tg.queue_update({
             "update_id": 11,
             "message": {"message_id": 11, "chat": {"id": 42}, "text": "yes",
@@ -2515,7 +2525,14 @@ class TestBotDaemon(_TelegramFixture):
         self.tg.queue_update({
             "update_id": 12,
             "message": {"message_id": 21, "chat": {"id": 42}, "text": "yes",
-                        "date": 1},
+                        "date": int(time.time()) + skew - an.LATE_REPLY_SECONDS - 5},
+        })
+        an.bot_poll_once(cfg, poll_timeout=1)
+        self.assertIsNone(an.read_tg_answer("deadbeef"))
+        self.tg.queue_update({
+            "update_id": 13,
+            "message": {"message_id": 22, "chat": {"id": 42}, "text": "yes",
+                        "date": int(time.time()) + skew},
         })
         an.bot_poll_once(cfg, poll_timeout=1)
         self.assertEqual(an.read_tg_answer("deadbeef"), "yes")
@@ -3073,7 +3090,11 @@ class TestApprovalHardening(unittest.TestCase):
         other_id = "b" * 16
         an.write_ntfy_pending(other_id, "Second question?", 20)
         self.assertTrue(an.claim_ntfy_message("race-msg-1"))
-        an.close_pending("ntfy-pending", other_id, answered=True)
+        # answered a while ago: its tombstone no longer counts for this reply
+        # (one that may have been sent before that answer is refused anyway)
+        earlier = time.time() - 10
+        with unittest.mock.patch.object(an.time, "time", lambda: earlier):
+            an.close_pending("ntfy-pending", other_id, answered=True)
         self.ntfy.inject("claimed-responses", "race-claimed-reply", "race-msg-1")
         deadline = time.monotonic() + 15
         ignored = False
@@ -3144,7 +3165,7 @@ class TestApprovalHardening(unittest.TestCase):
         waiter = an.ApprovalWaiter(
             cfg, "claimfailure-responses", 5, approval_id="a" * 16)
         an.write_ntfy_pending("a" * 16, "Q?", 5)          # the one open question
-        an.remember_ntfy_question("a" * 16, 1000)
+        an.remember_ntfy_question("a" * 16, 1000, time.time())
         original = an.claim_ntfy_message
         an.claim_ntfy_message = lambda message_id: (_ for _ in ()).throw(
             OSError("read only"))
@@ -4208,10 +4229,12 @@ class TestForeignTelegramAnswer(unittest.TestCase):
         approval_id = "abcdef1234567890"
         an.write_tg_pending(approval_id, "Deploy?", 60)
         try:
-            an.handle_bot_update(cfg, {"callback_query": {
-                "id": "cb", "data": f"agentbell|{approval_id}|approved",
-                "from": {"id": 9999}, "message": {"chat": {"id": 9999}, "message_id": 1},
-            }})
+            # the refusal is answered on a closed local port, not the real API
+            with unittest.mock.patch.object(an, "TG_API_BASE", "http://127.0.0.1:9"):
+                an.handle_bot_update(cfg, {"callback_query": {
+                    "id": "cb", "data": f"agentbell|{approval_id}|approved",
+                    "from": {"id": 9999}, "message": {"chat": {"id": 9999}, "message_id": 1},
+                }})
             self.assertIsNone(an.read_tg_answer(approval_id),
                               "a stranger must not be able to approve")
         finally:
@@ -4935,7 +4958,8 @@ class TestWebhookHardening(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=5) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            with exc:             # it holds the connection (3.14 warns)
+                return exc.code, exc.read()
 
     def test_a_request_from_a_browser_page_is_refused(self):
         # a text/plain POST needs no CORS preflight, so without this any open
@@ -4996,7 +5020,8 @@ class TestWebhookToken(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=5) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            with exc:             # it holds the connection (3.14 warns)
+                return exc.code, exc.read()
 
     def test_missing_token_is_401(self):
         self.assertEqual(self._post()[0], 401)

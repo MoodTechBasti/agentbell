@@ -135,9 +135,18 @@ PRIME_RETRY_SECONDS = 0.2
 # An ask's marker is open exactly while the ask holds its kernel lock. Once
 # the ask has ended (answered elsewhere, timed out, failed, killed) its
 # question may still be on the phone: it stays a candidate for a typed reply
-# for this long after the end, unless it was answered on that channel
-# (see reply_candidates).
+# sent up to this long after the end, unless it was answered on that
+# channel (see reply_candidates).
 PENDING_TOMBSTONE_GRACE_SECONDS = 60
+
+# A typed reply that names no question is judged against the questions
+# that could be on the phone when it was SENT. It is used only when it
+# reaches agentbell at most this long after its server time (ntfy `time`,
+# Telegram `date`); a later one (a reconnect, a bot that was down) is
+# refused. Tombstones are kept this much longer than their grace, so every
+# question that counted when a reply was sent still counts when it is
+# read (DECISIONS §30).
+LATE_REPLY_SECONDS = 30
 
 # A marker that cannot be read is read once more after this pause: it may
 # be caught mid-rewrite.
@@ -151,9 +160,15 @@ BOT_NOTICE_INTERVAL_SECONDS = 60
 MIN_GUESSABLE_TOPIC_LEN = 16
 
 # `ask` derives "<topic>-responses", which must itself stay inside ntfy's
-# 64-character topic limit - so the main topic has a smaller budget.
+# 64-character topic limit - so the main topic has a smaller budget. A send
+# still accepts up to ntfy's own limit: a longer topic from an older config
+# keeps notifying, only `ask` refuses it; doctor, verify, init and
+# `config set` apply the smaller budget (rate_topic).
 RESPONSE_SUFFIX = "-responses"
-MAX_TOPIC_LEN = 64 - len(RESPONSE_SUFFIX)
+NTFY_TOPIC_LIMIT = 64
+MAX_TOPIC_LEN = NTFY_TOPIC_LIMIT - len(RESPONSE_SUFFIX)
+TOPIC_LIMITS_TEXT = (f"at most {MAX_TOPIC_LEN} characters, because 'ask' adds "
+                     f"'{RESPONSE_SUFFIX}' and ntfy allows {NTFY_TOPIC_LIMIT}")
 
 # fullmatch only: "$" also matched before a trailing newline, and the
 # length is checked on its own so an overlong topic is called that
@@ -746,12 +761,15 @@ class TelegramRefused(RuntimeError):
 
 def _refused(exc):
     """Whether a failed send is known to have delivered nothing: the server
-    answered with an error status, or Telegram said ok:false. A gateway's
-    502 or 504 is no proof, nor is a timeout or a dropped connection: the
-    server behind it may have stored the message."""
+    rejected the request itself (HTTP 4xx other than 408), or Telegram said
+    ok:false. A 5xx is no proof: ntfy hands a message to its subscribers
+    before it writes its cache, and answers 500 when that write fails; a
+    proxy's 502, 504 or 52x may come after the server took the request. A
+    408, a redirect, a timeout or a dropped connection prove nothing
+    either: the server may have stored the message."""
     cause = exc.__cause__
     if isinstance(cause, urllib.error.HTTPError):
-        return cause.code not in (502, 504)
+        return 400 <= cause.code < 500 and cause.code != 408
     return isinstance(exc, TelegramRefused)
 
 
@@ -854,6 +872,10 @@ def http_request(url, method="GET", headers=None, body=None, timeout=10.0):
             detail = raw.decode("utf-8", "replace")[:300] if raw else ""
         except (OSError, http.client.HTTPException):
             detail = ""
+        finally:
+            # the error holds the response's socket; its code and headers
+            # stay readable (_refused needs the code via __cause__)
+            _close_http_error(exc)
         if 300 <= exc.code < 400:
             target = exc.headers.get("Location") if exc.headers else None
             raise PermanentError(
@@ -874,6 +896,15 @@ def http_request(url, method="GET", headers=None, body=None, timeout=10.0):
         # not a timeout, so it used to skip the retry and the offline queue.
         raise TransientError(
             f"connection to {safe_url(url)} failed ({type(exc).__name__})") from exc
+
+
+def _close_http_error(exc):
+    """Release the connection an HTTPError holds. Python 3.14 warns about
+    an unclosed one (ResourceWarning) when it is collected."""
+    try:
+        exc.close()
+    except Exception:  # noqa: BLE001 - built without a response (fp=None): 3.9
+        pass           # raises KeyError there, and there is nothing to close
 
 
 def clamp_message(text, limit=3900):
@@ -936,10 +967,13 @@ def toml_string(value):
 
 
 def validate_topic(topic):
-    if not TOPIC_RE.fullmatch(topic or "") or len(topic) > 64:
+    """Refuse a topic ntfy would reject. The main topic's own rule is
+    stricter (TOPIC_LIMITS_TEXT); a send allows up to ntfy's limit, so an
+    existing longer topic keeps notifying."""
+    if not TOPIC_RE.fullmatch(topic or "") or len(topic) > NTFY_TOPIC_LIMIT:
         raise RuntimeError(
-            f"invalid ntfy topic '{topic}'. Allowed: a-z, A-Z, 0-9, '-', '_' (max 64 chars). "
-            "Run 'agentbell init' if not configured yet."
+            f"invalid ntfy topic '{topic}'. Allowed: a-z, A-Z, 0-9, '-', '_', "
+            f"{TOPIC_LIMITS_TEXT}. Run 'agentbell init' if not configured yet."
         )
 
 
@@ -995,6 +1029,8 @@ class NtfyChannel:
             return OPENER.open(request, timeout=timeout)     # never follows redirects
         except (urllib.error.URLError, socket.timeout, OSError,
                 http.client.HTTPException) as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                _close_http_error(exc)
             raise RuntimeError(f"cannot subscribe to {safe_url(url)}: {exc}") from exc
 
     def poll(self, topic, since, timeout=10.0):
@@ -1098,8 +1134,9 @@ class TelegramChannel:
             text += "\n\n(start the answer bot with 'agentbell bot' to answer here)"
         body["text"] = text
         result = self._api("sendMessage", body, timeout)
-        message_id = result.get("message_id") if isinstance(result, dict) else None
-        return {"channel": "telegram", "ok": True, "message_id": message_id}
+        result = result if isinstance(result, dict) else {}
+        return {"channel": "telegram", "ok": True, "message_id": result.get("message_id"),
+                "date": result.get("date")}
 
     def answer_callback(self, callback_query_id, text=None, timeout=10.0):
         body = {"callback_query_id": callback_query_id}
@@ -1771,22 +1808,22 @@ def close_pending(name, approval_id, answered):
     """End an ask on one channel: its marker becomes a tombstone.
 
     `answered` means the answer came through this channel: the question
-    there is settled and the tombstone no longer counts. Otherwise (no
-    answer, a failed send, an answer on the other channel) the question
-    may still be on the phone, and the tombstone counts when a typed reply
-    is placed for PENDING_TOMBSTONE_GRACE_SECONDS, so a "yes" typed under
-    it does not go to another ask. The tombstone is written before the lock
-    is dropped: whoever finds the lock free reads the final state. A marker
-    this process does not hold (never written, already ended) is left as
-    it is.
+    there is settled, and the tombstone counts only for a typed reply sent
+    before it ended. Otherwise (no answer, a failed send, an answer on the
+    other channel) the question may still be on the phone, and the
+    tombstone counts for a typed reply sent up to
+    PENDING_TOMBSTONE_GRACE_SECONDS after the end, so a "yes" typed under
+    it does not go to another ask (reply_candidates). The tombstone is
+    written before the lock is dropped: whoever finds the lock free reads
+    the final state. A marker this process does not hold (never written,
+    already ended) is left as it is.
     """
     path = _pending_path(name, approval_id)
     with _HELD_MARKERS_LOCK:
         if path not in _HELD_MARKERS:
             return
     data = _read_marker(path) or {"approval_id": approval_id}
-    data.update(closed=True, answered=bool(answered),
-                expires=time.time() + PENDING_TOMBSTONE_GRACE_SECONDS)
+    data.update(_tombstone(time.time()), answered=bool(answered))
     try:
         _write_held_marker(path, data)
     except OSError as exc:
@@ -1795,6 +1832,23 @@ def close_pending(name, approval_id, answered):
                          f"for {PENDING_TOMBSTONE_GRACE_SECONDS}s\n")
     finally:
         _let_go(path)
+
+
+def _tombstone(ended):
+    """The fields that end a marker at local time `ended`: it counts as
+    the grace says (reply_candidates) and is deleted once no reply that
+    can still be used can have been sent while it counted."""
+    return {"closed": True, "answered": False, "ended": ended,
+            "expires": ended + PENDING_TOMBSTONE_GRACE_SECONDS + LATE_REPLY_SECONDS}
+
+
+def _ended_at(data):
+    """When a tombstone's ask ended, by the local clock."""
+    ended = data.get("ended")
+    if _is_number(ended):
+        return ended
+    # written before `ended` existed: `expires` was the end plus the grace
+    return data.get("expires", 0) - PENDING_TOMBSTONE_GRACE_SECONDS
 
 
 def discard_pending(name, approval_id):
@@ -1838,17 +1892,18 @@ def _read_marker(path):
 
 
 def pending_markers(name):
-    """Every marker of one channel that still counts: open asks and
-    tombstones in their grace.
+    """Every marker of one channel that can still count for a typed
+    reply: open asks, and tombstones until their `expires`.
 
     A marker is open while its ask holds its lock, whatever the clock says.
     One nobody holds has ended: its ask closed it, or died without closing
     it (SIGKILL, a crash, an older agentbell). An unclosed one is closed
-    here, unanswered, and its grace starts now. A tombstone past its grace
-    is deleted. A marker that cannot be read counts as a question whose
-    place is unknown ({"unreadable": True}), because skipping it would hand
-    a typed reply to another ask (WIN-1): open while held, otherwise until a
-    grace after its last write.
+    here, unanswered, and it ends now. A tombstone past its `expires` (its
+    grace plus LATE_REPLY_SECONDS) is deleted; which of the others count
+    for a given reply is up to reply_candidates(). A marker that cannot be
+    read counts as a question whose place is unknown ({"unreadable": True}),
+    because skipping it would hand a typed reply to another ask (WIN-1):
+    open while held, otherwise it ended at its last write.
     """
     directory = _pending_dir(name)
     if not os.path.isdir(directory):
@@ -1872,8 +1927,7 @@ def pending_markers(name):
                 continue
             data = {"approval_id": entry[:-len(".json")], "unreadable": True}
             if not held:
-                data.update(closed=True, answered=False,
-                            expires=written + PENDING_TOMBSTONE_GRACE_SECONDS)
+                data.update(_tombstone(written))
         elif not held and not data.get("closed"):
             ended = _mark_ended(path, data, now)
             held = ended is None          # it had only just taken its lock
@@ -1899,8 +1953,7 @@ def _mark_ended(path, data, now):
     """
     if _lock_held(path):
         return None
-    data = dict(data, closed=True, answered=False,
-                expires=now + PENDING_TOMBSTONE_GRACE_SECONDS)
+    data = dict(data, **_tombstone(now))
     tmp = f"{path}.{os.getpid()}-{threading.get_ident()}.tmp"
     try:
         with open_private(tmp, "w") as fh:
@@ -1928,17 +1981,61 @@ def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def reply_candidates(markers):
-    """The asks a typed reply that names no question may be meant for:
-    every open one, and every ended one that got no answer, because its
-    question may still be on the phone."""
-    return [data for data in markers if not (data.get("closed") and data.get("answered"))]
+def reply_candidates(markers, sent_after=None, now=None):
+    """The asks a typed reply that names no question may be meant for.
+
+    `sent_after` is the earliest local time at which the reply can have
+    been sent (reply_age_bound); the reply is judged against the
+    questions that could be on the phone then. Every open ask counts. An
+    ask that ended without an answer on this channel counts when the reply
+    may have been sent within PENDING_TOMBSTONE_GRACE_SECONDS of its end:
+    its question may still have been on the screen. One answered on this
+    channel counts when the reply may have been sent before that answer.
+    Without `sent_after` the reply is taken to be sent `now`, and an
+    answered one never counts (such a reply is not used anyway).
+    """
+    now = time.time() if now is None else now
+    sent = now if sent_after is None else sent_after
+    candidates = []
+    for data in markers:
+        if not data.get("closed"):
+            candidates.append(data)
+        elif data.get("answered"):
+            if sent_after is not None and sent <= _ended_at(data):
+                candidates.append(data)
+        elif sent <= _ended_at(data) + PENDING_TOMBSTONE_GRACE_SECONDS:
+            candidates.append(data)
+    return candidates
+
+
+def reply_age_bound(marker, time_key, reply_time, now):
+    """The most seconds that can have passed since a reply was sent, or
+    None when that cannot be known.
+
+    `reply_time` is the reply's server time in whole seconds (ntfy `time`,
+    Telegram `date`); the marker holds its own question's server time
+    under `time_key` and `question_sent_at`, the local time just before the
+    send that returned it. The server stamped the question after that
+    moment, so `question_sent_at - question_time - 1` is at most the true
+    offset between this machine's clock and the server's, and the result
+    is at least the reply's true age. Whatever that offset is (a local
+    clock minutes ahead of or behind the server), it cancels out: skew
+    cannot make a late reply look fresh. What makes the bound larger than
+    the true age (the question's round trip, the whole-second times) only
+    ever refuses a reply. A local clock stepped back between the question
+    and the reply shortens it by the step (DECISIONS §30).
+    """
+    sent_at, question_time = marker.get("question_sent_at"), marker.get(time_key)
+    if not all(_is_number(value) for value in (sent_at, question_time, reply_time)):
+        return None
+    return now - (sent_at - question_time - 1) - reply_time
 
 
 REPLY_PREDATES = "reply predates the question"
 
 
-def place_typed_reply(markers, key, position, strict):
+def place_typed_reply(markers, key, position, strict, time_key=None, reply_time=None,
+                      now=None):
     """The ask a typed reply that names no question answers.
 
     Returns (marker, None, None), or (None, reason, approval id or None)
@@ -1946,19 +2043,30 @@ def place_typed_reply(markers, key, position, strict):
     question's place in the reply stream (a Telegram message id, an ntfy
     server time); `position` is the reply's place in that stream. `strict`:
     an equal place predates the question (unique message ids); with
-    whole-second times it does not.
+    whole-second times it does not. `time_key` names the marker's question
+    server time and `reply_time` is the reply's (reply_age_bound).
 
     The reply is used only when there is exactly one candidate
-    (reply_candidates), that ask is still open, and its question is known
-    to be out before the reply. Choosing among several questions by their
-    places kept approving the wrong one: a send that failed or needed a
-    retry, or a question that had just ended, can sit anywhere on the
-    phone. A misrouted approval is worse than a lost reply; the buttons,
-    a typed "APPROVED <id>" and Telegram's Reply still name their question.
-    A reply older than every candidate's question is a replay (a restarted
-    bot, a reply sent before the question): stale, as before.
+    (reply_candidates, judged at the time the reply was sent), that ask is
+    still open, its question is known to be out before the reply, and the
+    reply reached agentbell within LATE_REPLY_SECONDS of being sent.
+    Choosing among several questions by their places kept approving the
+    wrong one: a send that failed or needed a retry, or a question that
+    had just ended, can sit anywhere on the phone. A reply read late (a
+    reconnect, a bot that was down) was judged against questions that
+    changed since it was typed. A misrouted approval is worse than a lost
+    reply; the buttons, a typed "APPROVED <id>" and Telegram's Reply still
+    name their question. A reply older than every candidate's question is
+    a replay (a restarted bot, a reply sent before the question): stale,
+    as before.
     """
-    candidates = reply_candidates(markers)
+    now = time.time() if now is None else now
+    still_open = [data for data in markers if not data.get("closed")]
+    age = (reply_age_bound(still_open[0], time_key, reply_time, now)
+           if len(still_open) == 1 and time_key else None)
+    if age is not None and age < 0:
+        age = None            # below any true age: a clock was stepped, trust neither
+    candidates = reply_candidates(markers, None if age is None else now - age, now)
     about = candidates[0].get("approval_id") if len(candidates) == 1 else None
     marks = [data.get(key) for data in candidates]
     if (candidates and _is_number(position) and all(_is_number(mark) for mark in marks)
@@ -1973,6 +2081,11 @@ def place_typed_reply(markers, key, position, strict):
         return None, "that question is no longer open", about
     if not _is_number(position) or not _is_number(only.get(key)):
         return None, "that question's place in the chat is unknown", about
+    if age is None:
+        return None, "the time it was sent is unknown", about
+    if age > LATE_REPLY_SECONDS:
+        return None, (f"it arrived more than {LATE_REPLY_SECONDS} s after it was sent, "
+                      "and the open questions may have changed since"), about
     return only, None, None
 
 
@@ -2026,7 +2139,7 @@ def write_tg_pending(approval_id, message, timeout_seconds):
     write_pending("tg-pending", approval_id, message, timeout_seconds)
 
 
-def remember_tg_question_message(approval_id, message_id):
+def remember_tg_question_message(approval_id, message_id, date=None, sent_at=None):
     """Record the Telegram message id of the question we just sent.
 
     Free-text replies are ordered against this id, not against the local
@@ -2034,30 +2147,39 @@ def remember_tg_question_message(approval_id, message_id):
     about a day of updates; a lower id was written before this question
     existed, whatever the two clocks say (DECISIONS §16i, §22). After a
     retried send it is the copy that got through: a reply to an earlier
-    copy counts as older and is not used.
+    copy counts as older and is not used. `date` (Telegram's time of the
+    question) and `sent_at` (the local time just before that send) tell
+    how long ago a reply was sent (reply_age_bound).
     """
     try:
         message_id = int(message_id)
     except (TypeError, ValueError):
         return
-    _remember_question("tg-pending", approval_id, {"question_message_id": message_id})
+    _remember_question("tg-pending", approval_id, {
+        "question_message_id": message_id,
+        "question_date": date if _is_number(date) else None,
+        "question_sent_at": sent_at if _is_number(sent_at) else None})
 
 
 def write_ntfy_pending(approval_id, message, timeout_seconds):
     write_pending("ntfy-pending", approval_id, message, timeout_seconds)
 
 
-def remember_ntfy_question(approval_id, server_time):
+def remember_ntfy_question(approval_id, server_time, sent_at=None):
     """Record the ntfy server time of the question we just published.
 
     The ntfy twin of the Telegram message id: every reply carries the same
     server's `time`, so replies are ordered against the questions without
     the local clock (DECISIONS §16i). None means its place is unknown: the
     server sent no time, or every publish attempt failed although one may
-    have been stored. Typed replies are then not used for it.
+    have been stored. Typed replies are then not used for it. `sent_at`,
+    the local time just before the publish that returned `server_time`,
+    tells how long ago a reply was sent (reply_age_bound).
     """
-    _remember_question("ntfy-pending", approval_id,
-                       {"question_time": server_time if _is_number(server_time) else None})
+    known = _is_number(server_time)
+    _remember_question("ntfy-pending", approval_id, {
+        "question_time": server_time if known else None,
+        "question_sent_at": sent_at if known and _is_number(sent_at) else None})
 
 
 def ntfy_reply_route(reply_time):
@@ -2077,7 +2199,8 @@ def ntfy_reply_route(reply_time):
     if (len(candidates) == 1 and not candidates[0].get("closed")
             and "question_time" not in candidates[0]):
         return None
-    return place_typed_reply(markers, "question_time", reply_time, strict=False)
+    return place_typed_reply(markers, "question_time", reply_time, strict=False,
+                             time_key="question_time", reply_time=reply_time)
 
 
 # A free-text reply belongs to exactly one ask, but on ntfy every parallel ask
@@ -3613,7 +3736,13 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
     if "ntfy" in channels:
         if not cfg.ntfy_ready():
             raise RuntimeError("ntfy is not configured. Run 'agentbell init' first.")
-        resp_topic = f"{ntfy.get('topic')}-responses"
+        topic = ntfy.get("topic") or ""
+        if TOPIC_RE.fullmatch(topic) and MAX_TOPIC_LEN < len(topic) <= NTFY_TOPIC_LIMIT:
+            raise RuntimeError(
+                f"the ntfy topic is {len(topic)} characters; 'ask' needs {TOPIC_LIMITS_TEXT}. "
+                "Notifications still work. Pick a shorter topic: "
+                f"agentbell config set ntfy.topic {suggest_topic()}")
+        resp_topic = f"{topic}{RESPONSE_SUFFIX}"
         validate_topic(resp_topic)
         _warn_insecure_ask(cfg, message)
     if "telegram" in channels:
@@ -3648,7 +3777,8 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                      "or type a custom answer.")
 
         def publish():
-            return NtfyChannel(cfg).publish(
+            before = time.time()
+            sent = NtfyChannel(cfg).publish(
                 ntfy.get("topic"),
                 f"{message}\n\nID: {approval_id}\n{hint}",
                 title="\u2753 Approval requested",
@@ -3656,6 +3786,7 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                 tags=["question", "approval"],
                 actions=actions,
             )
+            return dict(sent, sent_at=before) if isinstance(sent, dict) else sent
         return _publish_question(publish)
 
     def _note_ntfy_failure(exc, detail):
@@ -3715,8 +3846,8 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
             if ask_closed.is_set():
                 ntfy_waiter.stop_event.set()
                 return
-            remember_ntfy_question(
-                approval_id, sent.get("time") if isinstance(sent, dict) else None)
+            sent = sent if isinstance(sent, dict) else {}
+            remember_ntfy_question(approval_id, sent.get("time"), sent.get("sent_at"))
             waiters.append(("ntfy", ntfy_waiter))
 
     if print_status:
@@ -3746,15 +3877,18 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         telegram_error = None
         if "telegram" in channels:
             def send_tg():
-                return TelegramChannel(cfg).send_ask(
+                before = time.time()
+                sent = TelegramChannel(cfg).send_ask(
                     message, approval_id, yes_label, no_label,
                     buttons=buttons and bot_heartbeat_fresh(),
                 )
+                return dict(sent, sent_at=before) if isinstance(sent, dict) else sent
             try:
                 sent = _publish_question(send_tg)
-                message_id = sent.get("message_id") if isinstance(sent, dict) else None
-                if message_id:
-                    remember_tg_question_message(approval_id, message_id)
+                sent = sent if isinstance(sent, dict) else {}
+                if sent.get("message_id"):
+                    remember_tg_question_message(approval_id, sent["message_id"],
+                                                 sent.get("date"), sent.get("sent_at"))
             except RuntimeError as exc:
                 telegram_error = exc
                 sys.stderr.write(f"{PROG}: telegram: {exc}\n")
@@ -7850,7 +7984,8 @@ def _tg_reply_owner(markers, message):
             return (None, "reply to a question that is no longer open",
                     named.get("approval_id") if named is not None else quoted[-1])
     return place_typed_reply(markers, "question_message_id", message.get("message_id"),
-                             strict=True)
+                             strict=True, time_key="question_date",
+                             reply_time=message.get("date"))
 
 
 def bot_poll_once(cfg, offset=None, poll_timeout=25, session=None):
@@ -8103,9 +8238,15 @@ def rate_topic(topic):
     """
     if not TOPIC_RE.fullmatch(topic or ""):
         return FAIL, "is not valid (allowed: a-z A-Z 0-9 - _)"
+    if len(topic) > NTFY_TOPIC_LIMIT:
+        return FAIL, (f"is too long ({len(topic)} chars, max {MAX_TOPIC_LEN}): ntfy "
+                      f"allows {NTFY_TOPIC_LIMIT}, and 'ask' also needs "
+                      f"'<topic>{RESPONSE_SUFFIX}' to fit")
     if len(topic) > MAX_TOPIC_LEN:
-        return FAIL, (f"is too long ({len(topic)} chars, max {MAX_TOPIC_LEN}) - 'ask' "
-                      f"also needs '<topic>{RESPONSE_SUFFIX}' to fit in 64")
+        return FAIL, (f"is too long ({len(topic)} chars, max {MAX_TOPIC_LEN}): "
+                      "notifications still go out, but 'ask' cannot - it listens on "
+                      f"'<topic>{RESPONSE_SUFFIX}', which must fit ntfy's "
+                      f"{NTFY_TOPIC_LIMIT} characters")
     if len(topic) < MIN_GUESSABLE_TOPIC_LEN:
         return WARN, ("short topic - guessable on a public server; anyone who knows it "
                       "can read your notifications and send fake approvals")

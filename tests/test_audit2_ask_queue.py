@@ -219,10 +219,13 @@ class TestTelegramReplyRouting(base._TelegramFixture):
     def _ask(self, approval_id, question_message_id=None):
         an.write_tg_pending(approval_id, f"{approval_id[:1]}?", 60)
         if question_message_id is not None:
-            an.remember_tg_question_message(approval_id, question_message_id)
+            # sent just now: Telegram's date and the local time before the send
+            an.remember_tg_question_message(approval_id, question_message_id,
+                                            int(time.time()), time.time())
 
     def _reply(self, message_id, text, reply_to=None):
-        message = {"message_id": message_id, "chat": {"id": 42}, "text": text}
+        message = {"message_id": message_id, "chat": {"id": 42}, "text": text,
+                   "date": int(time.time())}
         if reply_to is not None:
             message["reply_to_message"] = reply_to
         an.handle_bot_update(self.cfg, {"update_id": message_id, "message": message})
@@ -313,7 +316,8 @@ class TestNtfyReplyRouting(unittest.TestCase):
     def _waiter(self, approval_id, question_time="unset"):
         an.write_ntfy_pending(approval_id, "Q?", 60)
         if question_time != "unset":
-            an.remember_ntfy_question(approval_id, question_time)
+            # the fake server clock (1000, ...) was read just now
+            an.remember_ntfy_question(approval_id, question_time, time.time())
         return an.ApprovalWaiter(self.cfg, "m13unit-responses", 60, approval_id=approval_id)
 
     def _got(self, waiter):
@@ -366,7 +370,7 @@ class TestNtfyReplyRouting(unittest.TestCase):
         b = self._waiter(self.B)
         b._offer("r5", "staging", 1003)
         self.assertEqual(self._got(b), [])
-        an.remember_ntfy_question(self.B, 1003)
+        an.remember_ntfy_question(self.B, 1003, time.time())
         b._offer("r5", "staging", 1003)
         self.assertEqual(self._got(b), ["staging"])
 

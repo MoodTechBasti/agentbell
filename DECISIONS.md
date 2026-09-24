@@ -1426,7 +1426,7 @@ request list after the ask thread had started, so a fast `sendMessage`
 was treated as "already there" and the test waited 20 seconds. The count
 is taken before the thread starts.
 
-## 30. A typed reply answers one question or none (2026-09-23)
+## 30. A typed reply answers one question or none (2026-09-23, late replies 2026-09-24)
 
 **What was wrong.** A typed reply carries no question id. It went to the
 newest open ask (§4b, §9), later to the newest question sent before the
@@ -1450,29 +1450,75 @@ reply is used only when exactly one question can still be on the phone.
   said "expired" and a typed "yes" went to a newer ask. A killed or
   crashed ask loses the lock with its process, so its marker cannot stay
   open.
-- The candidates are every open ask plus every ended ask whose question
-  may still be on that phone. When an ask ends, each marker becomes a
-  tombstone (`closed`, `answered`, `expires`) before the lock is
-  dropped. `answered` is true only on the channel that carried the
-  answer: an ask answered on Telegram still has its question and
-  buttons on ntfy. An answered tombstone does not count. Any other
+- The candidates are every ask whose question could be on that phone
+  when the reply was SENT, not when agentbell reads it. When an ask ends,
+  each marker becomes a tombstone (`closed`, `answered`, `ended`,
+  `expires`) before the lock is dropped. `answered` is true only on the
+  channel that carried the answer: an ask answered on Telegram still has
+  its question and buttons on ntfy. Every open ask counts. An unanswered
   tombstone (no answer, a failed send, a kill, an answer on the other
-  channel) counts for `PENDING_TOMBSTONE_GRACE_SECONDS` (60 s) after the
-  ask ended, then it is deleted. A marker whose ask died without closing
-  it is closed by the first reader that finds its lock free, and its 60 s
-  start then. `ask` turns SIGTERM and SIGHUP into a normal exit
-  (128 + signal), so an agent's tool timeout closes the question at once.
-  The wall clock only prunes tombstones nobody holds.
-- A question the server refused (every attempt answered with an HTTP
-  error status other than a gateway's 502/504, or Telegram `ok: false`)
-  never reached the phone: its marker on that channel is deleted. A
-  timeout or a dropped connection proves nothing, since the server may
-  have stored the question, so that marker stays with an unknown place.
+  channel) counts for a reply that may have been sent within
+  `PENDING_TOMBSTONE_GRACE_SECONDS` (60 s) of the end. An answered one
+  counts for a reply that may have been sent before the answer: a "yes"
+  typed while two questions were open must not go to one of them because
+  the other was answered with its button before the "yes" was read. A
+  tombstone is deleted once no usable reply can have been sent while it
+  counted: 60 s + `LATE_REPLY_SECONDS` (30 s) after the end. A marker
+  whose ask died without closing it is closed by the first reader that
+  finds its lock free, and it ends then. `ask` turns SIGTERM and SIGHUP
+  into a normal exit (128 + signal), so an agent's tool timeout closes
+  the question at once. The wall clock only prunes tombstones nobody
+  holds.
+- A question the server rejected never reached the phone: every attempt
+  was answered with an HTTP 4xx other than 408, or Telegram said
+  `ok: false`. Its marker on that channel is deleted. Nothing else proves
+  that. A 5xx does not: ntfy hands a message to its live subscribers
+  (and Firebase, web push) before it writes its message cache, and
+  answers 500 when that write fails, so every retry put another copy on
+  the phone while agentbell deleted the marker, and a "yes" typed under
+  those copies approved another ask (audit 7, AF-2). A proxy's 502, 504
+  or 52x can come after the server took the request. A 408, a redirect, a
+  timeout or a dropped connection prove nothing either. Such a marker
+  stays with an unknown place.
+- A typed reply is judged against the questions of the moment it was
+  sent, so it must not be read long after that. After a lost connection
+  the ntfy poll reaches back to the start of the ask, and a Telegram bot
+  that was down, restarting or failing getUpdates replays up to a day of
+  chat. A reply read then was judged against later markers: once the
+  other question had ended and its grace passed, a "yes" typed while two
+  questions were open approved the one left (audit 7, AF-1). A reply that
+  names no question is refused when it may be more than
+  `LATE_REPLY_SECONDS` (30 s) old. Its age comes from its server time
+  (ntfy `time`, Telegram `date`, whole seconds) and the one open
+  candidate's question: the ask records the local time just before the
+  send that returned the question's server time (`question_sent_at`,
+  with `question_time` or `question_date`). The server stamped the
+  question after that moment, so `question_sent_at - question_time - 1`
+  is at most the true offset between the two clocks, and
+  `now - (question_sent_at - question_time - 1) - reply_time` is at least
+  the reply's true age. The offset cancels out: a local clock minutes or
+  hours ahead of or behind the server's changes nothing. The bound is
+  high by the question's round trip plus up to 2 s of rounding, which
+  only ever refuses a reply. A reply whose age cannot be bounded (no
+  server time, a question without `question_sent_at`, or a bound below
+  zero, which only a stepped clock produces) is not used. With
+  a reply at most 30 s old and tombstones kept 30 s past their grace,
+  every question that counted when the reply was sent still counts when
+  it is read. Skew between two servers is not an issue: a reply is only
+  used by the ask whose own question, on its own server, is the
+  reference. What the bound cannot see is a clock stepped while the
+  reply was on its way: this machine's clock stepped back (or the
+  server's stepped forward) between the question and the reply shortens
+  the estimate by the step. NTP slews small errors; a large manual step
+  in that window is the one remaining way to misjudge a reply's age.
+  Explicit routes are not affected: a button, a typed `APPROVED <id>`
+  and Telegram's Reply are used however late they arrive.
 - With exactly one candidate, the reply is used when that ask is still
   open and its question is known to be out before the reply: a greater
   Telegram message id, or an ntfy server time that is not earlier
-  (whole seconds, so the same second counts). A reply older than every
-  candidate's question is a replay and stays stale.
+  (whole seconds, so the same second counts), and the reply is at most
+  30 s old (above). A reply older than every candidate's question is a
+  replay and stays stale.
 - In every other case the reply is refused and recorded as
   `stale_answer` with the channel, the reason and whether the notice
   went out. The person who typed it is told: the Telegram bot answers
@@ -1491,8 +1537,8 @@ reply is used only when exactly one question can still be on the phone.
   that has ended is not used. `approve 2` is not an id; it is free text.
 - A marker that cannot be read is read once more after 50 ms (it may be
   caught mid-rewrite). If it still cannot be read it counts as a
-  question of unknown place: while its lock is held, and for 60 s after
-  its last write once nobody holds it; then it is deleted. On ntfy a
+  question of unknown place: while its lock is held, and once nobody
+  holds it as a tombstone that ended at its last write. On ntfy a
   typed reply waits while the one candidate is still publishing its
   question; the publish ends with a time, an unknown place or a deleted
   marker.
@@ -1509,11 +1555,16 @@ that errs on the side of not running the gated command.
 
 **Cost.** Fewer typed replies are accepted. With two asks open, or for
 60 s after an ask ended without an answer on that channel, typed text is
-refused with a notice. A "yes" typed under an ended question more than
-60 s after it ended can reach a later single open ask; so can a
-duplicate "yes" meant for an ask that was already answered on that
-channel. Excluding them is the price of not blocking every reply after
-every ask. A marker needs a filesystem with `flock` (not some network
+refused with a notice. So is a reply that reaches agentbell more than
+30 s after it was sent (after a lost connection, from a bot that was
+down: the backlog is only recorded), a reply typed within about two
+seconds (plus the question's round trip) after another ask was answered
+with its button, and a reply to a question whose publish ended in a 5xx.
+A "yes" typed under an ended question more than 60 s after it ended can
+reach a later single open ask; so can a duplicate "yes" meant for an
+ask that was already answered on that channel more than a few seconds
+before it was typed. Excluding them is the price of not blocking every
+reply after every ask. A marker needs a filesystem with `flock` (not some network
 mounts): where it cannot be locked, `ask` fails with that error, like
 the bot. An ask started by an earlier version holds no lock and counts
 as ended once a new reader sees it; its markers still carry `expires`

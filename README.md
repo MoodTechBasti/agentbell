@@ -20,7 +20,7 @@ It is a command-line tool in a single Python file with no dependencies. The free
 - **Webhook server** (`/notify`, `/ask`) for CI jobs and machines without agentbell installed.
 - **Quiet hours, a retry queue, history and `doctor`**: a push that cannot be sent is queued and retried later, and `doctor` prints the command that fixes a problem.
 
-Status: beta. The Claude Code, Codex and OpenCode hooks have been in daily use since August 2026 (versions 1.6.x), and the Kimi Code hooks on two days. Much of the rest, including most of what changed in 1.7.0, has only been tested by the automated test suite so far. The [status and limits](https://github.com/MoodTechBasti/agentbell#status-and-limits) section lists which parts.
+Status: beta. The Claude Code, Codex and OpenCode hooks have been in daily use since August 2026 (versions 1.6.x), and the Kimi Code hooks on two days. Much of the rest, including everything that changed in 1.7.0, has only been tested by the automated test suite so far. The [status and limits](https://github.com/MoodTechBasti/agentbell#status-and-limits) section lists which parts.
 
 ## Install
 
@@ -158,7 +158,7 @@ Only an explicit yes approves. Free text exits 0 so that an agent can use the an
 
 To type an answer, send a message to `<topic>-responses` in the ntfy app, or write in the Telegram bot chat.
 
-**Which question a reply answers.** A button always answers its own question. So do a typed `APPROVED <id>` / `DENIED <id>` and Telegram's Reply on the question. A typed reply that names no question is used only when exactly one approval question can still be on the phone. A question counts while its `ask` is still waiting (its process holds a lock on the question's marker file). One that ended without an answer on that channel (its timeout ran out, its send timed out, it was killed, or it was answered on the other channel) counts for 60 seconds after it ended. One the server refused never reached the phone and does not count. With two questions that count, or when the only one has already ended, agentbell refuses the reply and does not guess. It sends a notice on the same channel ("Reply not used" on ntfy; the Telegram bot sends at most one per reason a minute) and records `stale_answer` in `history`. Use the buttons, Telegram's Reply or `APPROVED <id>` / `DENIED <id>` in that case.
+**Which question a reply answers.** A button always answers its own question. So do a typed `APPROVED <id>` / `DENIED <id>` and Telegram's Reply on the question. A typed reply that names no question is used only when exactly one approval question can still be on the phone. A question counts while its `ask` is still waiting (its process holds a lock on the question's marker file). One that ended without an answer on that channel (its timeout ran out, its send timed out, it was killed, or it was answered on the other channel) counts for 60 seconds after it ended. One the server rejected (an HTTP 4xx error, or Telegram's `ok: false`) never reached the phone and does not count; after a server error or a timeout it may have, and it counts. What counts is judged at the moment the reply was sent: a reply that reaches agentbell more than 30 seconds after it was sent (after a lost connection, or from a Telegram bot that was down) is refused, and a clock difference between your machine and the server does not change that. With two questions that count, or when the only one has already ended, agentbell refuses the reply and does not guess. It sends a notice on the same channel ("Reply not used" on ntfy; the Telegram bot sends at most one per reason a minute) and records `stale_answer` in `history`. Use the buttons, Telegram's Reply or `APPROVED <id>` / `DENIED <id>` in that case.
 
 ### Gating a script on an approval
 
@@ -310,7 +310,7 @@ The config file is `~/.config/agentbell/config.json`, created with mode 600. `ag
 | Key | Meaning | `config set` |
 |---|---|---|
 | `ntfy.server` | ntfy server URL (default `https://ntfy.sh`) | yes |
-| `ntfy.topic` | your topic: letters, digits, `-` and `_`, at most 54 characters, a warning below 16 | yes |
+| `ntfy.topic` | your topic: letters, digits, `-` and `_`, at most 54 characters (`ask` adds `-responses`, and ntfy allows 64), a warning below 16 | yes |
 | `ntfy.auth` | `user:pass` or a token for a protected server (`none` clears it) | yes |
 | `ntfy.action_auth` | publish-only token that the approval buttons use (see Security) | yes |
 | `channels` | `ntfy`, `os` (desktop notification), `telegram`, comma-separated | yes |
@@ -385,7 +385,7 @@ Start with `agentbell doctor`. It checks the install, PATH, config, server, quie
 | Pushes are waiting | `agentbell queue list`, then `agentbell queue flush`. |
 | An agent never pushes | `agentbell hooks` (for a rule-file agent, run it inside that repo), then `agentbell verify --agent <slug> --since 1h` after one real turn. |
 | No buttons on the question | On a protected ntfy server, set `ntfy.action_auth`. On Telegram, the bot must be running (`agentbell bot status`). |
-| A typed reply was ignored | Another question was open, or one had ended unanswered less than a minute before. Tap the button, use Reply, or send `APPROVED <id>`. `history` shows `stale_answer`. |
+| A typed reply was ignored | Another question was open, one had ended unanswered less than a minute before, or the reply reached agentbell more than 30 seconds after it was sent. Tap the button, use Reply, or send `APPROVED <id>`. `history` shows `stale_answer` with the reason. |
 | Upgraded and something is off | Re-run `agentbell hooks install <agent>` for each wired agent, and `agentbell bot install-service` if you use it. Restart a bot that is still running from the old version. |
 
 When you [open an issue](https://github.com/MoodTechBasti/agentbell/issues/new/choose), include `agentbell --version` and the output of `agentbell verify`, not `doctor`.
@@ -404,10 +404,10 @@ agentbell is in beta. [FIELD_TEST.md](https://github.com/MoodTechBasti/agentbell
 
 **Covered by the automated tests, not yet checked on a real machine:**
 
-- Everything 1.7.0 changed (FIELD_TEST rows 26–45), including:
+- Everything 1.7.0 changed (FIELD_TEST rows 26–46), including:
   - `watch` signal and terminal handling
   - the Claude Code permission-dialog push
-  - refusing typed replies while two questions are open
+  - refusing typed replies while two questions are open, or when they arrive late
   - bot service stop and restart
   - Codex configs with other tables
   - clearing credentials on a server change

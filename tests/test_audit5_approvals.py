@@ -42,6 +42,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 A, B, C, D = "a" * 16, "b" * 16, "c" * 16, "d" * 16
 TWO_OPEN = "2 approval questions are open or just ended"
 GRACE = an.PENDING_TOMBSTONE_GRACE_SECONDS
+# a tombstone is kept this long after its ask ended (audit 7, AF-1)
+KEPT = GRACE + an.LATE_REPLY_SECONDS
 
 
 def _clean_state():
@@ -178,7 +180,8 @@ class TestHeldMarkerIgnoresTheClock(base._TelegramFixture):
         self.assertFalse(an.pending_is_open("tg-pending", D))
         [tombstone] = an.pending_markers("tg-pending")
         self.assertEqual((tombstone["closed"], tombstone["answered"]), (True, False))
-        self.assertLessEqual(tombstone["expires"], time.time() + GRACE)
+        self.assertLessEqual(tombstone["ended"], time.time())
+        self.assertEqual(tombstone["expires"], tombstone["ended"] + KEPT)
         self.assertEqual(_raw("tg-pending", D)["closed"], True)     # written for all
 
 
@@ -266,14 +269,17 @@ class TestEndedAskGrace(unittest.TestCase):
     def test_an_unanswered_tombstone_counts_for_the_grace_not_the_timeout(self):
         an.write_ntfy_pending(A, "Q?", 3600)
         an.close_pending("ntfy-pending", A, answered=False)
-        expires = _raw("ntfy-pending", A)["expires"]
-        self.assertLessEqual(expires, time.time() + GRACE)
-        self.assertGreater(expires, time.time() + GRACE - 10)
+        tombstone = _raw("ntfy-pending", A)
+        self.assertLessEqual(tombstone["ended"], time.time())
+        self.assertGreater(tombstone["ended"], time.time() - 10)
+        self.assertEqual(tombstone["expires"], tombstone["ended"] + KEPT)
 
     def test_a_refused_question_leaves_no_marker(self):
-        """Every copy got HTTP 503: nothing is on the phone, and the retry's
-        typed "yes" is its answer."""
-        self.ntfy.post_503_count = an.RETRY_ATTEMPTS
+        """The server rejected the question (HTTP 400, not retried): nothing
+        is on the phone, and the retry's typed "yes" is its answer. A 5xx
+        proves nothing (audit 7, AF-2)."""
+        self.ntfy.post_fail_status = 400
+        self.ntfy.post_503_count = 1
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(RuntimeError):
                 an.run_ask(self.cfg, "Deploy prod?", timeout_seconds=3600, print_status=False)
@@ -291,7 +297,9 @@ class TestEndedAskGrace(unittest.TestCase):
 
     def test_a_gateway_error_is_no_proof(self):
         exc = an.TransientError("HTTP 504")
-        for code, refused in ((504, False), (502, False), (503, True), (400, True)):
+        for code, refused in ((504, False), (502, False), (503, False), (500, False),
+                              (520, False), (408, False), (302, False),
+                              (400, True), (403, True), (413, True), (429, True)):
             exc.__cause__ = urllib.error.HTTPError("http://x", code, "", {}, io.BytesIO())
             self.addCleanup(exc.__cause__.close)
             self.assertEqual(an._refused(exc), refused, code)
@@ -354,7 +362,8 @@ class TestEndedAskGrace(unittest.TestCase):
         with open(marker, encoding="utf-8") as fh:
             data = json.load(fh)
         self.assertEqual((data["closed"], data["answered"]), (True, False))
-        self.assertLessEqual(data["expires"], time.time() + GRACE)
+        self.assertLessEqual(data["ended"], time.time())
+        self.assertEqual(data["expires"], data["ended"] + KEPT)
 
 
 class TestTelegramRefusal(base._TelegramFixture):

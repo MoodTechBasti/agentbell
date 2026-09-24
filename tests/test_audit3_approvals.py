@@ -169,7 +169,8 @@ class TestNtfyUnplacedQuestions(unittest.TestCase):
     def _waiter(self, approval_id, question_time="unset"):
         an.write_ntfy_pending(approval_id, "Q?", 60)
         if question_time != "unset":
-            an.remember_ntfy_question(approval_id, question_time)
+            # the fake server clock (1000, ...) was read just now
+            an.remember_ntfy_question(approval_id, question_time, time.time())
         return an.ApprovalWaiter(self.cfg, "apr1unit-responses", 60, approval_id=approval_id)
 
     def _got(self, waiter):
@@ -336,11 +337,14 @@ class TestTelegramUnplacedQuestions(base._TelegramFixture):
     def _ask(self, approval_id, question_message_id=None):
         an.write_tg_pending(approval_id, f"{approval_id[:1]}?", 60)
         if question_message_id is not None:
-            an.remember_tg_question_message(approval_id, question_message_id)
+            # sent just now: Telegram's date and the local time before the send
+            an.remember_tg_question_message(approval_id, question_message_id,
+                                            int(time.time()), time.time())
 
     def _reply(self, message_id, text):
         an.handle_bot_update(self.cfg, {"update_id": message_id, "message": {
-            "message_id": message_id, "chat": {"id": 42}, "text": text}})
+            "message_id": message_id, "chat": {"id": 42}, "text": text,
+            "date": int(time.time())}})
 
     def test_reply_while_a_newer_question_is_being_sent_is_not_used(self):
         self._ask(self.A, 1)
@@ -403,7 +407,11 @@ class TestTelegramUnplacedQuestions(base._TelegramFixture):
         self.assertIsNone(an.read_tg_answer(self.B))
         self.assertEqual([(r["approval_id"], r["reason"]) for r in _stale(mark)],
                          [(closed, "verdict for a question that is no longer open")])
-        an.close_pending("tg-pending", self.A, answered=True)
+        # A was answered a while before the next reply was typed (one typed
+        # within about two seconds of that answer may predate it: refused)
+        earlier = time.time() - 10
+        with unittest.mock.patch.object(an.time, "time", lambda: earlier):
+            an.close_pending("tg-pending", self.A, answered=True)
         self._reply(5, "approve 2")                  # no full id: free text for B
         self.assertEqual(an.read_tg_answer(self.B), "approve 2")
 
