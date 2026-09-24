@@ -3,6 +3,15 @@ description: Report a problem with agentbell
 title: "[Bug]: "
 labels: ["bug"]
 body:
+  - type: markdown
+    attributes:
+      value: >
+        This issue is public. Do not paste the output of `agentbell doctor`
+        or `agentbell config show`: they contain your topic name, and topic
+        names are credentials. Anyone who knows yours can read your
+        notifications and answer approvals. Security problems go through
+        private vulnerability reporting (see SECURITY.md), not an issue.
+
   - type: textarea
     id: what-happened
     attributes:
@@ -12,14 +21,30 @@ body:
       required: true
 
   - type: textarea
-    id: doctor-output
+    id: steps
     attributes:
-      label: Output of `agentbell doctor`
+      label: Steps to reproduce
+      description: The commands you ran, in order, if you can reproduce it.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Output of `agentbell --version`
+      placeholder: agentbell 1.x.y
+    validations:
+      required: true
+
+  - type: textarea
+    id: verify-output
+    attributes:
+      label: Output of `agentbell verify`
       description: >
-        Run `agentbell doctor` and paste the output here — but REPLACE your
-        topic names with <redacted> first. Topic names are credentials:
-        anyone who knows them can read your notifications and answer
-        approvals. This issue is public.
+        Run `agentbell verify` (add `--agent <slug>` for the agent involved)
+        and paste the output. `verify` is read-only, sends nothing, and does
+        not print your topic, server or file paths.
       render: shell
     validations:
       required: false
@@ -28,7 +53,7 @@ body:
     id: os
     attributes:
       label: OS
-      description: e.g. macOS 14.5, Ubuntu 22.04, Windows 11 + WSL2
+      description: e.g. macOS 14.5, Ubuntu 22.04, Windows 11, Windows 11 + WSL2
     validations:
       required: true
 
@@ -37,10 +62,11 @@ body:
     attributes:
       label: Install method
       options:
-        - install.sh
-        - pipx
-        - pip
-        - copy
+        - pipx install agentbell (from PyPI)
+        - pip install agentbell (from PyPI)
+        - Git checkout (install.sh, or pip install . from the checkout)
+        - Copied agentbell.py by hand
+        - Other / not sure
     validations:
       required: true
 
@@ -48,6 +74,6 @@ body:
     id: agent
     attributes:
       label: Agent involved
-      description: Which AI coding agent were you using, if any (Claude Code, Codex, Cursor, ...)?
+      description: Which AI coding agent and version were you using, if any (Claude Code, Codex, Cursor, ...)?
     validations:
       required: false

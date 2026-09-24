@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "/home/you/.local/bin/agentbell hook started --agent qwen-code --silent"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "/home/you/.local/bin/agentbell hook run_completed --agent qwen-code --min-duration 60"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "command": "/home/you/.local/bin/agentbell hook run_failed --agent qwen-code"
+          }
+        ]
+      }
+    ]
+  }
+}

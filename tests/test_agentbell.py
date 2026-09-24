@@ -1,6 +1,9 @@
 """Tests for agentbell. Run with: python3 -m unittest discover -s tests -v"""
 
+import atexit
+import base64
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -9,6 +12,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -26,8 +30,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import agentbell as an  # noqa: E402
 
 _TEST_ROOT = tempfile.mkdtemp(prefix="agentbell-tests-")
+
+
+def _remove_tree(path):
+    """Delete a temp tree at exit; say so when part of it stays (a file a
+    process still holds open on Windows) instead of failing silently."""
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        shutil.rmtree(path, ignore_errors=True)
+        sys.stderr.write(f"test_agentbell: could not remove all of {path}: {exc}\n")
+
+
+# Every temp dir a test makes (mkdtemp, NamedTemporaryFile) lands under
+# _TEST_ROOT and goes with it, removed or not by the test itself (WF-3).
+tempfile.tempdir = os.path.join(_TEST_ROOT, "tmp")
+os.makedirs(tempfile.tempdir)
+atexit.register(_remove_tree, _TEST_ROOT)
 os.environ["AGENTBELL_STATE_DIR"] = os.path.join(_TEST_ROOT, "state")
 os.environ["AGENTBELL_CONFIG_DIR"] = os.path.join(_TEST_ROOT, "config")
+os.environ.pop("AGENTBELL_CONFIG", None)
 
 # Many tests fire the same hook push back to back; the identical-push window
 # would turn them into `hook.skipped_duplicate`. Off here, on (patched) in
@@ -38,13 +60,26 @@ an.HOOK_DEDUPE_WINDOW_SECONDS = 0
 HAS_TOMLLIB = sys.version_info >= (3, 11)
 
 
+# Env vars that move a location agentbell (or `python -m site`, `pipx`) reads
+# away from the home dir. Unset, each one falls back to a path under HOME.
+_HOME_OVERRIDES = ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_BIN_HOME",
+                   "KIMI_CODE_HOME", "QWEN_HOME", "PYTHONUSERBASE", "PIPX_HOME",
+                   "PIPX_BIN_DIR")
+
+
 def _set_home(home):
     """Point every home-dir mechanism at `home`. Windows expanduser ignores
-    HOME and reads USERPROFILE, so tests must move both - otherwise they
-    read and write the real profile of the machine running the tests."""
-    old = {key: os.environ.get(key) for key in ("HOME", "USERPROFILE")}
+    HOME and reads USERPROFILE, and Windows paths come from APPDATA, so tests
+    must move all of them - otherwise they read and write the real profile,
+    agent configs and pip --user install of the machine running the tests."""
+    old = {key: os.environ.get(key)
+           for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA") + _HOME_OVERRIDES}
     os.environ["HOME"] = home
     os.environ["USERPROFILE"] = home
+    os.environ["APPDATA"] = os.path.join(home, "AppData", "Roaming")
+    os.environ["LOCALAPPDATA"] = os.path.join(home, "AppData", "Local")
+    for key in _HOME_OVERRIDES:
+        os.environ.pop(key, None)
     return old
 
 
@@ -54,6 +89,12 @@ def _restore_home(old):
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+
+
+# The whole suite runs in a temp home; a test's own _set_home() moves it
+# further and _restore_home() comes back here, never to the real one.
+os.makedirs(os.path.join(_TEST_ROOT, "home"))
+_set_home(os.path.join(_TEST_ROOT, "home"))
 
 
 def _fake_launcher(tmpdir, name="agentbell"):
@@ -105,6 +146,8 @@ class MockNtfy:
         self.subscribers = {}    # topic -> list of queue.Queue
         self.stream_enabled = stream_enabled
         self.post_503_count = post_503_count  # transient failures on the first N POSTs
+        self.post_fail_status = 503           # ...answered with this status
+        self.get_503_count = 0                # transient failures on the next N polls
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.server.server_address[1]
         self.url = f"http://127.0.0.1:{self.port}"
@@ -124,7 +167,7 @@ class MockNtfy:
                 body = self.rfile.read(length).decode("utf-8")
                 if server.post_503_count > 0:
                     server.post_503_count -= 1
-                    self.send_response(503)
+                    self.send_response(server.post_fail_status)
                     self.send_header("Content-Type", "text/plain")
                     self.end_headers()
                     self.wfile.write(b"temporarily unavailable")
@@ -142,10 +185,13 @@ class MockNtfy:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(b'{"id":"x","time":1,"event":"message"}')
+                # the server's clock in whole seconds, like real ntfy
+                self.wfile.write(json.dumps({"id": record["id"], "time": int(record["ts"]),
+                                             "event": "message"}).encode())
 
             def _write(self, record):
-                line = json.dumps({"event": "message", "id": record["id"], "message": record["body"]})
+                line = json.dumps({"event": "message", "id": record["id"],
+                                   "time": int(record["ts"]), "message": record["body"]})
                 self.wfile.write((line + "\n").encode())
                 self.wfile.flush()
 
@@ -166,6 +212,13 @@ class MockNtfy:
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(b'{"code":40008,"error":"invalid since"}')
+                    return
+                if params.get("poll") == "1" and server.get_503_count > 0:
+                    server.get_503_count -= 1
+                    self.send_response(503)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"temporarily unavailable")
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-ndjson")
@@ -217,6 +270,12 @@ class MockNtfy:
     def stop(self):
         self.server.shutdown()
         self.server.server_close()
+
+
+def _remove_pending(name, approval_id):
+    """Drop an ask's marker outright; an ended ask leaves a tombstone."""
+    with contextlib.suppress(OSError):
+        os.remove(an._pending_path(name, approval_id))
 
 
 def make_config(server_url, topic="testtopic"):
@@ -285,6 +344,23 @@ class TestPriorityAndQuietHours(unittest.TestCase):
         self.assertFalse(an.suppressed_by_quiet_hours(cfg, 3, force=False))
         self.assertFalse(an.suppressed_by_quiet_hours(cfg, 2, force=True))
 
+    def test_quiet_hours_include_the_last_minute_of_the_day(self):
+        """00:00-23:59 used to go quiet at 23:58. 24:00 cannot be written."""
+        window = [{"start": "00:00", "end": "23:59"}]
+        late = an.datetime.datetime(2026, 8, 14, 23, 59)
+        self.assertTrue(an.in_quiet_hours(window, late))
+        end = an.next_quiet_end(window, late)
+        end_dt = an.datetime.datetime.fromtimestamp(end)
+        self.assertEqual((end_dt.day, end_dt.hour, end_dt.minute), (15, 0, 0))
+        # an ordinary end minute stays exclusive
+        daytime = [{"start": "13:00", "end": "14:00"}]
+        at_end = an.datetime.datetime(2026, 8, 14, 14, 0)
+        self.assertFalse(an.in_quiet_hours(daytime, at_end))
+        evening = [{"start": "22:00", "end": "23:59"}]
+        self.assertTrue(an.in_quiet_hours(evening, late))
+        self.assertFalse(an.in_quiet_hours(
+            evening, an.datetime.datetime(2026, 8, 15, 0, 0)))
+
     def test_invalid_window_ignored(self):
         self.assertFalse(an.in_quiet_hours([{"start": "99:00", "end": "10:00"}]))
         self.assertFalse(an.in_quiet_hours([]))
@@ -295,11 +371,77 @@ class TestAnswerParsing(unittest.TestCase):
         self.assertEqual(an._parse_answer("APPROVED abc123")[0], "approved")
         self.assertEqual(an._parse_answer("approve")[0], "approved")
         self.assertEqual(an._parse_answer("YES")[0], "approved")
+        self.assertEqual(an._parse_answer("Ja")[0], "approved")
         self.assertEqual(an._parse_answer("DENIED abc123")[0], "denied")
         self.assertEqual(an._parse_answer("no")[0], "denied")
         self.assertEqual(an._parse_answer("Deploy only staging first")[0], "answer")
         self.assertEqual(an._parse_answer("Deploy only staging first")[1], "Deploy only staging first")
         self.assertEqual(an._parse_answer("")[0], "denied")
+
+    def test_negations_and_the_no_button_label_do_not_approve(self):
+        """Typing the suggested deny label, or an obvious no, is a denial.
+
+        Free text that is not a negation stays an answer: "staging" is the
+        documented exit-0 reply, not a failed approval.
+        """
+        cases = (
+            "Abort", "abort the migration", "Nein", "Nein, warte", "not yet",
+            "don't", "don't deploy", "don’t", "do not ship", "never", "nah",
+            "👎", "👎🏻", "👎 later",
+            "Stopp", "Stopp sofort", "noch nicht", "nö", "nee", "abbrechen",
+            "not now", "Not", "please don't", "absolutely not", "wait",
+            "warte", "❌", "🛑", "🚫",
+            "nicht jetzt", "Nicht jetzt", "Nicht", "halt", "halt, tests are red",
+            "hold on", "later", "later tonight", "bloß nicht", "bloss nicht",
+            "Moment", "moment", "✋", "✋🏻", "⛔",
+        )
+        for text in cases:
+            self.assertEqual(an._parse_answer(text)[0], "denied", text)
+        kind, reason = an._parse_answer("Abort, tests are red", no_label="Abort")
+        self.assertEqual(kind, "denied")
+        self.assertEqual(reason, "tests are red")
+        self.assertEqual(an._parse_answer("Hold", no_label="Hold")[0], "denied")
+        # not a built-in negation, and not the button label: still an answer
+        self.assertEqual(an._parse_answer("Hold")[0], "answer")
+        self.assertEqual(an._parse_answer("note the file")[0], "answer")
+        self.assertEqual(an._parse_answer("nevertheless, ship it")[0], "answer")
+        self.assertEqual(an._parse_answer("do nothing yet")[0], "answer")
+        self.assertEqual(an._parse_answer("yesterday")[0], "answer")
+        self.assertEqual(an._parse_answer("use the staging cluster")[0], "answer")
+        # a longer instruction is not the standalone refusal "not" / "nicht";
+        # "wait" is a postponement, so "wait for CI, then ship" must not let
+        # `ask && deploy` ship now
+        self.assertEqual(an._parse_answer("wait for CI, then ship")[0], "denied")
+        self.assertEqual(an._parse_answer("not staging — use prod")[0], "answer")
+        self.assertEqual(an._parse_answer("nicht staging — use prod")[0], "answer")
+        # "halt" denies; a longer word that merely starts with it does not
+        self.assertEqual(an._parse_answer("halting problem, ship it")[0], "answer")
+        self.assertEqual(an._parse_answer("hold onto the release")[0], "answer")
+        self.assertEqual(an._parse_answer("latest is fine")[0], "answer")
+        self.assertEqual(an._parse_answer("momentum is fine")[0], "answer")
+        # a label must not be interpreted as a regular expression
+        self.assertEqual(an._parse_answer("a.b", no_label="a.b")[0], "denied")
+        self.assertEqual(an._parse_answer("ab", no_label="a.b")[0], "answer")
+
+    def test_yes_button_label_approves_only_when_it_stands_alone(self):
+        self.assertEqual(an._parse_answer("Ship it", yes_label="Ship it")[0], "approved")
+        self.assertEqual(an._parse_answer("Ship it!", yes_label="Ship it")[0], "approved")
+        self.assertEqual(
+            an._parse_answer("Ship it, but canary first", yes_label="Ship it")[0],
+            "answer")
+        self.assertEqual(an._parse_answer("👍🏻")[0], "approved")
+        # the hint says to reply with the yes label. "Stop it" is that label
+        # here, so it must not lose to the leading denial "stop".
+        self.assertEqual(an._parse_answer("Stop it")[0], "denied")
+        self.assertEqual(
+            an._parse_answer("Stop it", yes_label="Stop it", no_label="Keep")[0],
+            "approved")
+        self.assertEqual(
+            an._parse_answer("Keep", yes_label="Stop it", no_label="Keep")[0],
+            "denied")
+        self.assertEqual(
+            an._parse_answer("Stop it now", yes_label="Stop it", no_label="Keep")[0],
+            "denied")
 
 
 class TestNotify(unittest.TestCase):
@@ -339,6 +481,159 @@ class TestNotify(unittest.TestCase):
         self.assertTrue(any(r["event"] == "notify" and r["message"] == "x" for r in records))
 
 
+class _EmptyBody:
+    """A response whose body cannot be read. urllib does not wrap that read."""
+
+    status = 200
+
+    def __init__(self, error):
+        self.error = error
+
+    def read(self):
+        raise self.error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class TestConnectionDrops(unittest.TestCase):
+    """A reset or a short read is a transient delivery failure, not a crash.
+
+    urllib wraps some socket errors in URLError and leaves others
+    (RemoteDisconnected from getresponse, IncompleteRead from read) raw.
+    Those used to skip the retry, the offline queue, and the catches in
+    ask, watch, the bot and doctor.
+    """
+
+    def _url(self):
+        return "http://example.test/topic"
+
+    def test_reset_and_short_read_are_transient(self):
+        cases = (
+            http.client.RemoteDisconnected("closed"),
+            ConnectionResetError("reset"),
+            http.client.IncompleteRead(b"partial"),
+        )
+        for error in cases:
+            with self.subTest(error=type(error).__name__):
+                with unittest.mock.patch.object(
+                        an.OPENER, "open", side_effect=error):
+                    with self.assertRaises(an.TransientError) as caught:
+                        an.http_request(self._url(), "POST", body="hi")
+                self.assertIn(type(error).__name__, str(caught.exception))
+            with self.subTest(error=type(error).__name__ + "-body"):
+                with unittest.mock.patch.object(
+                        an.OPENER, "open", return_value=_EmptyBody(error)):
+                    with self.assertRaises(an.TransientError) as caught:
+                        an.http_request(self._url())
+                self.assertIn("dropped while reading", str(caught.exception))
+
+    def test_a_lost_error_body_keeps_the_status_class(self):
+        def error(code):
+            err = urllib.error.HTTPError(
+                self._url(), code, "x", http.client.HTTPMessage(), io.BytesIO(b""))
+
+            def boom(*args, **kwargs):
+                raise http.client.IncompleteRead(b"")
+
+            err.read = boom
+            return err
+
+        with unittest.mock.patch.object(an.OPENER, "open", side_effect=error(503)):
+            with self.assertRaises(an.TransientError) as caught:
+                an.http_request(self._url())
+        self.assertIn("HTTP 503", str(caught.exception))
+        with unittest.mock.patch.object(an.OPENER, "open", side_effect=error(404)):
+            with self.assertRaises(an.PermanentError) as caught:
+                an.http_request(self._url())
+        self.assertIn("HTTP 404", str(caught.exception))
+
+    def test_subscribe_reports_a_reset_as_a_runtime_error(self):
+        cfg = make_config("http://example.test")
+        with unittest.mock.patch.object(
+                an.OPENER, "open",
+                side_effect=http.client.RemoteDisconnected("closed")):
+            with self.assertRaises(RuntimeError) as caught:
+                an.NtfyChannel(cfg).subscribe("topic", since="90s")
+        self.assertNotIsInstance(caught.exception, http.client.RemoteDisconnected)
+        self.assertIn("cannot subscribe", str(caught.exception))
+
+    def test_a_dropped_publish_is_queued(self):
+        cfg = make_config("http://example.test")
+        old = an.RETRY_BACKOFF_SECONDS
+        an.RETRY_BACKOFF_SECONDS = (0, 0)
+        try:
+            with unittest.mock.patch.object(
+                    an.OPENER, "open",
+                    side_effect=http.client.RemoteDisconnected("closed")):
+                result = an.send_notification(cfg, "hello", timeout=1, event="notify")
+        finally:
+            an.RETRY_BACKOFF_SECONDS = old
+            shutil.rmtree(an.queue_dir(), ignore_errors=True)
+        self.assertFalse(result["ok"] is False and not result.get("queued"))
+        self.assertEqual(result.get("queued"), ["ntfy"])
+        self.assertTrue(any(
+            record.get("event") == "queued" and record.get("message") == "hello"
+            for record in an.read_history()))
+
+    def test_watch_keeps_the_command_exit_when_the_push_is_reset(self):
+        cfg = make_config("http://example.test")
+        old = an.RETRY_BACKOFF_SECONDS
+        an.RETRY_BACKOFF_SECONDS = (0, 0)
+        try:
+            with unittest.mock.patch.object(
+                    an.OPENER, "open",
+                    side_effect=ConnectionResetError("reset")):
+                result = an.run_watch(
+                    cfg, [sys.executable, "-c", "import sys; raise SystemExit(7)"])
+        finally:
+            an.RETRY_BACKOFF_SECONDS = old
+            shutil.rmtree(an.queue_dir(), ignore_errors=True)
+        self.assertEqual(result["exit_code"], 7)
+        self.assertEqual(result["notification"]["queued"], ["ntfy"])
+
+    def test_doctor_reports_a_reset_instead_of_crashing(self):
+        cfg = make_config("http://example.test")
+        with unittest.mock.patch.object(
+                an.OPENER, "open",
+                side_effect=http.client.IncompleteRead(b"")):
+            checks = an.doctor_checks(cfg)
+        server = next(check for check in checks if check["name"] == "ntfy server")
+        self.assertEqual(server["status"], an.FAIL)
+        self.assertIn("unreachable", server["detail"])
+
+    def test_stream_reader_reconnects_after_a_short_read(self):
+        cfg = make_config("http://127.0.0.1:9", topic="streamdrop")
+        waiter = an.ApprovalWaiter(
+            cfg, "streamdrop-responses", 5, poll_interval=30, approval_id="ab" * 8)
+        calls = {"n": 0}
+
+        class Short:
+            def __iter__(self):
+                raise http.client.IncompleteRead(b"")
+
+            def close(self):
+                pass
+
+        def subscribe(self, topic, since=None, timeout=30.0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return Short()
+            waiter.stop_event.set()
+            raise RuntimeError("stop")
+
+        with unittest.mock.patch.object(an.NtfyChannel, "subscribe", subscribe):
+            thread = threading.Thread(target=waiter._reader, daemon=True)
+            thread.start()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertGreaterEqual(calls["n"], 2)
+        self.assertTrue(any("stop" in error for error in waiter.errors))
+
+
 class TestApprovalFlow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -347,6 +642,11 @@ class TestApprovalFlow(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.ntfy.stop()
+
+    def setUp(self):
+        # an ask that ended unanswered leaves a tombstone that refuses typed
+        # replies for a while; every test starts without one
+        shutil.rmtree(os.path.join(an.state_dir(), "ntfy-pending"), ignore_errors=True)
 
     def _run_ask_async(self, cfg, **kwargs):
         holder = {}
@@ -408,7 +708,7 @@ class TestApprovalFlow(unittest.TestCase):
         deadline = time.monotonic() + 5
         while not self.ntfy.posts.get("approvals3") and time.monotonic() < deadline:
             time.sleep(0.05)
-        headers, body = self.ntfy.posts["approvals3"][-1]["headers"], self.ntfy.posts["approvals3"][-1]["body"]
+        headers = self.ntfy.posts["approvals3"][-1]["headers"]
         self.assertNotIn("Actions", headers)
         urllib.request.urlopen(
             urllib.request.Request(
@@ -419,8 +719,110 @@ class TestApprovalFlow(unittest.TestCase):
         thread.join(timeout=10)
         self.assertFalse(thread.is_alive())
         outcome = holder["result"]
-        self.assertTrue(outcome["approved"])
+        # exit 0 is cmd_ask's job (denied and timeout are both false). The
+        # boolean is not a yes: a gate that only reads `approved` must not
+        # treat the environment name as permission.
+        self.assertFalse(outcome["approved"])
+        self.assertFalse(outcome["denied"])
+        self.assertFalse(outcome["timeout"])
         self.assertEqual(outcome["answer"], "staging")
+
+    def test_typing_the_no_button_label_denies(self):
+        """The hint tells the user to reply with the no button's label.
+
+        That reply used to come back approved, including from ask_approval,
+        which returns this same result.
+        """
+        cfg = make_config(self.ntfy.url, topic="approvals-label")
+        holder, thread = self._run_ask_async(
+            cfg, message="Deploy?", timeout_seconds=20, print_status=False,
+            no_label="Abort")
+        deadline = time.monotonic() + 5
+        while not self.ntfy.posts.get("approvals-label") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"{self.ntfy.url}/approvals-label-responses", method="POST",
+                data="Abort".encode(),
+            )
+        ).read()
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        outcome = holder["result"]
+        self.assertTrue(outcome["denied"])
+        self.assertFalse(outcome["approved"])
+
+    def test_old_yes_after_a_prime_blip_does_not_approve(self):
+        """One failed listing of the response topic must not drop the guard.
+
+        A "yes" already on the topic is the previous question's answer.
+        """
+        topic = "primeblip"
+        self.ntfy.inject(f"{topic}-responses", "yes", "old-yes-id")
+        self.ntfy.get_503_count = 1
+        cfg = make_config(self.ntfy.url, topic=topic)
+        original = an.ApprovalWaiter.__init__
+
+        def fast(self, *args, **kwargs):
+            kwargs["poll_interval"] = 0.3
+            original(self, *args, **kwargs)
+
+        an.ApprovalWaiter.__init__ = fast
+        try:
+            holder, thread = self._run_ask_async(
+                cfg, message="Deploy?", timeout_seconds=8, print_status=False)
+            time.sleep(2.0)
+            self.assertTrue(thread.is_alive(), holder.get("result"))
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{self.ntfy.url}/{topic}-responses", method="POST",
+                    data=b"no",
+                )
+            ).read()
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(holder["result"]["denied"])
+            self.assertFalse(holder["result"]["approved"])
+        finally:
+            an.ApprovalWaiter.__init__ = original
+            self.ntfy.get_503_count = 0
+
+    def test_unreadable_response_topic_refuses_to_wait(self):
+        topic = "primefail"
+        self.ntfy.inject(f"{topic}-responses", "yes", "stale-yes")
+        self.ntfy.get_503_count = 10
+        cfg = make_config(self.ntfy.url, topic=topic)
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                an.run_ask(cfg, "Deploy?", timeout_seconds=5, print_status=False)
+            self.assertIn("not waiting", str(caught.exception))
+        finally:
+            self.ntfy.get_503_count = 0
+
+    def test_prime_retries_a_blip_and_ignores_the_old_id(self):
+        cfg = make_config("http://127.0.0.1:9", topic="primeretry")
+        waiter = an.ApprovalWaiter(
+            cfg, "primeretry-responses", 5, poll_interval=30, approval_id="ab" * 8)
+        calls = {"n": 0}
+
+        def flaky(self, topic, since, timeout=10.0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise an.TransientError("blip")
+            return [{"id": "old-yes", "event": "message", "message": "yes"}]
+
+        with unittest.mock.patch.object(an.NtfyChannel, "poll", flaky), \
+             unittest.mock.patch.object(
+                 an.NtfyChannel, "subscribe", side_effect=RuntimeError("no stream")):
+            waiter.start()
+            waiter.stop_event.set()
+            for thread in waiter._threads:
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+        self.assertGreaterEqual(calls["n"], 2)
+        self.assertIn("old-yes", waiter.seen)
+        waiter._offer("old-yes", "yes")
+        self.assertTrue(waiter.messages.empty())
 
     def test_timeout(self):
         cfg = make_config(self.ntfy.url, topic="approvals4")
@@ -467,12 +869,35 @@ class TestHooks(unittest.TestCase):
         self.assertIn("Notification", data["hooks"])
         stop_hooks = [h for g in data["hooks"]["Stop"] for h in g["hooks"]]
         # shape-independent: on Windows the binary is quoted ('C:\...\agentbell')
-        self.assertTrue(any(an._contains_our_hook(h)
+        self.assertTrue(any(an._is_our_hook_command(h["command"])
                             and "hook run_completed --agent claude" in h["command"]
                             for h in stop_hooks), stop_hooks)
         # idempotent
         result2 = an.install_hooks("claude")
         self.assertFalse(result2["changed"])
+
+    def test_http_hook_with_headers_does_not_crash_install(self):
+        """An HTTP hook stores headers as an object. That used to be unhashable
+        and hooks install died before writing anything.
+        """
+        path = self._settings("claude")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                "type": "http",
+                "url": "https://example.test/hook",
+                "headers": {"Authorization": "Bearer keep-me"},
+                "args": ["one", "two"],
+            }]}]}}, fh)
+        result = an.install_hooks("claude")
+        self.assertTrue(result["changed"])
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        kept = data["hooks"]["PreToolUse"][0]["hooks"][0]
+        self.assertEqual(kept["headers"]["Authorization"], "Bearer keep-me")
+        self.assertEqual(kept["args"], ["one", "two"])
+        self.assertIn("Stop", data["hooks"])
+        self.assertFalse(an.install_hooks("claude")["changed"])
 
     def test_claude_uninstall(self):
         an.install_hooks("claude")
@@ -551,7 +976,7 @@ class TestHooks(unittest.TestCase):
             data = json.load(fh)
         self.assertIn("AfterAgent", data["hooks"])
         hook = data["hooks"]["AfterAgent"][0]["hooks"][0]
-        self.assertTrue(an._contains_our_hook(hook), hook)
+        self.assertTrue(an._is_our_hook_command(hook["command"]), hook)
         self.assertIn("hook run_completed --agent gemini", hook["command"])
         an.install_hooks("gemini", add=False)
         with open(path) as fh:
@@ -577,6 +1002,137 @@ class TestHooks(unittest.TestCase):
             text = fh.read()
         self.assertNotIn("features.hooks = true", text)
         self.assertNotIn(an.TOML_START, text)
+
+    def test_codex_keeps_host_tables_written_inside_the_block(self):
+        """Codex writes its own tables between the agentbell markers.
+
+        Reinstall and uninstall must move those tables out, not delete them.
+        A hook the user added in the same region stays too.
+        """
+        path = an.codex_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        foreign = (
+            "[hooks.state]\n"
+            'trust = "agent-ops-hash"\n'
+            "\n"
+            "[tui]\n"
+            'theme = "dark"\n'
+            "\n"
+            "[plugins.example]\n"
+            "enabled = true\n"
+            "\n"
+            "[[hooks.Stop]]\n"
+            "[[hooks.Stop.hooks]]\n"
+            'type = "command"\n'
+            'command = "lint.sh"\n'
+        )
+        block = an.codex_hooks_block()
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('model = "gpt-5"\n' + block.replace(
+                an.TOML_END, "\n" + foreign + an.TOML_END, 1))
+        os.chmod(path, 0o600)
+        result = an.install_codex_hooks()
+        self.assertTrue(result["changed"])
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertLess(text.index(an.TOML_END), text.index("[hooks.state]"))
+        self.assertLess(text.index(an.TOML_END), text.index("[tui]"))
+        self.assertLess(text.index(an.TOML_END), text.index("[plugins.example]"))
+        self.assertIn('trust = "agent-ops-hash"', text)
+        self.assertIn('theme = "dark"', text)
+        self.assertIn("enabled = true", text)
+        self.assertIn('command = "lint.sh"', text)
+        self.assertIn('model = "gpt-5"', text)
+        self.assertIn("hook run_completed --agent codex", text)
+        if os.name != "nt":
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        again = an.install_codex_hooks()
+        self.assertFalse(again["changed"])
+        an.uninstall_codex_hooks()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertNotIn(an.TOML_START, text)
+        self.assertNotIn("hook run_completed --agent codex", text)
+        self.assertIn('trust = "agent-ops-hash"', text)
+        self.assertIn('theme = "dark"', text)
+        self.assertIn("[plugins.example]", text)
+        self.assertIn('command = "lint.sh"', text)
+        self.assertIn('model = "gpt-5"', text)
+        if os.name != "nt":
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_codex_flag_is_its_own_line_without_a_trailing_newline(self):
+        path = an.codex_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('model = "gpt-5"')
+        an.install_codex_hooks()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn('model = "gpt-5"\n', text)
+        self.assertNotIn('"gpt-5"features.hooks', text)
+        self.assertIn("\nfeatures.hooks = true", text)
+        an.uninstall_codex_hooks()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertNotIn("features.hooks", text)
+        self.assertIn('model = "gpt-5"', text)
+        # a flag already glued to the last line is removed, not left behind
+        glued = ('model = "gpt-5"features.hooks = true  ' + an.CODEX_FLAG_MARKER
+                 + "\n" + an.TOML_START + "\n" + an.TOML_END + "\n")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(glued)
+        an.uninstall_codex_hooks()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertNotIn("features.hooks", text)
+        self.assertEqual(text.strip(), 'model = "gpt-5"')
+
+    def test_codex_uninstall_without_an_end_marker_leaves_the_file(self):
+        path = an.codex_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        original = 'model = "gpt-5"\n' + an.TOML_START + "\n[[hooks.Stop]]\n"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        self.assertFalse(an.uninstall_codex_hooks())
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), original)
+
+    def test_user_hook_attached_to_our_stop_group_stays_an_array(self):
+        """A second [[hooks.Stop.hooks]] under our Stop element must keep its parent.
+
+        Uninstall used to delete [[hooks.Stop]] because the next chunk was
+        our own hook, and the user's later hook was left with no parent.
+        TOML then reads hooks.Stop as a table instead of an array.
+        """
+        path = an.codex_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        an.install_codex_hooks()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        extra = "[[hooks.Stop.hooks]]\n" 'command = "lint.sh"\n'
+        self.assertIn(an.TOML_END, text)
+        text = text.replace(an.TOML_END, extra + an.TOML_END, 1)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        self.assertTrue(an.uninstall_codex_hooks())
+        with open(path, encoding="utf-8") as fh:
+            result = fh.read()
+        self.assertNotIn("hook run_completed --agent codex", result)
+        self.assertIn('command = "lint.sh"', result)
+        lint_at = result.index("lint.sh")
+        parent_at = result.rindex("[[hooks.Stop]]", 0, lint_at)
+        self.assertLess(parent_at, lint_at)
+        if HAS_TOMLLIB:
+            import tomllib
+            data = tomllib.loads(result)
+            self.assertIsInstance(data["hooks"]["Stop"], list)
+            commands = [
+                hook.get("command")
+                for group in data["hooks"]["Stop"]
+                for hook in group.get("hooks", [])
+            ]
+            self.assertEqual(commands, ["lint.sh"])
 
     def test_codex_existing_features_table(self):
         path = an.codex_config_path()
@@ -753,6 +1309,169 @@ class TestHooks(unittest.TestCase):
         self.assertEqual(data["models"]["model"], "kimi-k3")
         self.assertNotIn("hooks", data)
 
+    def test_kimi_install_does_not_duplicate_hooks_without_markers(self):
+        """Kimi has removed the marker comments while leaving the hooks live.
+
+        A second install must not append another copy, and status must not
+        report the hooks as missing — that is the advice that duplicates them.
+        Uninstall still removes those commands: the command string is exactly
+        ours, which is not a guess.
+        """
+        path = an.kimi_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        an.install_kimi_hooks()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        stripped = text.replace(an.TOML_START + "\n", "").replace(an.TOML_END + "\n", "")
+        self.assertNotIn(an.TOML_START, stripped)
+        self.assertIn("hook started --agent kimi", stripped)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(stripped)
+        self.assertTrue(an.AGENT_SPECS["kimi"]["status"](None))
+        result = an.install_kimi_hooks()
+        self.assertFalse(result["changed"])
+        self.assertTrue(any("markers are gone" in note for note in result["notes"]))
+        with open(path, encoding="utf-8") as fh:
+            again = fh.read()
+        self.assertEqual(again.count("hook started --agent kimi"), 1)
+        self.assertEqual(again.count("hook run_completed --agent kimi"), 1)
+        self.assertEqual(again.count("hook run_failed --agent kimi"), 1)
+        removed = an.uninstall_kimi_hooks()
+        self.assertTrue(removed["changed"])
+        self.assertTrue(any("markers were already gone" in note for note in removed["notes"]))
+        with open(path, encoding="utf-8") as fh:
+            cleared = fh.read()
+        self.assertNotIn("hook started --agent kimi", cleared)
+        self.assertNotIn("hook run_completed --agent kimi", cleared)
+        self.assertNotIn("hook run_failed --agent kimi", cleared)
+
+    def test_kimi_keeps_a_foreign_table_inside_the_markers(self):
+        path = an.kimi_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        block = an.kimi_hooks_block()
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(block.replace(
+                an.TOML_END, '\n[model]\nname = "k2"\n' + an.TOML_END, 1))
+        os.chmod(path, 0o600)
+        result = an.install_kimi_hooks()
+        self.assertTrue(result["changed"])
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertLess(text.index(an.TOML_END), text.index("[model]"))
+        self.assertIn('name = "k2"', text)
+        self.assertIn("hook started --agent kimi", text)
+        if os.name != "nt":
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertFalse(an.install_kimi_hooks()["changed"])
+        self.assertTrue(an.uninstall_kimi_hooks()["changed"])
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn('name = "k2"', text)
+        self.assertNotIn("hook started --agent kimi", text)
+        if os.name != "nt":
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_kimi_uninstall_without_markers_removes_only_our_hooks(self):
+        """Kimi strips the marker comments. Uninstall must still delete the
+        three hook tables whose command is ours, and must keep a user's own
+        [[hooks]] table plus the rest of the file. The removal plan used to
+        say the hooks were already gone while Kimi kept calling them.
+        """
+        path = an.kimi_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        an.install_kimi_hooks()
+        with open(path, encoding="utf-8") as fh:
+            stripped = (fh.read()
+                        .replace(an.TOML_START + "\n", "")
+                        .replace(an.TOML_END + "\n", ""))
+        user = '[[hooks]]\nevent = "Stop"\ncommand = "echo mine"\n'
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('[model]\nname = "k2"\n\n' + stripped + "\n" + user)
+        self.assertTrue(an.AGENT_SPECS["kimi"]["status"](None))
+        entries = [entry for entry in an._agent_hook_entries()
+                   if entry["label"].startswith("kimi ")]
+        self.assertEqual(len(entries), 1)
+        self.assertIn("remove the agentbell hooks", entries[0]["action"])
+        self.assertTrue(entries[0]["apply"]())
+        with open(path, encoding="utf-8") as fh:
+            left = fh.read()
+        self.assertNotIn("hook started --agent kimi", left)
+        self.assertNotIn("hook run_completed --agent kimi", left)
+        self.assertNotIn("hook run_failed --agent kimi", left)
+        self.assertIn('command = "echo mine"', left)
+        self.assertIn('name = "k2"', left)
+        self.assertFalse(an.AGENT_SPECS["kimi"]["status"](None))
+        self.assertFalse(an.install_hooks("kimi", add=False)["changed"])
+
+    def test_kimi_uninstall_without_markers_leaves_a_wrapper_and_says_so(self):
+        path = an.kimi_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        wrapped = "bash -c 'agentbell hook run_completed --agent kimi'"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('[[hooks]]\nevent = "Stop"\ncommand = '
+                     + an.toml_string(wrapped) + "\n")
+        self.assertTrue(an.AGENT_SPECS["kimi"]["status"](None))
+        result = an.install_hooks("kimi", add=False)
+        self.assertFalse(result["changed"])
+        self.assertTrue(any("left in place" in note for note in result["notes"]))
+        with open(path, encoding="utf-8") as fh:
+            self.assertIn("bash -c", fh.read())
+        self.assertTrue(an.AGENT_SPECS["kimi"]["status"](None))
+
+    @unittest.skipIf(os.name == "nt", "os.symlink requires admin or developer mode on Windows")
+    def test_kimi_uninstall_updates_a_symlinked_config(self):
+        path = an.kimi_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        real = os.path.join(self.tmp, "dotfiles-kimi.toml")
+        with open(real, "w", encoding="utf-8") as fh:
+            fh.write('[model]\nname = "k2"\n' + an.kimi_hooks_block())
+        os.chmod(real, 0o600)
+        os.symlink(real, path)
+        removed = an.uninstall_kimi_hooks()
+        self.assertTrue(removed["changed"])
+        self.assertTrue(os.path.islink(path))
+        self.assertEqual(os.path.realpath(path), os.path.realpath(real))
+        with open(real, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn('name = "k2"', text)
+        self.assertNotIn("hook started --agent kimi", text)
+        self.assertFalse(os.path.islink(real))
+        self.assertEqual(os.stat(real).st_mode & 0o777, 0o600)
+
+    def test_quoted_hash_in_a_toml_header_is_not_a_comment(self):
+        self.assertEqual(
+            an._toml_header_key('[projects."/home/u/C#/app"]'),
+            '[projects."/home/u/C#/app"]')
+        self.assertEqual(
+            an._toml_header_key("[projects.'/home/u/C#/app']"),
+            "[projects.'/home/u/C#/app']")
+        self.assertEqual(
+            an._toml_header_key('[projects."/home/u/C#/app"] # note'),
+            '[projects."/home/u/C#/app"]')
+        self.assertEqual(an._toml_header_key("[hooks.state] # note"), "[hooks.state]")
+        self.assertEqual(an._toml_header_key("# [not a header]"), "")
+
+    def test_codex_keeps_a_table_whose_key_contains_a_hash(self):
+        path = an.codex_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        foreign = '[projects."/home/u/C#/app"]\nroot = "/home/u/C#/app"\n'
+        block = an.codex_hooks_block()
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('model = "gpt-5"\n' + block.replace(
+                an.TOML_END, "\n" + foreign + an.TOML_END, 1))
+        an.install_codex_hooks()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn('[projects."/home/u/C#/app"]', text)
+        self.assertIn('root = "/home/u/C#/app"', text)
+        self.assertLess(text.index(an.TOML_END), text.index('[projects."/home/u/C#/app"]'))
+        an.uninstall_codex_hooks()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn('[projects."/home/u/C#/app"]', text)
+        self.assertIn('root = "/home/u/C#/app"', text)
+        self.assertNotIn("hook run_completed --agent codex", text)
+
     def test_qwen_install_uninstall(self):
         path = an.qwen_settings_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -770,7 +1489,7 @@ class TestHooks(unittest.TestCase):
                 for hook in group["hooks"]:
                     self.assertTrue(hook.get("async"), f"{event} hook must be async")
         stop_hooks = [h for g in data["hooks"]["Stop"] for h in g["hooks"]]
-        self.assertTrue(any(an._contains_our_hook(h)
+        self.assertTrue(any(an._is_our_hook_command(h["command"])
                             and "hook run_completed --agent qwen-code" in h["command"]
                             for h in stop_hooks), stop_hooks)
         self.assertFalse(an.install_hooks("qwen-code")["changed"])
@@ -1288,7 +2007,7 @@ class TestApprovalPollFallback(unittest.TestCase):
                 time.sleep(0.05)
             urllib.request.urlopen(
                 urllib.request.Request(
-                    f"{mock.url}/pollonly-responses", method="POST", data=b"APPROVED via poll"
+                    f"{mock.url}/pollonly-responses", method="POST", data=b"yes"
                 )
             ).read()
             thread.join(timeout=15)
@@ -1375,6 +2094,7 @@ class MockTelegram:
                     self._reply({"ok": True, "result": {
                         "message_id": server._message_id,
                         "chat": {"id": body.get("chat_id")},
+                        "date": int(time.time()),
                     }})
                 elif method in ("answerCallbackQuery", "editMessageText"):
                     self._reply({"ok": True, "result": True})
@@ -1395,6 +2115,9 @@ class MockTelegram:
         return Handler
 
     def queue_update(self, update):
+        # Telegram stamps every message with its server time
+        if isinstance(update.get("message"), dict):
+            update["message"].setdefault("date", int(time.time()))
         self.updates.append(update)
 
     def last(self, method):
@@ -1427,6 +2150,9 @@ class _TelegramFixture(unittest.TestCase):
             os.remove(an._bot_state_path())
         except OSError:
             pass
+        # no tombstone of an earlier test's ask may refuse this test's replies
+        for name in ("ntfy-pending", "tg-pending"):
+            shutil.rmtree(os.path.join(an.state_dir(), name), ignore_errors=True)
 
     def _tg_cfg(self, licensed=True, ntfy_url="https://ntfy.sh", channels=("telegram",)):
         cfg = an.Config({
@@ -1486,6 +2212,82 @@ class TestWatch(unittest.TestCase):
         self.assertEqual(result["exit_code"], 127)
         self.assertIn("could not be started", result["message"])
 
+    def _interrupt_child(self, signum, exit_code, topic):
+        """A child that takes longer than subprocess.run's 0.25s SIGKILL window.
+
+        watch runs as its own process, and the signal comes from this one,
+        outside watch's process group: the child sees it only if watch
+        forwards it, and it exits with `exit_code` only if it is allowed to
+        finish.
+        """
+        directory = tempfile.mkdtemp()
+        ready = os.path.join(directory, "ready")
+        script = os.path.join(directory, "child.py")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import signal, time, sys\n"
+                "def stop(signum, frame):\n"
+                "    deadline = time.monotonic() + 0.6\n"
+                "    while time.monotonic() < deadline:\n"
+                "        time.sleep(0.05)\n"
+                f"    raise SystemExit({exit_code})\n"
+                "signal.signal(signal.SIGINT, stop)\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                f"open({ready!r}, 'w').close()\n"
+                "time.sleep(3)\n"
+                "raise SystemExit(0)\n"
+            )
+        config_dir = os.path.join(directory, "config")
+        os.makedirs(config_dir)
+        with open(os.path.join(config_dir, "config.json"), "w", encoding="utf-8") as fh:
+            json.dump({"ntfy": {"server": self.ntfy.url, "topic": topic}}, fh)
+        # the state dir stays this module's, so read_history() sees the record
+        env = dict(os.environ, AGENTBELL_CONFIG_DIR=config_dir, HOME=directory,
+                   USERPROFILE=directory, XDG_CONFIG_HOME=directory, XDG_STATE_HOME=directory)
+        before = len(self.ntfy.posts.get(topic, []))
+        started = time.monotonic()
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(an.__file__), "watch", "--", sys.executable, script],
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not os.path.exists(ready) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            proc.send_signal(signum)
+            out, _ = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            shutil.rmtree(directory, ignore_errors=True)
+        result = {"exit_code": proc.returncode, "message": out.decode("utf-8", "replace")}
+        return result, time.monotonic() - started, before
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group signals")
+    def test_ctrl_c_lets_the_child_finish_and_still_notifies(self):
+        result, elapsed, before = self._interrupt_child(signal.SIGINT, 3, "watch-sigint")
+        self.assertEqual(result["exit_code"], 3)
+        self.assertGreaterEqual(elapsed, 0.5)
+        self.assertIn("failed (exit 3)", result["message"])
+        posts = self.ntfy.posts["watch-sigint"]
+        self.assertEqual(len(posts), before + 1)
+        self.assertIn("exit 3", posts[-1]["body"])
+        self.assertEqual(posts[-1]["headers"]["Priority"], "5")
+        self.assertTrue(any(
+            record.get("event") == "watch" and "exit 3" in (record.get("message") or "")
+            for record in an.read_history()))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group signals")
+    def test_sigterm_lets_the_child_finish_and_still_notifies(self):
+        result, elapsed, before = self._interrupt_child(signal.SIGTERM, 4, "watch-sigterm")
+        self.assertEqual(result["exit_code"], 4)
+        self.assertGreaterEqual(elapsed, 0.5)
+        self.assertIn("failed (exit 4)", result["message"])
+        posts = self.ntfy.posts["watch-sigterm"]
+        self.assertEqual(len(posts), before + 1)
+        self.assertIn("exit 4", posts[-1]["body"])
+
 
 class TestHookDuration(unittest.TestCase):
     @classmethod
@@ -1537,8 +2339,12 @@ class TestHookDuration(unittest.TestCase):
 
 
 class TestTelegramAsk(_TelegramFixture):
-    def _wait_new_request(self, method="sendMessage", timeout=20.0):
-        before = len(self.tg.requests)
+    def _wait_new_request(self, method="sendMessage", timeout=20.0, before=None):
+        # `before` has to be the count from before the ask thread starts.
+        # Counting after start misses a sendMessage that already landed and
+        # then waits out the whole timeout.
+        if before is None:
+            before = len(self.tg.requests)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             new = [r for r in self.tg.requests[before:] if r["method"] == method]
@@ -1549,6 +2355,7 @@ class TestTelegramAsk(_TelegramFixture):
 
     def test_ask_waits_for_bot_answer(self):
         cfg = self._tg_cfg()
+        before = len(self.tg.requests)
         holder = {}
         thread = threading.Thread(
             target=lambda: holder.update(
@@ -1557,7 +2364,7 @@ class TestTelegramAsk(_TelegramFixture):
             daemon=True,
         )
         thread.start()
-        sent = self._wait_new_request("sendMessage")
+        sent = self._wait_new_request("sendMessage", before=before)
         self.assertIsNotNone(sent)
         body = sent["body"]
         self.assertEqual(body["chat_id"], "42")
@@ -1574,7 +2381,9 @@ class TestTelegramAsk(_TelegramFixture):
 
     def test_ask_with_bot_alive_attaches_keyboard(self):
         cfg = self._tg_cfg()
+        self.addCleanup(an.release_bot_lock, an.acquire_bot_lock())    # a running bot
         an.write_bot_heartbeat()
+        before = len(self.tg.requests)
         holder = {}
         thread = threading.Thread(
             target=lambda: holder.update(
@@ -1583,7 +2392,7 @@ class TestTelegramAsk(_TelegramFixture):
             daemon=True,
         )
         thread.start()
-        body = self._wait_new_request("sendMessage")["body"]
+        body = self._wait_new_request("sendMessage", before=before)["body"]
         keyboard = body["reply_markup"]["inline_keyboard"]
         self.assertEqual([b["text"] for b in keyboard[0]], ["Approve", "Deny"])
         self.assertTrue(keyboard[0][0]["callback_data"].startswith("agentbell|"))
@@ -1645,7 +2454,7 @@ class TestBotDaemon(_TelegramFixture):
         edited = self.tg.last("editMessageText")
         self.assertIn("Answered: approved", edited["body"]["text"])
         an.remove_tg_answer("abcdef0123456789")
-        an.remove_tg_pending("abcdef0123456789")
+        _remove_pending("tg-pending", "abcdef0123456789")
 
     def test_expired_callback_not_attributed(self):
         """A button pressed after the ask ended must never leak into a newer ask."""
@@ -1664,11 +2473,12 @@ class TestBotDaemon(_TelegramFixture):
         answered = self.tg.last("answerCallbackQuery")
         self.assertEqual(answered["body"]["callback_query_id"], "cq3")
         self.assertIn("expired", answered["body"]["text"])
-        an.remove_tg_pending("feedface01234567")
+        _remove_pending("tg-pending", "feedface01234567")
 
     def test_free_text_attributed_to_newest_pending(self):
         cfg = self._tg_cfg()
         an.write_tg_pending("deadbeef", "Which env?", 60)
+        self._stamp_question("deadbeef", 5)
         self.tg.queue_update({
             "update_id": 2,
             "message": {"message_id": 6, "chat": {"id": 42}, "text": "staging"},
@@ -1676,7 +2486,70 @@ class TestBotDaemon(_TelegramFixture):
         an.bot_poll_once(cfg, poll_timeout=1)
         self.assertEqual(an.read_tg_answer("deadbeef"), "staging")
         an.remove_tg_answer("deadbeef")
-        an.remove_tg_pending("deadbeef")
+        _remove_pending("tg-pending", "deadbeef")
+
+    def _stamp_question(self, approval_id, message_id, date=None):
+        path = an._pending_path("tg-pending", approval_id)
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["question_message_id"] = message_id
+        data["question_date"] = int(time.time()) if date is None else date
+        data["question_sent_at"] = time.time()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def test_replayed_yes_from_before_the_question_is_ignored(self):
+        """A restarted bot replays backlog. A lower message id is not this answer.
+
+        Ordering is by message id, not by the local clock. A reply dated in
+        the future still predates the question when its id is lower. A
+        higher id counts however far Telegram's clock is from the local one
+        (here five hours behind it); one that reached the bot long after it
+        was sent does not (audit 7, AF-1).
+        """
+        cfg = self._tg_cfg()
+        self.tg.updates.clear()
+        an.write_tg_pending("deadbeef", "Deploy?", 60)
+        skew = -5 * 3600
+        self._stamp_question("deadbeef", 20, date=int(time.time()) + skew)
+        self.tg.queue_update({
+            "update_id": 11,
+            "message": {"message_id": 11, "chat": {"id": 42}, "text": "yes",
+                        "date": int(time.time()) + 3600},
+        })
+        an.bot_poll_once(cfg, poll_timeout=1)
+        self.assertIsNone(an.read_tg_answer("deadbeef"))
+        self.assertTrue(any(
+            r.get("event") == "stale_answer" and "predate" in (r.get("reason") or "")
+            for r in an.read_history()))
+        self.tg.queue_update({
+            "update_id": 12,
+            "message": {"message_id": 21, "chat": {"id": 42}, "text": "yes",
+                        "date": int(time.time()) + skew - an.LATE_REPLY_SECONDS - 5},
+        })
+        an.bot_poll_once(cfg, poll_timeout=1)
+        self.assertIsNone(an.read_tg_answer("deadbeef"))
+        self.tg.queue_update({
+            "update_id": 13,
+            "message": {"message_id": 22, "chat": {"id": 42}, "text": "yes",
+                        "date": int(time.time()) + skew},
+        })
+        an.bot_poll_once(cfg, poll_timeout=1)
+        self.assertEqual(an.read_tg_answer("deadbeef"), "yes")
+        an.remove_tg_answer("deadbeef")
+        _remove_pending("tg-pending", "deadbeef")
+
+    def test_reply_without_a_message_id_is_not_ordered_as_newer(self):
+        cfg = self._tg_cfg()
+        self.tg.updates.clear()
+        an.write_tg_pending("deadbeef", "Deploy?", 60)
+        self.tg.queue_update({
+            "update_id": 13,
+            "message": {"chat": {"id": 42}, "text": "yes", "date": int(time.time())},
+        })
+        an.bot_poll_once(cfg, poll_timeout=1)
+        self.assertIsNone(an.read_tg_answer("deadbeef"))
+        _remove_pending("tg-pending", "deadbeef")
 
     def test_unknown_callback_answered_politely(self):
         cfg = self._tg_cfg()
@@ -1690,16 +2563,24 @@ class TestBotDaemon(_TelegramFixture):
         self.assertEqual(answered["body"]["text"], "unknown action")
 
     def test_heartbeat_and_lock(self):
+        lock = an.acquire_bot_lock()
         an.write_bot_heartbeat()
         self.assertTrue(an.bot_heartbeat_fresh())
-        path = an.acquire_bot_lock()
-        self.assertTrue(os.path.exists(path))
         with self.assertRaises(SystemExit):
             an.acquire_bot_lock()  # our own fresh lock -> "already running"
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        an.release_bot_lock(lock)
+        self.assertFalse(an.bot_heartbeat_fresh())
+
+    def test_a_reused_pid_does_not_keep_the_lock(self):
+        """SIGKILL leaves the lock. The pid can belong to something else."""
+        path = os.path.join(an.state_dir(), "bot.lock")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "start": "not-this-process"}, fh)
+        lock = an.acquire_bot_lock()
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertNotIn("start", data)
+        an.release_bot_lock(lock)
 
 
 class TestAskParallelChannels(_TelegramFixture):
@@ -1717,7 +2598,7 @@ class TestAskParallelChannels(_TelegramFixture):
         return self._tg_cfg(ntfy_url=self.ntfy.url, channels=("ntfy", "telegram"))
 
     def _run_ask_async(self, cfg, **kwargs):
-        holder = {}
+        holder = {"tg_before": len(self.tg.requests)}
         thread = threading.Thread(
             target=lambda: holder.update(
                 result=an.run_ask(cfg, print_status=False, **kwargs)
@@ -1727,8 +2608,10 @@ class TestAskParallelChannels(_TelegramFixture):
         thread.start()
         return holder, thread
 
-    def _wait_new_request(self, method="sendMessage", timeout=20.0):
-        before = len(self.tg.requests)
+    def _wait_new_request(self, method="sendMessage", timeout=20.0, before=None):
+        # See TestTelegramAsk: the count must be from before the ask starts.
+        if before is None:
+            before = len(self.tg.requests)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             new = [r for r in self.tg.requests[before:] if r["method"] == method]
@@ -1771,8 +2654,21 @@ class TestAskParallelChannels(_TelegramFixture):
     def test_telegram_wins(self):
         cfg = self._cfg()
         holder, thread = self._run_ask_async(cfg, message="Deploy?", timeout_seconds=20)
-        body = self._wait_new_request("sendMessage")["body"]
+        body = self._wait_new_request("sendMessage", before=holder["tg_before"])["body"]
         match = an.re.search(r"ID: ([0-9a-f]+)", body["text"])
+        # the marker learns the message id only after sendMessage has answered
+        question_id = None
+        deadline = time.monotonic() + 10
+        while question_id is None and time.monotonic() < deadline:
+            try:
+                with open(an._pending_path("tg-pending", match.group(1)), encoding="utf-8") as fh:
+                    question_id = json.load(fh).get("question_message_id")
+            except (OSError, ValueError):
+                pass
+            if question_id is None:
+                time.sleep(0.02)
+        self.assertIsInstance(question_id, int)
+        self.assertGreater(question_id, 0)
         an.write_tg_answer(match.group(1), "approved")
         thread.join(timeout=10)
         self.assertFalse(thread.is_alive())
@@ -1807,6 +2703,66 @@ class TestAskParallelChannels(_TelegramFixture):
             an.TG_API_BASE = old_base
             broken.stop()
 
+    def test_telegram_is_asked_while_ntfy_prime_is_still_failing(self):
+        """A dead ntfy must not swallow the ask before Telegram is contacted.
+
+        Prime used to raise in the calling thread, so the Telegram question
+        was never sent. It also must not wait out the prime retries first.
+        """
+        release = threading.Event()
+        started = threading.Event()
+
+        def blocked(waiter):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("prime still blocked")
+            raise RuntimeError("unreachable")
+
+        cfg = self._cfg()
+        before = len(self.ntfy.posts.get("tgtopic", []))
+        with unittest.mock.patch.object(an.ApprovalWaiter, "_prime", blocked):
+            holder, thread = self._run_ask_async(
+                cfg, message="Deploy?", timeout_seconds=20)
+            try:
+                self.assertTrue(started.wait(2), "ntfy prime did not start")
+                sent = self._wait_new_request(
+                    "sendMessage", timeout=2, before=holder["tg_before"])
+                self.assertIsNotNone(
+                    sent, "telegram was not asked while ntfy prime was blocked")
+                match = an.re.search(r"ID: ([0-9a-f]+)", sent["body"]["text"])
+                an.write_tg_answer(match.group(1), "approved")
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive(), holder.get("result"))
+                self.assertTrue(holder["result"]["approved"])
+                self.assertEqual(holder["result"]["channel"], "telegram")
+                self.assertEqual(len(self.ntfy.posts.get("tgtopic", [])), before)
+            finally:
+                release.set()
+                thread.join(timeout=3)
+        self.assertEqual(
+            len(self.ntfy.posts.get("tgtopic", [])), before,
+            "ntfy was published after the ask had already finished")
+
+    def test_ntfy_prime_failure_leaves_telegram_as_the_only_channel(self):
+        def broken(waiter):
+            raise RuntimeError("unreachable")
+
+        cfg = self._cfg()
+        before = len(self.ntfy.posts.get("tgtopic", []))
+        with unittest.mock.patch.object(an.ApprovalWaiter, "_prime", broken):
+            holder, thread = self._run_ask_async(
+                cfg, message="Deploy?", timeout_seconds=8)
+            sent = self._wait_new_request(
+                "sendMessage", timeout=3, before=holder["tg_before"])
+            self.assertIsNotNone(sent)
+            match = an.re.search(r"ID: ([0-9a-f]+)", sent["body"]["text"])
+            an.write_tg_answer(match.group(1), "no")
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), holder.get("result"))
+        self.assertTrue(holder["result"]["denied"])
+        self.assertEqual(holder["result"]["channel"], "telegram")
+        self.assertEqual(len(self.ntfy.posts.get("tgtopic", [])), before)
+
 
 class TestRetryAndQueue(unittest.TestCase):
     @classmethod
@@ -1837,7 +2793,6 @@ class TestRetryAndQueue(unittest.TestCase):
 
     def test_persistent_failure_queued(self):
         cfg = make_config(self.ntfy.url, topic="down")
-        old_url = self.ntfy.url
         self.ntfy.stop()
         try:
             result = an.send_notification(cfg, "while offline", priority="normal")
@@ -2086,16 +3041,28 @@ class TestApprovalHardening(unittest.TestCase):
         posts = self._wait_posts("par", 2)
         id_b = an.re.search(r"ID: ([0-9a-f]+)", posts[-1]["body"]).group(1)
         self.assertNotEqual(id_a, id_b)
-        # free text goes to the newest open question (B)
+        # free text names neither of two open questions: used by none, and
+        # the phone is told so once
         urllib.request.urlopen(
             urllib.request.Request(f"{self.ntfy.url}/par-responses", method="POST",
                                    data=b"staging")
         ).read()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not any(
+                "was not used" in p["body"] for p in self.ntfy.posts.get("par", [])):
+            time.sleep(0.05)
+        notices = [p for p in self.ntfy.posts["par"] if "was not used" in p["body"]]
+        self.assertEqual(len(notices), 1)
+        self.assertTrue(thread_a.is_alive())
+        self.assertTrue(thread_b.is_alive())
+        # a button answer reaches each of them
+        urllib.request.urlopen(
+            urllib.request.Request(f"{self.ntfy.url}/par-responses", method="POST",
+                                   data=f"DENIED {id_b}".encode())
+        ).read()
         thread_b.join(timeout=10)
         self.assertFalse(thread_b.is_alive())
-        self.assertEqual(holder_b["result"]["answer"], "staging")
-        self.assertTrue(thread_a.is_alive())  # A unaffected
-        # a button answer for A still reaches A
+        self.assertTrue(holder_b["result"]["denied"])
         urllib.request.urlopen(
             urllib.request.Request(f"{self.ntfy.url}/par-responses", method="POST",
                                    data=f"APPROVED {id_a}".encode())
@@ -2106,26 +3073,28 @@ class TestApprovalHardening(unittest.TestCase):
         self.assertEqual(holder_a["result"].get("channel"), "ntfy")
 
     def test_free_text_claimed_by_another_ask_is_not_answered_twice(self):
-        """The case the newest-open check alone cannot decide.
+        """The case the markers alone cannot decide.
 
         On a slow box the ask that took a free-text reply is already finished
-        - and its pending marker deleted - by the time a second ask's poll
-        reaches the same message. That ask then finds itself "newest open" and
-        answers the very same reply. The claim recorded before the marker
-        disappeared is what stops it.
+        - its marker an answered tombstone that no longer counts - by the time
+        a second ask's poll reaches the same message. That ask then finds
+        itself the only open question and answers the very same reply. The
+        claim recorded before the marker was closed is what stops it.
         """
         cfg = make_config(self.ntfy.url, topic="claimed")
         holder, thread = self._run_ask_async(cfg, message="Which env?", timeout_seconds=20)
         posts = self._wait_posts("claimed", 1)
         approval_id = an.re.search(r"ID: ([0-9a-f]+)", posts[-1]["body"]).group(1)
-        # The other, newer ask: it takes the reply and shuts down (marker gone)
-        # before the message is ever handed to the ask above.
+        # The other ask took the reply (its claim) and ended (an answered
+        # tombstone) before the message is ever handed to the ask above.
         other_id = "b" * 16
         an.write_ntfy_pending(other_id, "Second question?", 20)
-        other = an.ApprovalWaiter(cfg, "claimed-responses", 20, approval_id=other_id)
-        other._offer("race-msg-1", "race-claimed-reply")
-        self.assertEqual(other.messages.get_nowait(), "race-claimed-reply")
-        an.remove_ntfy_pending(other_id)
+        self.assertTrue(an.claim_ntfy_message("race-msg-1"))
+        # answered a while ago: its tombstone no longer counts for this reply
+        # (one that may have been sent before that answer is refused anyway)
+        earlier = time.time() - 10
+        with unittest.mock.patch.object(an.time, "time", lambda: earlier):
+            an.close_pending("ntfy-pending", other_id, answered=True)
         self.ntfy.inject("claimed-responses", "race-claimed-reply", "race-msg-1")
         deadline = time.monotonic() + 15
         ignored = False
@@ -2195,11 +3164,13 @@ class TestApprovalHardening(unittest.TestCase):
         cfg = make_config(self.ntfy.url, topic="claimfailure")
         waiter = an.ApprovalWaiter(
             cfg, "claimfailure-responses", 5, approval_id="a" * 16)
+        an.write_ntfy_pending("a" * 16, "Q?", 5)          # the one open question
+        an.remember_ntfy_question("a" * 16, 1000, time.time())
         original = an.claim_ntfy_message
         an.claim_ntfy_message = lambda message_id: (_ for _ in ()).throw(
             OSError("read only"))
         try:
-            waiter._offer("message-id", "free text")
+            waiter._offer("message-id", "free text", 1001)
         finally:
             an.claim_ntfy_message = original
         self.assertTrue(waiter.messages.empty())
@@ -2317,6 +3288,12 @@ class TestPurge(unittest.TestCase):
         self.old_home = _set_home(self.home)
         self.old_argv0 = sys.argv[0]
         sys.argv[0] = _fake_launcher(self.home)
+        # tests here apply what purge finds: never the real pipx / pip --user install
+        self.real_pipx_installed = an._pipx_installed
+        for name, value in (("_pipx_installed", None), ("_user_site_dirs", (None, None))):
+            patcher = unittest.mock.patch.object(an, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         _restore_home(self.old_home)
@@ -2359,7 +3336,7 @@ class TestPurge(unittest.TestCase):
         }))
         # opencode project block + MCP entry
         agents_md = os.path.join(self.project, "AGENTS.md")
-        self._write(agents_md, f"# Rules\n{an.BLOCK_START}\ninstructions\n{an.BLOCK_END}\n")
+        self._write(agents_md, f"# Rules\n{an.BLOCK_START}\n{an.OPENCODE_INSTRUCTIONS}{an.BLOCK_END}\n")
         oc_json = os.path.join(self.project, "opencode.json")
         self._write(oc_json, json.dumps({
             "$schema": "https://opencode.ai/config.json",
@@ -2456,7 +3433,7 @@ class TestPurge(unittest.TestCase):
                 side_effect=lambda name: "/tools/pipx" if name == "pipx" else None), \
                 unittest.mock.patch.object(
                     an.subprocess, "run", return_value=completed) as run:
-            self.assertEqual(an._pipx_installed(), "/tools/pipx")
+            self.assertEqual(self.real_pipx_installed(), "/tools/pipx")
         run.assert_called_once_with(
             ["/tools/pipx", "list"], capture_output=True, text=True, timeout=30)
 
@@ -2502,14 +3479,16 @@ class TestPurge(unittest.TestCase):
     def test_cmd_uninstall_dry_run_deletes_nothing(self):
         import io as _io
         from contextlib import redirect_stdout
+        self._write(an.config_path(), "{}")
         parser = an.build_parser()
-        args = parser.parse_args(["uninstall"])
+        args = parser.parse_args(["uninstall", "--project", self.project])
         buffer = _io.StringIO()
         with redirect_stdout(buffer):
             args.func(args)
         out = buffer.getvalue()
         self.assertIn("dry run", out)
         self.assertIn("--yes", out)
+        self.assertTrue(os.path.exists(an.config_path()))
 
     def test_purge_env_override_warning(self):
         old = os.environ.get(an.CONFIG_DIR_ENV)
@@ -2527,6 +3506,7 @@ class TestPurge(unittest.TestCase):
 class TestBotStatus(_TelegramFixture):
     def test_status_running(self):
         cfg = self._tg_cfg()
+        self.addCleanup(an.release_bot_lock, an.acquire_bot_lock())    # a running bot
         an.write_bot_heartbeat()
         import io as _io
         from contextlib import redirect_stdout
@@ -2534,7 +3514,7 @@ class TestBotStatus(_TelegramFixture):
         with redirect_stdout(buffer):
             an.print_bot_status(cfg)
         out = buffer.getvalue()
-        self.assertIn("running", out)
+        self.assertIn("bot:       running (pid", out)
         self.assertIn("lock", out)
 
     def test_status_stale_lock_and_error(self):
@@ -2558,14 +3538,15 @@ class TestBotStatus(_TelegramFixture):
 class TestSecrets(unittest.TestCase):
     def test_config_show_redacts_every_credential(self):
         data = {
-            "ntfy": {"server": "https://ntfy.example", "topic": "t", "auth": "bob:hunter2"},
+            "ntfy": {"server": "https://ntfy.example", "topic": "t", "auth": "bob:hunter2",
+                     "action_auth": "tk_publish_only_secret"},
             "telegram": {"bot_token": "123456:AAHsuperSecretToken", "chat_id": 42},
             "webhook": {"listen": "0.0.0.0", "port": 8756, "token": "webhook-secret-token"},
             "license": "AB1-PAYLOADPAYLOAD-SIGNATURE",
         }
         safe = json.dumps(an.redacted_config(data))
         for secret in ("hunter2", "AAHsuperSecretToken", "webhook-secret-token",
-                       "PAYLOADPAYLOAD", "SIGNATURE"):
+                       "PAYLOADPAYLOAD", "SIGNATURE", "tk_publish_only_secret"):
             self.assertNotIn(secret, safe, f"{secret} leaked into 'config show'")
         self.assertIn("bob:", safe)          # enough context to recognise it
         self.assertIn("0.0.0.0", safe)       # non-secrets stay visible
@@ -2581,7 +3562,42 @@ class TestSecrets(unittest.TestCase):
 
     def test_applescript_and_powershell_quoting(self):
         self.assertEqual(an._applescript_string('say "hi" \\ bye'), '"say \\"hi\\" \\\\ bye"')
-        self.assertEqual(an._powershell_string("it's"), "'it''s'")
+
+    def test_windows_toast_text_is_not_powershell_source(self):
+        """The message must not be part of the -Command string.
+
+        Windows PowerShell 5.1 treats ’ (U+2019) as a quote, so quoting the
+        text into the script both broke the toast and ran whatever followed.
+        """
+        title = "it\u2019s done"
+        message = "\u2019; calc.exe # $(Remove-Item)"
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env")
+            return subprocess.CompletedProcess(cmd, 0)
+
+        original = an.platform.system
+        an.platform.system = lambda: "Windows"
+        try:
+            with unittest.mock.patch.object(an.subprocess, "run", fake_run):
+                result = an.os_notify(title, "a\x00" + message, 3)
+        finally:
+            an.platform.system = original
+        self.assertEqual(result, {"channel": "os", "ok": True})
+        script = captured["cmd"][-1]
+        self.assertEqual(captured["cmd"][:4],
+                         ["powershell", "-NoProfile", "-NonInteractive", "-Command"])
+        self.assertNotIn("calc", script)
+        self.assertNotIn("Remove-Item", script)
+        self.assertNotIn("\u2019", script)
+        self.assertNotIn("it\u2019s", script)
+        self.assertIn("$env:AGENTBELL_OS_TITLE", script)
+        self.assertIn("$env:AGENTBELL_OS_MESSAGE", script)
+        self.assertEqual(captured["env"]["AGENTBELL_OS_TITLE"], title)
+        self.assertEqual(captured["env"]["AGENTBELL_OS_MESSAGE"], "a" + message)
+        self.assertNotIn("\x00", captured["env"]["AGENTBELL_OS_MESSAGE"])
 
     def test_toml_string_escapes_windows_paths(self):
         self.assertEqual(an.toml_string(r"C:\Users\me\agentbell.exe"),
@@ -2623,6 +3639,210 @@ class TestCliWiring(unittest.TestCase):
 class _Args:
     def __init__(self, **kw):
         self.__dict__.update(kw)
+
+
+def _init_args(**overrides):
+    values = dict(
+        non_interactive=True, server=None, topic=None, ntfy_auth=None,
+        license=None, telegram_token=None, telegram_chat=None,
+        quiet_hours=None, quiet_hours_mode=None,
+        no_hooks=True, no_test=False, no_wait=True,
+    )
+    values.update(overrides)
+    return _Args(**values)
+
+
+class TestReinitKeepsSelfHostedAuth(unittest.TestCase):
+    """Re-init is how Telegram gets added. It must not move a self-hosted
+    server back to ntfy.sh and then post the saved password there."""
+
+    SECRET = "owner:s3cret-selfhosted"
+    TOPIC = "selfhost-topic-0123456789abcdef"
+    ACTION = "tk_old_action_token"
+
+    def _basic(self, secret):
+        return "Basic " + base64.b64encode(secret.encode()).decode()
+
+    def _config(self, server, action_auth=None):
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "config.json")
+        cfg = an.Config(an.default_config(), path=path)
+        ntfy = {"server": server, "topic": self.TOPIC, "auth": self.SECRET}
+        if action_auth is not None:
+            ntfy["action_auth"] = action_auth
+        cfg.data["ntfy"] = ntfy
+        cfg.save()
+        return directory, path
+
+    def _run(self, path, args, stdin=None):
+        seen = []
+        original = an.http_request
+
+        def wrapped(url, method="GET", headers=None, body=None, timeout=10.0):
+            seen.append({
+                "url": url,
+                "auth": (headers or {}).get("Authorization"),
+                "body": body if isinstance(body, str) else "",
+            })
+            if "ntfy.sh" in url:
+                return 200, b""
+            return original(url, method, headers, body, timeout)
+
+        previous = os.environ.get("AGENTBELL_CONFIG")
+        os.environ["AGENTBELL_CONFIG"] = path
+        stdout, stderr = io.StringIO(), io.StringIO()
+        patches = [unittest.mock.patch.object(an, "http_request", wrapped)]
+        if stdin is not None:
+            patches.append(unittest.mock.patch.object(
+                an.sys.stdin, "isatty", return_value=True))
+            patches.append(unittest.mock.patch("builtins.input", side_effect=stdin))
+        for patch in patches:
+            patch.start()
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                an.cmd_init(args)
+        finally:
+            for patch in patches:
+                patch.stop()
+            if previous is None:
+                os.environ.pop("AGENTBELL_CONFIG", None)
+            else:
+                os.environ["AGENTBELL_CONFIG"] = previous
+        return seen, stdout.getvalue(), stderr.getvalue()
+
+    def _saved(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)["ntfy"]
+
+    def test_pressing_enter_keeps_the_server_and_the_password(self):
+        server = MockNtfy()
+        directory, path = self._config(server.url)
+        try:
+            seen, stdout, _stderr = self._run(
+                path, _init_args(non_interactive=False),
+                stdin=["", "", "", "", ""])
+            saved = self._saved(path)
+        finally:
+            server.stop()
+            shutil.rmtree(directory)
+        self.assertEqual(saved["server"], server.url)
+        self.assertEqual(saved["topic"], self.TOPIC)
+        self.assertEqual(saved["auth"], self.SECRET)
+        self.assertTrue(any(server.url in call["url"] for call in seen))
+        self.assertFalse(any("ntfy.sh" in call["url"] for call in seen))
+        self.assertIn(self._basic(self.SECRET), [call["auth"] for call in seen])
+        self.assertIn(server.url, stdout)
+
+    def test_noninteractive_reinit_does_not_move_the_server(self):
+        server = MockNtfy()
+        directory, path = self._config(server.url)
+        try:
+            seen, _stdout, stderr = self._run(path, _init_args())
+            saved = self._saved(path)
+        finally:
+            server.stop()
+            shutil.rmtree(directory)
+        self.assertEqual(saved["server"], server.url)
+        self.assertEqual(saved["topic"], self.TOPIC)
+        self.assertEqual(saved["auth"], self.SECRET)
+        self.assertTrue(seen)
+        self.assertTrue(all(server.url in call["url"] for call in seen))
+        self.assertNotIn("not sending the saved", stderr)
+
+    def test_switching_server_does_not_send_the_old_password(self):
+        directory, path = self._config("https://ntfy.example")
+        try:
+            seen, _stdout, stderr = self._run(
+                path, _init_args(server="https://ntfy.sh"))
+            saved = self._saved(path)
+        finally:
+            shutil.rmtree(directory)
+        self.assertEqual(saved["server"], "https://ntfy.sh")
+        self.assertEqual(saved["topic"], self.TOPIC)
+        self.assertIsNone(saved["auth"])
+        self.assertTrue(seen)
+        self.assertTrue(all("ntfy.sh" in call["url"] for call in seen))
+        blob = json.dumps(seen)
+        self.assertNotIn(self.SECRET, blob)
+        self.assertNotIn(self._basic(self.SECRET), blob)
+        self.assertTrue(all(call["auth"] in (None, "") for call in seen))
+        self.assertIn("not sending the saved", stderr)
+
+    def test_new_auth_flag_is_what_gets_sent(self):
+        directory, path = self._config("https://ntfy.example")
+        fresh = "fresh:token"
+        try:
+            seen, _stdout, _stderr = self._run(
+                path, _init_args(server="https://ntfy.sh", ntfy_auth=fresh))
+            saved = self._saved(path)
+        finally:
+            shutil.rmtree(directory)
+        self.assertEqual(saved["auth"], fresh)
+        blob = json.dumps(seen)
+        self.assertNotIn(self.SECRET, blob)
+        self.assertNotIn(self._basic(self.SECRET), blob)
+        self.assertIn(self._basic(fresh), [call["auth"] for call in seen])
+
+    def test_interactive_server_change_asks_before_sending(self):
+        directory, path = self._config("https://ntfy.example")
+        try:
+            seen, stdout, _stderr = self._run(
+                path, _init_args(non_interactive=False),
+                stdin=["https://ntfy.sh", "", "", "", "", ""])
+            saved = self._saved(path)
+        finally:
+            shutil.rmtree(directory)
+        self.assertEqual(saved["server"], "https://ntfy.sh")
+        self.assertIsNone(saved["auth"])
+        self.assertIn("will not be sent", stdout)
+        blob = json.dumps(seen)
+        self.assertNotIn(self.SECRET, blob)
+        self.assertNotIn(self._basic(self.SECRET), blob)
+        self.assertTrue(all("ntfy.sh" in call["url"] for call in seen))
+
+    def test_server_change_drops_the_action_token(self):
+        directory, path = self._config("https://ntfy.example", action_auth=self.ACTION)
+        try:
+            seen, _stdout, stderr = self._run(
+                path, _init_args(server="https://ntfy.sh"))
+            saved = self._saved(path)
+        finally:
+            shutil.rmtree(directory)
+        self.assertIsNone(saved["auth"])
+        self.assertIsNone(saved.get("action_auth"))
+        self.assertNotIn(self.ACTION, json.dumps(saved))
+        self.assertNotIn(self.ACTION, json.dumps(seen))
+        self.assertIn("action token", stderr)
+        actions = an.ask_actions(
+            "https://ntfy.sh", self.TOPIC + "-responses", "ab",
+            "Approve", "Deny", saved)
+        self.assertNotIn(self.ACTION, json.dumps(actions))
+
+    def test_new_password_does_not_keep_the_old_action_token(self):
+        directory, path = self._config("https://ntfy.example", action_auth=self.ACTION)
+        try:
+            seen, _stdout, stderr = self._run(
+                path, _init_args(server="https://ntfy.sh", ntfy_auth="fresh:token"))
+            saved = self._saved(path)
+        finally:
+            shutil.rmtree(directory)
+        self.assertEqual(saved["auth"], "fresh:token")
+        self.assertIsNone(saved.get("action_auth"))
+        self.assertNotIn(self.ACTION, json.dumps(saved))
+        self.assertNotIn(self.ACTION, json.dumps(seen))
+        self.assertIn("action token", stderr)
+
+    def test_same_server_keeps_the_action_token(self):
+        server = MockNtfy()
+        directory, path = self._config(server.url, action_auth=self.ACTION)
+        try:
+            _seen, _stdout, stderr = self._run(path, _init_args())
+            saved = self._saved(path)
+        finally:
+            server.stop()
+            shutil.rmtree(directory)
+        self.assertEqual(saved["action_auth"], self.ACTION)
+        self.assertNotIn("action token", stderr)
 
 
 class TestRunTestConfirmation(unittest.TestCase):
@@ -2958,6 +4178,38 @@ class TestMcpClients(unittest.TestCase):
             self.assertEqual(json.load(fh)["mcpServers"], {"other": {"command": "x"}})
         shutil.rmtree(tmp)
 
+    @unittest.skipIf(os.name == "nt", "os.symlink requires admin or developer mode on Windows")
+    def test_mcp_removal_does_not_follow_a_tmp_symlink(self):
+        """uninstall walks project MCP files. mcp.json.tmp as a symlink must not be followed."""
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "mcp.json")
+        precious = os.path.join(tmp, "precious")
+        with open(precious, "w", encoding="utf-8") as fh:
+            fh.write("do not touch\n")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "mcpServers": {
+                    "agentbell": {"command": "agentbell"},
+                    "other": {"command": "x"},
+                },
+                "theme": "dark",
+            }, fh)
+        os.chmod(path, 0o600)
+        os.symlink(precious, path + ".tmp")
+        try:
+            self.assertTrue(an._remove_mcp_server_key(path, "mcpServers"))
+            with open(precious, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "do not touch\n")
+            self.assertFalse(os.path.islink(path))
+            self.assertFalse(os.path.lexists(path + ".tmp"))
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertEqual(data["theme"], "dark")
+            self.assertEqual(data["mcpServers"], {"other": {"command": "x"}})
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        finally:
+            shutil.rmtree(tmp)
+
     def test_broken_json_is_not_overwritten(self):
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, "mcp.json")
@@ -2977,14 +4229,16 @@ class TestForeignTelegramAnswer(unittest.TestCase):
         approval_id = "abcdef1234567890"
         an.write_tg_pending(approval_id, "Deploy?", 60)
         try:
-            an.handle_bot_update(cfg, {"callback_query": {
-                "id": "cb", "data": f"agentbell|{approval_id}|approved",
-                "from": {"id": 9999}, "message": {"chat": {"id": 9999}, "message_id": 1},
-            }})
+            # the refusal is answered on a closed local port, not the real API
+            with unittest.mock.patch.object(an, "TG_API_BASE", "http://127.0.0.1:9"):
+                an.handle_bot_update(cfg, {"callback_query": {
+                    "id": "cb", "data": f"agentbell|{approval_id}|approved",
+                    "from": {"id": 9999}, "message": {"chat": {"id": 9999}, "message_id": 1},
+                }})
             self.assertIsNone(an.read_tg_answer(approval_id),
                               "a stranger must not be able to approve")
         finally:
-            an.remove_tg_pending(approval_id)
+            _remove_pending("tg-pending", approval_id)
             an.remove_tg_answer(approval_id)
 
 
@@ -3061,7 +4315,9 @@ class TestAuditRegressions(unittest.TestCase):
 
     @unittest.skipUnless(HAS_TOMLLIB, "tomllib requires 3.11+")
     def test_codex_install_repairs_a_pre_1_3_0_config(self):
-        """The old install put the flag where TOML scoped it to the last table."""
+        """The old install put the flag where TOML scoped it to the last table.
+        The top-level flag is added; the unmarked line may be the user's and
+        stays (CR3-2)."""
         import tomllib
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, "config.toml")
@@ -3081,7 +4337,8 @@ class TestAuditRegressions(unittest.TestCase):
             with open(path, "rb") as fh:
                 data = tomllib.load(fh)
             self.assertIs(data["features"]["hooks"], True)
-            self.assertEqual(data["model_providers"]["oss"], {"name": "x"})
+            self.assertEqual(data["model_providers"]["oss"],
+                             {"name": "x", "features": {"hooks": True}})
             self.assertFalse(an.install_codex_hooks()["changed"])     # idempotent
         finally:
             an.codex_config_path = original
@@ -3102,10 +4359,28 @@ class TestAuditRegressions(unittest.TestCase):
         url = "https://api.telegram.org/bot123456789:AAHsuperSecretToken/sendMessage"
         self.assertNotIn("AAHsuperSecretToken", an.safe_url(url))
         self.assertIn("<redacted>", an.safe_url(url))
+        dirty = "https://api.telegram.org/bot123456789:AAHsuper Secret\rToken/getMe"
+        scrubbed = an.safe_url(dirty)
+        self.assertNotIn("super", scrubbed)
+        self.assertNotIn("Token", scrubbed)
+        secret = "AAHsuperSecretToken"
+        with self.assertRaises(an.PermanentError) as caught:
+            an.TelegramChannel._call(f"123456:{secret[:6]} {secret[6:]}", "getMe")
+        self.assertNotIn(secret[:6], str(caught.exception))
+        self.assertNotIn("Secret", str(caught.exception))
+        seen = []
+
+        def wrapped(url, method="GET", headers=None, body=None, timeout=10.0):
+            seen.append(url)
+            return 200, b'{"ok": true, "result": {"username": "probe"}}'
+
+        with unittest.mock.patch.object(an, "http_request", wrapped):
+            an.TelegramChannel._call(f"123456:{secret}\n", "getMe")
+        self.assertEqual(seen, [f"https://api.telegram.org/bot123456:{secret}/getMe"])
 
     def test_header_with_newline_does_not_crash(self):
-        self.assertEqual(an._latin1_header("a\nb\tc"), "a b c")
-        self.assertEqual(an._latin1_header(None), "")
+        self.assertEqual(an._ntfy_header("a\nb\tc"), "a b c")
+        self.assertEqual(an._ntfy_header(None), "")
 
     def test_broken_quiet_hours_config_does_not_crash(self):
         for broken in ("22:00-07:30", ["22:00-07:30"], {"start": "22:00", "end": "07:30"},
@@ -3185,9 +4460,10 @@ class TestAuditRegressions(unittest.TestCase):
             ntfy.stop()
 
     def test_dead_daemon_means_no_dead_buttons(self):
+        lock = an.acquire_bot_lock()
         an.write_bot_heartbeat()
         self.assertTrue(an.bot_heartbeat_fresh())
-        an._update_bot_state(pid=999999)      # fresh timestamp, dead pid
+        an.release_bot_lock(lock)             # fresh timestamp, no bot any more
         self.assertFalse(an.bot_heartbeat_fresh())
         try:
             os.remove(an._bot_state_path())
@@ -3234,6 +4510,148 @@ class TestMinDuration(unittest.TestCase):
     def test_unknown_duration_always_notifies(self):
         an.run_hook(self.cfg, "run_completed", "opencode", min_duration=60)
         self.assertEqual(len(self._posts()), 1)
+
+    def _backdate(self, agent, seconds, session_id=None, cwd=None):
+        path = an._run_marker_path(agent, an._marker_scope(session_id, cwd))
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["started_at"] = time.time() - seconds
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        return path
+
+    def test_parallel_sessions_keep_their_own_duration(self):
+        """Two Claude sessions share one agent name and often one directory.
+
+        The start marker used to be one file per agent. The long session
+        then read the short session's fresh start and was dropped, and the
+        short session notified because its marker was already gone.
+        """
+        an.write_start_marker("claude", session_id="session-long")
+        long_path = self._backdate("claude", 300, session_id="session-long")
+        an.write_start_marker("claude", session_id="session-short")
+        short_path = self._backdate("claude", 5, session_id="session-short")
+        self.assertNotEqual(long_path, short_path)
+        try:
+            long_result = an.run_hook(
+                self.cfg, "run_completed", "claude", min_duration=60,
+                session_id="session-long", cwd="/same/project")
+            short_result = an.run_hook(
+                self.cfg, "run_completed", "claude", min_duration=60,
+                session_id="session-short", cwd="/same/project")
+        finally:
+            for path in (long_path, short_path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        self.assertNotIn("skipped", long_result)
+        self.assertEqual(len(self._posts()), 1)
+        self.assertIn("in 5m00s", self._posts()[0]["body"])
+        self.assertEqual(short_result.get("skipped"), "shorter than min-duration")
+
+    def test_without_a_session_id_the_directory_is_the_fallback(self):
+        an.write_start_marker("claude", cwd="/proj/one")
+        one = self._backdate("claude", 300, cwd="/proj/one")
+        an.write_start_marker("claude", cwd="/proj/two")
+        two = an._run_marker_path("claude", an._marker_scope(cwd="/proj/two"))
+        self.assertNotEqual(one, two)
+        try:
+            result = an.run_hook(
+                self.cfg, "run_completed", "claude", min_duration=60, cwd="/proj/one")
+            self.assertNotIn("skipped", result)
+            self.assertTrue(os.path.exists(two))
+        finally:
+            for path in (one, two):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def test_a_session_marker_older_than_the_window_is_deleted(self):
+        """A turn that never reaches Stop must not leave its file forever.
+
+        The dedupe record lives in the same directory and is not a start
+        marker, even when it is old.
+        """
+        an.write_start_marker("claude", session_id="fresh")
+        fresh = an._run_marker_path("claude", an._marker_scope(session_id="fresh"))
+        stale = an._run_marker_path("claude", an._marker_scope(session_id="old"))
+        with open(stale, "w", encoding="utf-8") as fh:
+            json.dump({"agent": "claude", "started_at": time.time() - 90 * 86400}, fh)
+        keep = an._dedupe_path()
+        with open(keep, "w", encoding="utf-8") as fh:
+            json.dump({"abc": time.time() - 90 * 86400}, fh)
+        old = time.time() - 90 * 86400
+        os.utime(keep, (old, old))
+        try:
+            an.write_start_marker("claude", session_id="newer")
+            self.assertTrue(os.path.exists(fresh))
+            self.assertFalse(os.path.exists(stale))
+            self.assertTrue(os.path.exists(keep))
+        finally:
+            for path in (fresh, stale, keep,
+                         an._run_marker_path("claude", an._marker_scope(session_id="newer"))):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def test_hook_payload_session_id_is_applied(self):
+        payload = {"session_id": "from-stdin", "cwd": "/work"}
+        captured = {}
+
+        def fake_run(cfg, event, agent, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+        args = _Args(event="started", agent="claude", cwd=None, duration=None,
+                     force=False, silent=True, min_duration=None)
+        with unittest.mock.patch.object(an, "read_hook_payload", return_value=payload), \
+                unittest.mock.patch.object(an, "run_hook", fake_run), \
+                unittest.mock.patch.object(an, "Config", return_value=self.cfg):
+            with self.assertRaises(SystemExit) as caught:
+                an.cmd_hook(args)
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(captured["session_id"], "from-stdin")
+        self.assertEqual(captured["cwd"], "/work")
+
+    def test_ready_stdin_is_read_and_an_empty_pipe_does_not_block(self):
+        self.assertEqual(
+            an.read_hook_payload(raw='{"session_id": "pipe-session"}')["session_id"],
+            "pipe-session")
+        self.assertEqual(an.read_hook_payload(raw="not-json"), {})
+        self.assertEqual(an.read_hook_payload(raw="[1]"), {})
+        self.assertEqual(an._hook_session({"sessionId": "camel"}), "camel")
+
+        class _Pipe:
+            def __init__(self, fd):
+                self._fd = fd
+
+            def fileno(self):
+                return self._fd
+
+            def isatty(self):
+                return False
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b'{"session_id": "pipe-session"}')
+            os.close(write_fd)
+            write_fd = None
+            self.assertIn("pipe-session", an._read_ready_text(_Pipe(read_fd)))
+        finally:
+            if write_fd is not None:
+                os.close(write_fd)
+            os.close(read_fd)
+        empty_read, empty_write = os.pipe()
+        try:
+            started = time.monotonic()
+            self.assertEqual(an._read_ready_text(_Pipe(empty_read)), "")
+            self.assertLess(time.monotonic() - started, 0.5)
+        finally:
+            os.close(empty_read)
+            os.close(empty_write)
 
     def test_installed_claude_hook_carries_the_threshold(self):
         commands = [h["command"] for groups in an.claude_event_hooks().values()
@@ -3540,7 +4958,8 @@ class TestWebhookHardening(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=5) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            with exc:             # it holds the connection (3.14 warns)
+                return exc.code, exc.read()
 
     def test_a_request_from_a_browser_page_is_refused(self):
         # a text/plain POST needs no CORS preflight, so without this any open
@@ -3601,7 +5020,8 @@ class TestWebhookToken(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=5) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            with exc:             # it holds the connection (3.14 warns)
+                return exc.code, exc.read()
 
     def test_missing_token_is_401(self):
         self.assertEqual(self._post()[0], 401)
@@ -3732,6 +5152,61 @@ class TestSecurityAuditRegressions(unittest.TestCase):
         self.assertIn("is a symlink", buf.getvalue())
         shutil.rmtree(tmp)
 
+    @unittest.skipIf(os.name == "nt", "os.symlink requires admin or developer mode on Windows")
+    def test_atomic_text_write_does_not_follow_a_tmp_symlink(self):
+        # hooks install aider writes AGENTS.md via AGENTS.md.tmp. A repo that
+        # ships that name as a symlink to ~/.bashrc used to be overwritten.
+        tmp = tempfile.mkdtemp()
+        precious = os.path.join(tmp, "bashrc")
+        with open(precious, "w", encoding="utf-8") as fh:
+            fh.write("do not touch\n")
+        path = os.path.join(tmp, "AGENTS.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("original\n")
+        os.symlink(precious, path + ".tmp")
+        try:
+            an._write_text_atomic(path, "new content\n")
+            with open(precious, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "do not touch\n")
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "new content\n")
+            self.assertFalse(os.path.islink(path))
+            self.assertFalse(os.path.lexists(path + ".tmp"))
+        finally:
+            shutil.rmtree(tmp)
+
+    @unittest.skipIf(os.name == "nt", "os.symlink requires admin or developer mode on Windows")
+    def test_atomic_text_write_updates_through_a_config_symlink(self):
+        # A dotfiles checkout points ~/.kimi-code/config.toml at the repo.
+        # Replacing the link with a regular file left the repo copy, hooks
+        # and all. The temp name beside the real file must still not be
+        # followed when that name is itself a symlink.
+        tmp = tempfile.mkdtemp()
+        real_dir = os.path.join(tmp, "dotfiles")
+        os.makedirs(real_dir)
+        real = os.path.join(real_dir, "config.toml")
+        with open(real, "w", encoding="utf-8") as fh:
+            fh.write("original\n")
+        os.chmod(real, 0o600)
+        link = os.path.join(tmp, "config.toml")
+        os.symlink(real, link)
+        precious = os.path.join(tmp, "bashrc")
+        with open(precious, "w", encoding="utf-8") as fh:
+            fh.write("do not touch\n")
+        os.symlink(precious, real + ".tmp")
+        try:
+            an._write_text_atomic(link, "updated\n")
+            self.assertTrue(os.path.islink(link))
+            self.assertEqual(os.path.realpath(link), os.path.realpath(real))
+            with open(real, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "updated\n")
+            with open(precious, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "do not touch\n")
+            self.assertFalse(os.path.lexists(real + ".tmp"))
+            self.assertEqual(os.stat(real).st_mode & 0o777, 0o600)
+        finally:
+            shutil.rmtree(tmp)
+
     def test_a_redirect_is_never_followed(self):
         # urllib's default opener replays the Authorization header at the
         # redirect target, so a typo'd server could harvest the credential
@@ -3743,6 +5218,9 @@ class TestSecurityAuditRegressions(unittest.TestCase):
 
             def do_POST(self):
                 holder["auth"] = self.headers.get("Authorization")
+                # an unread body makes Windows reset the connection, and the
+                # client never sees the 302
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 self.send_response(302)
                 self.send_header("Location", "http://127.0.0.1:1/stolen")
                 self.send_header("Content-Length", "0")
@@ -4621,8 +6099,10 @@ class TestAgentbellBinary(unittest.TestCase):
         finally:
             sys.argv, an.shutil.which = original_argv, original_which
         self.assertEqual(manifest["binary"], os.path.abspath(an.__file__))
-        smoke = shlex.split(manifest["commands"]["smoke"])
-        self.assertEqual(smoke[0], manifest["binary"])
+        # agentbell.py runs through the interpreter, as generated hooks do
+        smoke = [part.replace("\\", "/") for part in shlex.split(manifest["commands"]["smoke"])]
+        self.assertEqual(smoke[:2], [part.replace("\\", "/")
+                                     for part in (sys.executable, manifest["binary"])])
 
 
 class TestIntegrationGuide(unittest.TestCase):
@@ -4644,11 +6124,11 @@ class TestIntegrationGuide(unittest.TestCase):
         for step in manifest["verification"]["steps"]:
             commands += step["commands"]
         self.assertGreaterEqual(len(commands), 12)
+        prefix = manifest["command_prefix"] + " "   # the binary, or python + agentbell.py
         for command in commands:
-            parts = shlex.split(command)
-            self.assertEqual(parts[0], manifest["binary"], command)
+            self.assertTrue(command.startswith(prefix), command)
             try:
-                args = parser.parse_args(parts[1:])
+                args = parser.parse_args(shlex.split(command[len(prefix):]))
             except SystemExit as exc:   # pragma: no cover - the assertion message matters
                 self.fail(f"guide command does not parse: {command} ({exc})")
             self.assertTrue(callable(getattr(args, "func", None)), command)
@@ -4726,7 +6206,7 @@ class TestIntegrationGuide(unittest.TestCase):
         started = guide.index(manifest["commands"]["started_silent"])
         completed = guide.index(manifest["commands"]["completed_min_duration"])
         self.assertLess(started, completed)
-        self.assertLess(completed - started, 200)   # same section, adjacent lines
+        self.assertEqual(guide.count("\n", started, completed), 1)   # adjacent lines
         self.assertIn("BOTH", guide)
 
     def test_rules_block_uses_slug_scoped_markers_only(self):

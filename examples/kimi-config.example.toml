@@ -1,0 +1,25 @@
+# agentbell: Kimi Code hook wiring.
+# This is what `agentbell hooks install kimi` appends to ~/.kimi-code/config.toml
+# (or $KIMI_CODE_HOME/config.toml).
+#
+# Kimi's [[hooks]] tables accept only event, matcher, command and timeout - any
+# other key (such as async) makes Kimi refuse the whole config, so these hooks
+# have no async flag, only a 10-second timeout. UserPromptSubmit only records
+# a start marker (--silent, no notification); --min-duration 60 keeps turns
+# shorter than a minute silent. The agentbell:start / agentbell:end comments
+# delimit the block, so `agentbell hooks uninstall kimi` removes exactly this.
+
+# --- agentbell:start ---
+[[hooks]]
+event = "UserPromptSubmit"
+command = "/home/you/.local/bin/agentbell hook started --agent kimi --silent"
+timeout = 10
+[[hooks]]
+event = "Stop"
+command = "/home/you/.local/bin/agentbell hook run_completed --agent kimi --min-duration 60"
+timeout = 10
+[[hooks]]
+event = "StopFailure"
+command = "/home/you/.local/bin/agentbell hook run_failed --agent kimi"
+timeout = 10
+# --- agentbell:end ---

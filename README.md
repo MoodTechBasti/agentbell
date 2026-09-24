@@ -1,471 +1,467 @@
 # agentbell
 
-**One place for all your AI agent notifications — phone push + Approve/Deny from your pocket.**
+[![CI](https://github.com/MoodTechBasti/agentbell/actions/workflows/ci.yml/badge.svg)](https://github.com/MoodTechBasti/agentbell/actions/workflows/ci.yml) [![PyPI](https://img.shields.io/pypi/v/agentbell.svg)](https://pypi.org/project/agentbell/) [![License: MIT](https://img.shields.io/github/license/MoodTechBasti/agentbell)](https://github.com/MoodTechBasti/agentbell/blob/main/LICENSE) ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg) ![Dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen.svg)
 
-[![CI](https://github.com/MoodTechBasti/agentbell/actions/workflows/ci.yml/badge.svg)](https://github.com/MoodTechBasti/agentbell/actions) [![License](https://img.shields.io/github/license/MoodTechBasti/agentbell)](LICENSE) ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg) ![Dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen.svg)
+How many times today have you checked whether your AI agent is done yet?
 
-[Setup](#60-second-setup) · [Approval flow](#approval-flow-human-in-the-loop) · [Agents](#agents-what-gets-wired-up) · [Any other agent](#any-other-agent) · [Free vs. premium](#free-vs-premium) · [Commands](#quick-reference) · [MCP](#desktop-apps-and-editors-mcp) · [Trust model](#trust-model) · [Troubleshooting](#troubleshooting) · [FAQ](#faq)
+agentbell tells your phone when an agent finishes, fails, or needs you, and lets you answer from there.
 
----
+![Illustration: a phone showing two ntfy notifications from agentbell, "✅ npm run build succeeded (exit 0) in 4m12s" and an approval request "May I deploy to production?" with Approve and Deny buttons](https://raw.githubusercontent.com/MoodTechBasti/agentbell/main/docs/social-preview.png)
 
-Be honest — how many times have you already checked your screen today while your AI agent still wasn’t done?
+It is a command-line tool in a single Python file with no dependencies. The free path needs no account and no server of your own. Pushes go through [ntfy](https://ntfy.sh), either the public ntfy.sh or your own server. Telegram is an optional paid extra.
 
-You jump between ChatGPT, Claude, Gemini, Cursor, DeepSeek… Desktop apps, CLI, browser windows. Always checking. Always a bit on edge.
+## What it does
 
-`agentbell` is the single place that tells you when something actually needs you.
+- **Pushes to your phone** when an agent turn finishes (with its duration), fails, or waits for your input. Where agentbell can measure a turn, turns shorter than a minute stay silent.
+- **Approvals from the phone.** `agentbell ask "Deploy to production?"` shows Approve and Deny buttons and waits. Your answer comes back as an exit code and as JSON.
+- **Watches any command.** `agentbell watch -- npm run build` pushes the result, exit code and duration, and passes the exit code through.
+- **Wires up agents for you.** Hooks for Claude Code, Codex, OpenCode, Gemini CLI, Kimi Code and Qwen Code, and rule files for Cursor, Windsurf, Cline, Continue, Zed and Aider. Any other agent can wire itself up from `agentbell integrate`.
+- **MCP server** with `notify` and `ask_approval` tools for desktop apps and editors.
+- **Webhook server** (`/notify`, `/ask`) for CI jobs and machines without agentbell installed.
+- **Quiet hours, a retry queue, history and `doctor`**: a push that cannot be sent is queued and retried later, and `doctor` prints the command that fixes a problem.
 
-- **Push notification** straight to your phone the moment an agent finishes, fails, or waits for input
-- When it really needs a decision, you tap **Approve** or **Deny** from your phone — no running back to the keyboard
-- One stdlib-only Python file, zero dependencies, free, no account, no server
+Status: beta. The Claude Code, Codex and OpenCode hooks have been in daily use since August 2026 (versions 1.6.x), and the Kimi Code hooks on two days. Much of the rest, including everything that changed in 1.7.0, has only been tested by the automated test suite so far. The [status and limits](https://github.com/MoodTechBasti/agentbell#status-and-limits) section lists which parts.
 
-Works with **Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Kimi Code, Qwen Code, Windsurf, Cline, Continue, Zed, Aider**, the **ChatGPT and Claude desktop apps** (via MCP), CI jobs, any shell script — and [any other agent](#any-other-agent), via `agentbell integrate`.
+## Install
 
-> **Status:** v1.6.3 — feedback wanted.
+You need Python 3.9 or newer and the free ntfy app on your phone ([Android and iOS](https://docs.ntfy.sh/subscribe/phone/)).
 
-**The loop:**
-
-```text
-agent finishes or blocks  ->  agentbell  ->  phone
-agent receives decision   <-  agentbell  <-  Approve / Deny
+```bash
+pipx install agentbell        # recommended: isolated, and on your PATH
 ```
 
-**Requirements:** Python 3.9+ · the free [ntfy](https://ntfy.sh) app (iOS/Android) · no account and no server of your own for the free core.
+Other ways:
 
----
+```bash
+pip install agentbell         # inside a virtual environment
+
+# from a checkout (macOS, Linux): tries pipx, then pip --user, then a plain copy
+git clone https://github.com/MoodTechBasti/agentbell
+cd agentbell && ./install.sh
+```
+
+On **Windows** (PowerShell):
+
+```powershell
+py -m pip install --user agentbell
+py -m agentbell init
+py -m agentbell doctor     # if `agentbell` is not found, this prints the PATH fix
+```
+
+The test suite runs on Windows in CI, but these steps have not been run by hand on a Windows machine yet.
 
 ## 60-second setup
 
-### PyPI install
+```bash
+agentbell init
+```
 
-`pipx` keeps the CLI isolated while making `agentbell` available on your
-`PATH`:
+The wizard does the following:
+
+1. It suggests ntfy.sh and a long random topic, or takes your own server and topic.
+2. It shows the two topics to subscribe to in the ntfy app, for example `my-agentbell-topic-7f3a` and `my-agentbell-topic-7f3a-responses` (the second one carries your answers). Your topic will be a different random name.
+3. It asks about Telegram (premium, optional).
+4. It asks for quiet hours, which are optional.
+5. It offers hooks for the agents it finds.
+6. It sends a test push and prints the next steps.
+
+Then:
+
+1. Make sure the ntfy app is subscribed to both topics. `init` prints them again at the end.
+2. Check both directions:
+
+   ```bash
+   agentbell test                                            # push + delivery check
+   agentbell ask "Did this reach my phone?" --timeout 60     # tap Approve
+   ```
+
+3. Anything wrong: `agentbell doctor`.
+
+For scripts, `init --non-interactive` takes everything as flags (`--server`, `--topic`, `--ntfy-auth`, `--quiet-hours`, `--quiet-hours-mode`, `--no-test`, `--no-hooks`, …). See `agentbell init --help`.
+
+## Agents
 
 ```bash
-pipx install agentbell
-agentbell init     # wizard: topic name, quiet hours, agent hooks, test push
+agentbell hooks install claude codex opencode   # or: agentbell hooks install all
+agentbell hooks                                 # status: what is wired, and how
 ```
 
-Inside an existing virtual environment, `pip install agentbell` is the
-alternative. Verified: a fresh `pip install agentbell` in a clean venv
-installs v1.6.3 from PyPI and `agentbell doctor` runs its health check —
-evidence in `FIELD_TEST.md`.
+`hooks install all` also writes the six rule files (see below) into the current directory.
 
-### Checkout install — also works
+| Agent | What agentbell writes | Scope | Pushes | Real-world use |
+|---|---|---|---|---|
+| Claude Code | hooks in `~/.claude/settings.json` | global | finished (with duration), failed, needs input, permission dialog | yes, daily since Aug 2026; the permission-dialog push is new in 1.7.0 and not field-tested |
+| Codex | hook block in `~/.codex/config.toml` | global | finished (with duration) | yes, daily since Aug 2026 |
+| OpenCode | plugin `~/.config/opencode/plugin/agentbell.js` | global (`--project`: that repo) | finished (with duration), failed, permission asked | yes, daily since Aug 2026 with the 1.6 plugin; the 1.7.0 plugin is not re-tested yet |
+| Kimi Code | hook block in `~/.kimi-code/config.toml` | global | finished (with duration), failed | yes, on two days in Aug 2026 |
+| Gemini CLI | `AfterAgent` hook in `~/.gemini/settings.json` | global | finished (every turn: Gemini has no failure event, and no duration is measured) | not yet |
+| Qwen Code | hooks in `~/.qwen/settings.json` | global | finished (with duration), failed | not yet |
+| Cursor | `.cursor/rules/agentbell.mdc` | per project | finished, needs input, failed (rule) | not yet |
+| Windsurf | `.windsurf/rules/agentbell.md` (plus a legacy `.mdc`) | per project | same (rule) | not yet |
+| Cline | `.clinerules/agentbell.md` | per project | same (rule) | not yet |
+| Continue | `.continue/rules/agentbell.md` | per project | same (rule) | not yet |
+| Zed | a marked block in `.rules` | per project | same (rule) | not yet |
+| Aider | an Aider-only block in `AGENTS.md` | per project | same (rule) | not yet |
 
-**No dev experience needed.** On macOS or Linux, open a terminal and run:
+The "real-world use" column comes from [FIELD_TEST.md](https://github.com/MoodTechBasti/agentbell/blob/main/FIELD_TEST.md). "Not yet" means untested, not known good: the installer and the config format are covered by the automated tests, but no real agent turn has been recorded.
+
+**Global hooks** (the first six) apply in every repository. They are deterministic lifecycle hooks: the agent host runs them, and the model has no say in it.
+
+**Rule-file agents** (the last six) have no hook agentbell uses. For each of them, agentbell writes an instruction telling the agent to call `agentbell hook …` when it finishes, needs input or fails. This works only as well as the model follows the rule. It is also **per project**. `hooks install cursor` writes into the current directory, or into `--project <dir>`, and nowhere else, so run it once in every repository you want covered. `agentbell init` wires these agents only in the directory you run it from.
+
+Details that apply to the hooks:
+
+- **No spam for short turns.** For Claude Code, Codex, OpenCode, Kimi Code and Qwen Code, the finished push carries `--min-duration 60`, so a turn shorter than a minute stays silent. It is recorded as `hook.skipped_short` in `agentbell history`. Failures and turns of unknown duration always push. You can edit the number in the hook. For Claude Code, Codex, Kimi Code and Qwen Code, re-running `hooks install` keeps your value.
+- **No doubles.** The same push (same agent, event and text) within 5 seconds is sent once. The repeat is recorded as `hook.skipped_duplicate`.
+- **Hooks do not hold up the agent for long.** Claude Code, Codex and Qwen Code run them in the background. Gemini CLI, Kimi Code and the OpenCode plugin wait for the hook, so every hook caps its sending at 6 seconds, below Kimi Code's 10-second and Gemini CLI's 15-second hook timeouts. What does not fit is queued and sent later.
+- **Your config stays yours.** Existing files are merged. `hooks uninstall` removes only the entries agentbell generated. A config agentbell cannot edit safely is left unchanged, and the command exits 1. Examples are a `settings.json` with comments, or TOML with inline hook tables.
+
+Reference copies of what the installers write are in [examples/](https://github.com/MoodTechBasti/agentbell/blob/main/examples/README.md).
+
+### Any other agent
+
+Any agent that can run a shell command or use an MCP server can use agentbell:
 
 ```bash
-git clone https://github.com/MoodTechBasti/agentbell && cd agentbell
-./install.sh       # picks pipx, pip --user or a plain copy — whichever works
-agentbell init     # wizard: topic name, quiet hours, agent hooks, test push
+agentbell integrate               # prints a self-integration guide; changes nothing
+agentbell verify --agent <slug> --since 10m   # did real events arrive? read-only
 ```
 
-That's it. `agentbell init` prints the next steps; `agentbell doctor` tells you exactly what's wrong and how to fix it at any point.
+Give the `integrate` output to the agent. The guide tells it to wire itself up in its own config files and to ask for your approval first. agentbell itself never edits configs it has no installer for. `verify` then checks `history` for real lifecycle events. It flags possible double integrations, and it does not count a `--force` smoke test as proof. GitHub Copilot CLI 1.0.80 integrated itself this way on 2026-08-21. It is so far the only self-integration with a recorded test protocol.
 
-**Windows (PowerShell):** install from the checkout without `install.sh`:
-
-```powershell
-git clone https://github.com/MoodTechBasti/agentbell
-Set-Location agentbell
-py -m pip install --user .
-py -m agentbell init  # works even before the Scripts folder is on PATH
-```
-
-To make `agentbell` available to future terminals, hooks, and desktop MCP clients, run this once in PowerShell, then close and reopen PowerShell:
-
-```powershell
-$scripts = py -c "import sysconfig; print(sysconfig.get_path('scripts', scheme='nt_user'))"
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-[Environment]::SetEnvironmentVariable("Path", "$userPath;$scripts", "User")
-```
-
-After reopening PowerShell, `agentbell doctor` confirms the installation.
-
-> **New to the terminal?** You need Python 3.9+. On macOS: `brew install python3`. On Debian/Ubuntu: `sudo apt install python3`. On Windows, install Python from [python.org](https://www.python.org/downloads/) and use `py --version`. If `agentbell` is not found after installation, run `py -m agentbell doctor` for a copy-pasteable PATH fix.
-
-### Developer path — full reference below
-
-If you know your way around hooks, MCP and config files, jump straight to [Agents: what gets wired up](#agents-what-gets-wired-up), the [Quick reference](#quick-reference), or [MCP](#desktop-apps-and-editors-mcp).
-
----
-
-## Approval flow (human in the loop)
-
-This is the part no notifier gives you: the agent doesn't just tell you it's blocked, it **waits for your answer** — and you give it from your phone.
-
-```
-agent ── ask "Deploy to prod?" ──►  phone: 🔴 Approval requested
-                                    [Approve] [Deny]   (or type any answer)
-agent ◄── approved / denied / your text / timeout ◄──  phone
-```
-
-The answer travels **through ntfy itself** — you don't expose an endpoint:
-
-- The question goes to your main topic with action buttons.
-- Buttons and app replies publish to a dedicated `<topic>-responses` topic.
-- `ask` waits on a live stream **plus** a polling fallback (robust when a server buffers streams).
-
-**Button answers never get crossed.** Every question carries a 64-bit request ID, and button answers are matched to exactly that ID. Free-text replies carry no ID, so they always go to the newest open question — with two asks in flight, answer with the buttons. Answers that were already on the topic when a question is asked are ignored, so a new `ask` can never inherit an old answer.
-
-**How your reply is read:**
-
-| You reply | Result | Exit |
-|---|---|---|
-| tap **Approve**, or type `yes` / `ok` / `y` | approved | 0 |
-| tap **Deny**, or type `no` / `deny` / `stop` | denied | 1 |
-| `no, not before the release` | denied, reason kept | 1 |
-| `use the staging cluster` | answered (text on stdout) | 0 |
-| `yes, but use staging` | answered, **not** a bare approval | 0 |
-| nothing | timeout | 2 |
-
-Exit 0 means "approved **or** answered" — so if you chain `agentbell ask "Deploy?" && deploy`, a free-text reply also proceeds. For a strict gate, read the `--json` output and check `approved` together with `answer`.
-
-> **Before you gate anything real on this:** the answer path is only as private as your topic name, and on public ntfy.sh anyone who knows that name can approve your questions. Read the [trust model](#trust-model) — for sensitive approvals, self-host ntfy with auth.
-
----
-
-## Agents: what gets wired up
-
-`agentbell hooks install <agent>` does the wiring for you. Nothing is written into your agent session, nothing blocks a turn. (Your agent isn't in the table? See [Any other agent](#any-other-agent).)
-
-| Agent | Mechanism | Scope | Events |
-|---|---|---|---|
-| **Claude Code** | `~/.claude/settings.json` hooks | global | finished (with duration), failed, needs-input |
-| **Codex** | `~/.codex/config.toml` `[[hooks.…]]` | global | finished (with duration) |
-| **OpenCode** | real plugin in `~/.config/opencode/plugin/` | global | finished (with duration), failed, permission asked |
-| **Gemini CLI** | `~/.gemini/settings.json` `AfterAgent` | global | finished |
-| **Kimi Code** | `~/.kimi-code/config.toml` `[[hooks]]` | global | finished (with duration), failed |
-| **Qwen Code** | `~/.qwen/settings.json` hooks | global | finished (with duration), failed |
-| **Cursor** | `.cursor/rules/agentbell.mdc` (`alwaysApply`) | project | finished, needs-input, failed |
-| **Windsurf** | `.windsurf/rules/agentbell.md` (`trigger: always_on`) + legacy `.mdc` for pre-Devin builds | project | finished, needs-input, failed |
-| **Cline** | `.clinerules/agentbell.md` | project | finished, needs-input, failed |
-| **Continue** | `.continue/rules/agentbell.md` | project | finished, needs-input, failed |
-| **Zed** | `.rules` block | project | finished, needs-input, failed |
-| **Aider** | Aider-scoped `AGENTS.md` block | project | finished, needs-input, failed |
-
-Claude Code, Codex, OpenCode, Gemini CLI, Kimi Code and Qwen Code have real hook/plugin systems — the wiring is exact and deterministic. The editors (Cursor, Windsurf, Cline, Continue, Zed, Aider) have no lifecycle hooks, so they get a clearly marked rule file that tells the agent when to call the CLI. That's best-effort by construction: it's an instruction the model can skip. Existing configs are merged, never overwritten; `uninstall` removes only what was added.
-
-Older Aider installs used a shared `AGENTS.md` instruction that other agents
-could follow too. `agentbell hooks status` and `agentbell verify` display an
-ACTION REQUIRED banner when they find one. Run `agentbell hooks install aider`
-from that project to update only agentbell's marked block; all other
-`AGENTS.md` content is preserved.
-
-`agentbell init` lists every agent it detects on your system (CLI on `PATH` or config dir) and offers to wire it up; `agentbell hooks install all` wires every supported agent at once.
-
-### No spam while you're watching
-
-"Finished" fires after *every* turn — a 20-second answer you watched happen isn't worth a push. So for Claude Code, Codex, OpenCode, Kimi Code and Qwen Code the installed hook carries `--min-duration 60`: turns shorter than a minute stay silent (logged as `hook.skipped_short` in `history`, so it's never a mystery). **Failures always send a notification**, and so does any turn whose duration is unknown.
-
-The same push twice within 5 s (same agent, event and text) is one piece of news: the repeat is suppressed and logged as `hook.skipped_duplicate` — a host that reports one turn end twice, or six parallel sessions failing on the same outage, buzzes once.
-
-Want a different threshold? Change the number in the hook command, or re-install:
+Scripts can also fire the events directly:
 
 ```bash
-agentbell hooks install claude          # default: 60 s
-# then edit the "--min-duration 60" in ~/.claude/settings.json to taste (0 = every turn)
+agentbell hook run_completed --agent my-agent --duration 312
+agentbell hook run_failed --agent my-agent
 ```
 
-Custom agents and scripts just call the CLI:
+## Approvals
 
 ```bash
-long_job && agentbell notify "done" || agentbell notify "FAILED" --priority urgent
-agentbell watch -- long_job          # …or let watch do both
-```
-
----
-
-## Any other agent
-
-The runtime is agent-agnostic: any agent that can run a shell command or register an MCP server can use agentbell — it doesn't need to be in the table above. Instead of shipping an installer per vendor, agentbell publishes a **contract** and observes the results:
-
-```bash
-agentbell integrate    # prints the self-integration guide (changes nothing)
-agentbell verify       # did it actually work? (read-only, sends nothing)
-```
-
-Hand the `integrate` output to the agent ("integrate yourself with this"). It wires up **its own** config files, with its own permissions — agentbell never edits configs it doesn't have an installer for. Then one real turn plus `agentbell verify --agent <slug> --since 10m` shows whether events actually arrived, were held by quiet hours, or look like a double integration. `agentbell integrate --json` prints the same contract as a machine-readable manifest.
-
-Three classes, honestly labeled:
-
-- **Native** — the 12 agents in the table: installers maintained and tested here.
-- **Self-integrated** — wired by the agent itself against the printed contract. Counts as *verified* only after `verify` has seen a real lifecycle event (a `--force` smoke test is marked as such and doesn't count).
-- **Rules-based** — the agent only reads an instructions file: best-effort by construction; the model can skip the rule.
-
-> **Status:** field-verified with a previously unknown agent so far: **GitHub Copilot CLI 1.0.80** (2026-08-21: self-integrated from the printed contract alone — real lifecycle events, `verify` exit 0, idempotent re-run, clean removal; evidence in `FIELD_TEST.md`). *This line gets updated as real integrations are reported.*
-
----
-
-## What it fixes
-
-| The annoying part | What agentbell does |
-|---|---|
-| Alt-tabbing every two minutes: "is it done yet?" | Push on finish / fail — with exit code and duration (`✅ npm run build succeeded in 4m12s`) |
-| The agent silently waits for a permission you never saw | `input_required` push the second it blocks |
-| You must sit at the keyboard to say "yes, deploy" | `agentbell ask` → **Approve / Deny buttons on your phone**; the agent blocks until you answer |
-| Notifier tools want an account, a hosted server, or a subscription | Free core. No account, no server, no subscription. Telegram extras: **€4.99 once** |
-| Wiring notifications into every agent, by hand, per repo | `agentbell init` detects your agents and installs their hooks — globally, so every repo is covered |
-| It breaks at 3 a.m. and you have no clue why | `agentbell doctor` names the problem **and prints the command that fixes it** |
-| "Notifications" that spam you all night | Quiet hours: drop *or* hold-and-bundle. Urgent always gets through |
-| A wifi blip silently eats the notification | Retry, then a persistent queue that gets replayed |
-| Uninstalling leaves junk in five config files | `agentbell uninstall` — dry run first, removes only its own markers |
-
----
-
-## Free vs. premium
-
-**Free and open source — the complete core:**
-ntfy push · native OS notifications · agent hooks for 12 agents · the full approval flow (buttons + free text) · `watch` · webhook server · MCP server · priorities · quiet hours (with defer) · history · retry + offline queue · `doctor` · clean uninstall.
-
-That list is the whole product for most people. Nothing above nags, expires, or asks for a key.
-
-> **Premium — €4.99 one-time, lifetime. No subscription, no account, no phone-home.**
-> - **Approve/Deny buttons that are authenticated to you.** A Telegram chat is tied to your account — unlike an ntfy topic, which anyone who learns its name could answer. (Via the `agentbell bot` daemon.)
-> - Plus **parallel delivery**: ntfy *and* Telegram at once, first answer wins.
->
-> [**Buy a lifetime key — €4.99**](https://buy.polar.sh/polar_cl_MAAwIuriOXF45xu9Fm0dbgr9iTIJFqsKM) — you get an `AB1-…` key by email within 24 hours (usually much faster), then: `agentbell license activate AB1-...`
-> The key never expires and isn't tied to a machine — use it on every computer you work on. It's verified offline; nothing about you is ever sent anywhere. VAT is included and the payment provider sends your invoice. Not what you expected? Reply to the purchase email within 14 days and you get a refund, no questions asked.
->
-> **The honest part:** the paywall is one `if` in a file you can read, and the project is MIT — a fork that deletes it is legal. €4.99 is priced as "less than the five minutes that would take." If it isn't worth that to you, the free core is complete and I'd rather you use it. What the key *is*: an Ed25519 signature over your customer id, checked against a public key that sits in plain sight in `agentbell.py`. It can't be forged, it's verified entirely on your machine (no network, ever), and there's no secret hidden in the install for anyone to dig out. See `DECISIONS.md` §2b for the full scheme and what it deliberately doesn't protect against.
-
----
-
-## Telegram approvals (premium)
-
-Real Approve/Deny buttons in Telegram, powered by a small opt-in long-polling daemon — no public endpoint, still zero dependencies.
-
-```bash
-agentbell license activate <key>
-agentbell init                 # enter bot token + chat id
-agentbell bot install-service  # answer daemon in the background
-agentbell ask "Deploy to production?"
-```
-
-- Buttons are attached only while the daemon's heartbeat is fresh — never dead buttons.
-- Free-text replies in the bot chat count as answers; only your configured chat can answer.
-- With ntfy **and** Telegram configured, both get the question — first answer wins.
-- `agentbell bot status` shows daemon state, lock, last error, open questions, queue counts.
-
----
-
-## Quick reference
-
-```bash
-# notify
-agentbell notify "Build finished" --priority high --tags build
-
-# run something and get told how it went (exit code is passed through)
-agentbell watch -- npm run build
-
-# ask and wait for the answer   (exit 0=approved/answered, 1=denied, 2=timeout, 3=error)
 agentbell ask "Deploy to production?" --timeout 600
-agentbell ask "Which environment?" --no-buttons        # free-text answer
-agentbell ask "Deploy?" --json
-
-# wire up agents (global — applies in every repo)
-agentbell hooks install claude codex opencode gemini cursor
-agentbell hooks install all             # every supported agent, detected or not
-agentbell hooks status
-agentbell hooks uninstall all
-
-# any agent not in the list above
-agentbell integrate                   # print the self-integration contract (changes nothing)
-agentbell integrate --json            # same contract as a machine-readable manifest
-agentbell verify --agent <slug>       # did events actually arrive? read-only, sends nothing
-
-# expose as an MCP tool (desktop apps + editors)
-agentbell mcp add                     # all clients it can detect
-agentbell mcp add claude-desktop      # just one
-agentbell mcp add --print             # print the snippet, change nothing
-
-# health check with copy-paste fixes
-agentbell doctor
-agentbell doctor --send               # …and send a real test notification
-
-# premium: Telegram answer daemon
-agentbell bot install-service         # run in the background (systemd/launchd) — recommended
-agentbell bot                         # or in the foreground, for debugging
-agentbell bot status
-
-# reliability + inspection
-agentbell queue list                  # what is waiting and why
-agentbell queue flush                 # deliver it now
-agentbell history --limit 20
-agentbell config show                 # secrets redacted
-agentbell config set ntfy.topic <new> # change one setting, no wizard
-
-# webhook for CI / a VPS without the CLI
-agentbell server                      # POST /notify, POST /ask, GET /healthz
-
-# complete removal
-agentbell uninstall                   # dry run, deletes nothing
-agentbell uninstall --yes
 ```
 
----
+The phone shows **❓ Approval requested** with **Approve** and **Deny** buttons. `ask` blocks until you answer or the timeout ends. The default timeout is `approval_timeout` from the config, 300 seconds. The answer travels through ntfy itself: the buttons post to `<topic>-responses`, where `ask` is listening. Nothing on your machine has to accept incoming connections.
 
-## Desktop apps and editors (MCP)
+### How replies are read
 
-`agentbell mcp add` registers a stdio MCP server exposing two tools:
-`notify(message, title, priority, tags)` and `ask_approval(message, timeout_seconds)`.
+| Reply | Result | Exit | `approved` |
+|---|---|---|---|
+| **Approve** button; typed `APPROVED <id>`; a bare `yes`, `y`, `ok`, `okay`, `yep`, `yeah`, `ja`, `approve`, `approved`, 👍; or the yes button's label alone | approved | 0 | `true` |
+| **Deny** button; typed `DENIED <id>`; a no, refusal or postponement such as `no`, `nein`, `stop`, `not now`, `wait`, `later`, `später`, 👎, ❌, ⏳, also with a reason after it (`no, not before the release`); a yes followed by one of these (`yes, but wait`) | denied | 1 | `false` |
+| any other text, such as `staging`, `yes, but use staging` or `not staging` | answered: the text is printed on stdout | 0 | `false` |
+| nothing before the timeout | timeout | 2 | `false` |
+| not configured, the question could not be sent, or no answer channel left | error | 3 | (no output) |
 
-| Client | Where it's registered | Works |
-|---|---|---|
-| **ChatGPT Desktop** | `~/.codex/config.toml` (shared with Codex CLI) | yes — local stdio |
-| **Claude Desktop** | `claude_desktop_config.json` | yes — local stdio |
-| Claude Code | `claude mcp add --scope user` | yes |
-| Codex CLI | `~/.codex/config.toml` | yes |
-| Cursor | `~/.cursor/mcp.json` (global) | yes |
-| VS Code / Copilot | user `mcp.json` | yes |
-| Gemini CLI, OpenCode | their settings files | yes |
-| **Qwen Code** | `~/.qwen/settings.json` (global; `--project` → `.qwen/settings.json`) | yes |
-| **Kimi Code** | `~/.kimi-code/mcp.json` (global; `--project` → `.kimi-code/mcp.json`) | yes |
-| ChatGPT **web** | — | no: web accepts remote MCP servers only |
+Only an explicit yes approves. Free text exits 0 so that an agent can use the answer, but it is **not** an approval. An unreadable config file also exits 1. Treat any non-zero exit as no.
 
-Restart the client afterwards. `agentbell mcp add --print` gives you the raw snippet for anything not in that list (Windsurf, Zed, LM Studio, …); `examples/README.md` has the same snippets to copy. Kimi Code exposes the tools as `mcp__agentbell__notify` and `mcp__agentbell__ask_approval`.
+To type an answer, send a message to `<topic>-responses` in the ntfy app, or write in the Telegram bot chat.
 
----
+**Which question a reply answers.** A button always answers its own question. So do a typed `APPROVED <id>` / `DENIED <id>` and Telegram's Reply on the question. A typed reply that names no question is used only when exactly one approval question can still be on the phone. A question counts while its `ask` is still waiting (its process holds a lock on the question's marker file). One that ended without an answer on that channel (its timeout ran out, its send timed out, it was killed, or it was answered on the other channel) counts for 60 seconds after it ended. One the server rejected (an HTTP 4xx error, or Telegram's `ok: false`) never reached the phone and does not count; after a server error or a timeout it may have, and it counts. What counts is judged at the moment the reply was sent: a reply that reaches agentbell more than 30 seconds after it was sent (after a lost connection, or from a Telegram bot that was down) is refused, and a clock difference between your machine and the server does not change that. "Sent" means when the server received it: a reply typed while the phone was offline is judged when it arrives, and can reach an ask that is by then the only one open. With two questions that count, or when the only one has already ended, agentbell refuses the reply and does not guess. It sends a notice on the same channel ("Reply not used" on ntfy; the Telegram bot sends at most one per reason a minute) and records `stale_answer` in `history`. Use the buttons, Telegram's Reply or `APPROVED <id>` / `DENIED <id>` in that case.
 
-## Events, priorities, quiet hours
+### Gating a script on an approval
 
-| Event | Priority | Emoji |
+Gate on `approved`, never on "an answer came back". `agentbell ask "Deploy?" && ./deploy.sh` is **not** a gate: it deploys on any free-text reply, for example `yes, but use staging`.
+
+```bash
+answer=$(agentbell ask "Deploy to production?" --timeout 600 --json) || exit $?   # 1 denied, 2 timeout, 3 error
+if printf '%s' "$answer" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("approved") is True else 1)'; then
+    ./deploy.sh
+else
+    echo "not approved: $answer" >&2
+    exit 1
+fi
+```
+
+`--json` prints one object:
+
+```json
+{"approved": false, "answer": "yes, but use staging", "denied": false, "timeout": false, "channel": "ntfy"}
+```
+
+On a timeout the object has no `channel` key. The same object comes back from the MCP tool `ask_approval` and from the webhook's `/ask`. `/ask` returns HTTP 200 for every answer and for a timeout, so a successful HTTP status is not an approval either. It returns 400 for a bad request and 500 with an `error` when the question cannot be asked.
+
+Other options: `--yes-label` / `--no-label` rename the buttons, `--no-buttons` asks for a typed answer only, and `--channel ntfy|telegram` picks one channel.
+
+## Watch any command
+
+```bash
+agentbell watch -- npm run build
+```
+
+- On success: **✅ npm run build succeeded (exit 0) in 4m12s**, at normal priority.
+- On failure: **🔴 npm run build failed (exit 1) in 12s**, at urgent priority.
+
+Use `--priority` and `--fail-priority` to change the priorities, and `--title` or `--tags` to label the push.
+
+- `watch` exits with the command's own exit code. A command ended by signal N exits 128+N (not on Windows). A command that could not be started exits 127. A failed push never changes the exit code.
+- The command runs **without a shell**, so pass it as separate words. For pipes, `&&` or redirects, use `agentbell watch -- sh -c 'make && make test'`.
+- The command keeps the terminal: `sudo` password prompts work, and Ctrl-C and Ctrl-Z reach the command. `watch` then waits for the command to end and sends the push anyway. If the push itself hangs, Ctrl-C queues it and exits (not on Windows).
+- On Windows, `watch` finds `.cmd` and `.bat` tools such as npm on `PATH`. It refuses arguments to them that contain `%`, `"` or a line break (exit 127), because `cmd.exe` would reinterpret them.
+
+This terminal and signal handling is new in 1.7.0 and covered by tests, but not yet checked by hand (FIELD_TEST rows 26–31 and 40).
+
+## MCP: desktop apps and editors
+
+```bash
+agentbell mcp add                    # every supported client found on this machine
+agentbell mcp add claude-desktop     # just one
+agentbell mcp add --print            # print the snippets, write nothing
+```
+
+Supported clients:
+
+- Claude Code
+- Claude Desktop
+- ChatGPT Desktop (shares `~/.codex/config.toml` with Codex)
+- Codex
+- Gemini CLI
+- Qwen Code
+- Kimi Code
+- Cursor
+- OpenCode
+- VS Code
+
+`--project <dir>` writes a project config for Cursor, OpenCode, Qwen Code and Kimi Code. For other clients, `--print` includes the JSON, TOML and Zed (`context_servers`) shapes. Restart the client after adding the server.
+
+The server exposes two tools:
+
+- `notify(message, title?, priority?, tags?, agent?)`
+- `ask_approval(message, timeout_seconds?, yes_label?, no_label?)` waits for the answer and returns the JSON shown above. The timeout defaults to 120 seconds and is limited to 10–600 seconds, because clients cancel long tool calls.
+
+The MCP path has been checked once with a real host (GitHub Copilot CLI, 2026-08-21). The desktop-app registrations have not been field-tested yet.
+
+## Webhook for CI and remote machines
+
+```bash
+export WEBHOOK_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+agentbell config set webhook.token "$WEBHOOK_TOKEN"
+agentbell server        # 127.0.0.1:8756 by default
+```
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8756/notify \
+  -H "Authorization: Bearer $WEBHOOK_TOKEN" -H "Content-Type: application/json" \
+  -d '{"message":"CI pipeline finished","priority":"normal"}'
+```
+
+`POST /ask` blocks until you answer (`timeout_seconds` from 1 to 3600) and returns the `ask --json` object. Gate on `"approved": true`. `GET /healthz` reports the version.
+
+To listen on another address or port, edit `webhook.listen` and `webhook.port` in the config file. The server refuses a non-loopback address without a token. It also rejects requests that carry a browser `Origin` header. [examples/webhook.sh](https://github.com/MoodTechBasti/agentbell/blob/main/examples/webhook.sh) has a full example.
+
+## Priorities and quiet hours
+
+| Event | Priority | Push starts with |
 |---|---|---|
 | `run_completed` | normal (3) | ✅ |
 | `run_failed` | urgent (5) | 🔴 |
 | `input_required` | high (4) | 🔵 |
 | `permission_required` | high (4) | 🔐 |
-| `started` | low (2) | ▶️ |
+| `started` | low (2) | ▶️ (the installed hooks record it silently) |
 
-Quiet hours (e.g. `22:00-07:30`) hold back everything below `normal`:
+Quiet hours hold back pushes **below `quiet_hours_min_priority`**. The default is `normal`, so only `min` and `low` pushes are held. Finished, failed, needs-input and permission pushes still arrive at night. To hold finished turns overnight as well:
 
-| `quiet_hours_mode` | Behavior |
-|---|---|
-| `suppress` (default) | dropped, logged to history |
-| `defer` | delivered after the window; more than 3 are bundled into one summary |
+```bash
+agentbell config set quiet_hours 22:00-07:30          # several: 22:00-07:30,13:00-14:00
+agentbell config set quiet_hours_min_priority high    # hold min, low and normal; high and urgent still arrive
+agentbell config set quiet_hours_mode defer           # or: suppress (the default)
+```
 
-`--force` bypasses quiet hours, `--defer` defers a single message. **Approval questions are never suppressed or deferred.**
+- `suppress` drops held pushes and records them in `history`.
+- `defer` stores held pushes and delivers them after the window. Delivery happens with the next push, with `agentbell queue flush`, or through the Telegram bot. It does not happen exactly at the end of the window. If 4 or more are due at once, they arrive as one summary.
+- `notify --force` ignores quiet hours, and `notify --defer` defers a single push. **Approval questions are never held.**
 
----
+## Commands
 
-## Reliability
+```bash
+agentbell init                           # setup wizard (re-run any time)
+agentbell notify "Build finished" --priority high --tags build
+agentbell ask "Deploy?" --json           # approval; exit 0/1/2/3
+agentbell watch -- <command> [args...]   # run and push the result
 
-Transient failures (network down, timeout, 5xx) are retried with backoff, then the notification goes into a persistent queue instead of being lost:
+agentbell hook <event> --agent <slug>    # fire an event yourself (scripts, other agents)
+agentbell hooks                          # status of all twelve agents
+agentbell hooks install <agent...>|all   # --project <dir> for rule files
+agentbell hooks uninstall <agent...>|all
+agentbell mcp add [client...]            # --print, --project <dir>
+agentbell mcp                            # the stdio MCP server that clients start
+agentbell integrate [--json]             # contract for any other agent
+agentbell verify [--agent <slug>] [--since 10m]
 
-- replayed after your next successful send, by `queue flush`, or by the bot daemon
-- `queue list` shows exactly what's waiting, how old it is and why
-- bounded: 100 items / 24 h, oldest dropped first — everything logged to history
-- `notify` exits 0 when queued (not lost, just delayed); `ask` is never queued
+agentbell test                           # real push + delivery check
+agentbell doctor [--send]                # health check with fix commands
+agentbell history --limit 20             # what agentbell did, and why
+agentbell queue list | flush | status    # queued and deferred pushes
 
-This is best-effort delivery, not a guarantee — see [trust model](#trust-model) for what ntfy.sh's free tier does and doesn't promise.
+agentbell config show | path | set <key> <value>
+agentbell server                         # webhook: POST /notify, POST /ask, GET /healthz
+agentbell license activate <key> | status
+agentbell bot | bot status | bot install-service   # Telegram (premium)
+agentbell uninstall [--yes] [--project <dir>]   # dry run unless --yes
+```
 
----
+Every command has `--help`.
 
 ## Configuration
 
-`~/.config/agentbell/config.json` (mode 600 — it holds your license key, bot token and ntfy password):
+The config file is `~/.config/agentbell/config.json`, created with mode 600. `agentbell config path` shows where yours is. `agentbell config show` prints it with credentials redacted.
 
-| Key | Meaning |
-|---|---|
-| `ntfy.server` / `ntfy.topic` / `ntfy.auth` | channel + optional `user:pass` (or an access token) for self-hosted ntfy |
-| `ntfy.action_auth` | optional scoped credential for approval buttons (see the [trust model](#trust-model)) |
-| `telegram.bot_token` / `telegram.chat_id` | Telegram channel (premium) |
-| `license` | premium key |
-| `channels` | `["ntfy"]`, `["ntfy","os"]`, `["ntfy","telegram"]` |
-| `quiet_hours` / `quiet_hours_min_priority` / `quiet_hours_mode` | see above |
-| `approval_timeout` | default seconds for `ask` (300) |
-| `webhook.listen` / `webhook.port` / `webhook.token` | `agentbell server` (token = bearer auth; required for any non-loopback `listen`) |
+| Key | Meaning | `config set` |
+|---|---|---|
+| `ntfy.server` | ntfy server URL (default `https://ntfy.sh`) | yes |
+| `ntfy.topic` | your topic: letters, digits, `-` and `_`, at most 54 characters (`ask` adds `-responses`, and ntfy allows 64), a warning below 16 | yes |
+| `ntfy.auth` | `user:pass` or a token for a protected server (`none` clears it) | yes |
+| `ntfy.action_auth` | publish-only token that the approval buttons use (see Security) | yes |
+| `channels` | `ntfy`, `os` (desktop notification), `telegram`, comma-separated | yes |
+| `quiet_hours` / `quiet_hours_mode` / `quiet_hours_min_priority` | see above | yes |
+| `approval_timeout` | default seconds for `ask` (300) | yes |
+| `webhook.token` | bearer token for `agentbell server` | yes |
+| `webhook.listen` / `webhook.port` | server address (`127.0.0.1`, `8756`) | edit the file |
+| `telegram.chat_id` | Telegram chat | yes |
+| `telegram.bot_token` | Telegram bot token | via `agentbell init` |
+| `license` | premium key | via `agentbell license activate` |
 
-State (history, queue, deferred, bot state): `~/.local/state/agentbell/`.
-Env overrides: `AGENTBELL_CONFIG_DIR`, `AGENTBELL_CONFIG`, `AGENTBELL_STATE_DIR`, `AGENTBELL_LICENSE`.
+State lives in `~/.local/state/agentbell/`: history, the queue, deferred pushes and bot state. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are respected. You can override the locations with `AGENTBELL_CONFIG_DIR`, `AGENTBELL_CONFIG` (the file itself) and `AGENTBELL_STATE_DIR`. `AGENTBELL_LICENSE` supplies a key.
 
----
+A failed push is retried, then kept in a local queue: up to 100 items, for up to 24 hours. The queue is replayed after the next successful push, by `agentbell queue flush`, or by the Telegram bot. A push that is still undelivered after 24 hours, or pushed out by a full queue, is dropped. A queued push counts as sent for now: `notify` exits 0 and prints a warning on stderr. `notify` exits 3 only when a channel fails for good, for example when the server rejects the request.
 
-## Trust model
+## Security and trust model
 
-What this tool actually protects, and what it doesn't. Read this before you gate a production deploy on it.
+Read this before you gate anything that matters on a phone tap.
 
-**Your topic name is the only credential in the free setup.** Anyone who learns it can read every notification, publish fake ones, and approve or deny any open `ask`. Treat it like a password — that's ntfy's own wording in their terms. `init` generates a long random topic for exactly this reason, so don't shorten it, and **don't paste `doctor` or `config show` output into public issues.**
+- **On the free path, the topic name is the only credential.** Anyone who knows it can read your pushes, send fake ones and answer your approval questions. `init` generates a long random topic for that reason. Topics shorter than 16 characters get a warning. Treat the topic like a password.
+- **ntfy.sh is a third-party relay.** It can read your message text, and hook pushes include the project directory. If that matters, [run your own ntfy server](https://docs.ntfy.sh/install/) with [access control](https://docs.ntfy.sh/config/#access-control) and point agentbell at it:
 
-**Sensitive approvals get a runtime warning when ntfy authentication is absent.** AgentBell recognizes only a narrow set of high-impact requests (for example, production deployments, production database deletion, credential rotation, money transfers, and firewall changes). This is a reminder, not a security decision: it cannot understand every action's real impact. Use self-hosted ntfy with auth before relying on phone approval for a sensitive action.
+  ```bash
+  agentbell config set ntfy.server https://ntfy.example.com
+  agentbell config set ntfy.auth 'user:password'      # or an access token
+  agentbell config set ntfy.action_auth tk_...        # token that may only publish to <topic>-responses
+  ```
 
-**ntfy.sh is a third-party relay.** Your message text passes through servers you don't control and can be read there — including the working directory that hook notifications carry. If that matters for your work, self-host ntfy and point `ntfy.server` at it.
+- **The buttons carry their credential inside the message.** Every subscriber of the topic can see it. So agentbell never puts `ntfy.auth` into a button. On a protected server without `ntfy.action_auth`, questions go out without buttons, and a typed reply still works.
+- **Changing the server clears the credentials.** `config set ntfy.server` and `init` drop `ntfy.auth` and `ntfy.action_auth` when the server really changes, so a password is never sent to a new server.
+- **Sensitive-looking questions** (a production deploy, deleting a database, rotating credentials, …) print a warning when ntfy has no authentication. This is only a reminder, not a safety check.
+- **Output that is safe to share:** `agentbell verify` never prints your topic, server or paths. `agentbell doctor` prints the full topic, and `config show` prints its first characters. Keep both out of public issues.
+- **The webhook** accepts anything from loopback unless you set `webhook.token`. Set one even locally.
+- **No telemetry.** agentbell connects only to the ntfy server you configure and, if you use it, the Telegram API. License keys are checked offline.
+- **Delivery is best effort.** agentbell retries and queues, but neither agentbell nor ntfy.sh guarantees delivery.
 
-**Action buttons carry their credential inside the message.** On a protected server, every subscriber to the topic can see a button's `Authorization` header. Set `ntfy.action_auth` to a token that may only publish to the `-responses` topic instead of reusing your account password.
+To report a vulnerability, see [SECURITY.md](https://github.com/MoodTechBasti/agentbell/blob/main/SECURITY.md).
 
-**Free-text replies go to the newest open question.** Button answers are matched by request ID and are unambiguous. With two asks in flight, answer with the buttons.
+## Uninstall
 
-**The webhook server trusts its loopback.** On loopback it accepts requests from any local process. Set `webhook.token` even locally; browser-originated requests are rejected. A non-loopback `listen` without a token is refused outright.
+```bash
+agentbell uninstall          # dry run: lists everything, deletes nothing
+agentbell uninstall --yes
+```
 
-**ntfy.sh free-tier limits that matter:** 250 messages/day · at most 3 action buttons per notification · 4 KB message size · **no delivery guarantee** — it's best-effort. Self-hosting or ntfy's paid tiers are the reliability path.
+This removes the following:
 
-**Self-integration is the agent's work, not agentbell's.** `agentbell integrate` only prints instructions — agentbell never edits configs of agents it has no installer for, and gains no new write surface from the feature. The guide's safety rails (only your own configs, diff + explicit OK outside the project, never read agentbell's config or state) are instructions to a model, not something agentbell can enforce. That's also why `verify` deliberately never prints your topic, server or paths: it's the one status command designed to be safe to hand to an agent. `doctor` does print the topic — keep it for humans.
+- the Telegram bot service
+- the package or copied binary (pipx, pip `--user`)
+- the config and state
+- the global hooks and the OpenCode plugin
+- the MCP entries
+- the rule files and `AGENTS.md` blocks in the current directory, or in `--project <dir>`
 
-**Not a security boundary:** agentbell doesn't authenticate who publishes to your topic and doesn't encrypt message bodies end-to-end.
+For each other repository with rule files, run `agentbell hooks uninstall <agent> --project <repo>` first. Only agentbell's own entries are removed: your other hooks, MCP servers and rules stay.
 
----
+Some things are not removed. Delete them yourself if you want them gone:
+
+- the subscription in the ntfy app
+- a Telegram bot you created with BotFather
+- `AGENTBELL_*` variables in your shell profile
+- wiring that a self-integrated agent added to its own config
 
 ## Troubleshooting
 
-**Start here: `agentbell doctor`** — it checks the installation, PATH, config, server reachability, quiet hours, license, hooks, MCP, queue and state dir, and prints a fix command for everything that's wrong.
+Start with `agentbell doctor`. It checks the install, PATH, config, server, quiet hours, license, hooks, MCP, queue and state directory, and it prints a fix command for each problem.
 
-| Symptom | Usually |
+| Symptom | Check |
 |---|---|
-| Nothing arrives | you haven't subscribed to the topic in the app, or quiet hours are active → `agentbell doctor` |
-| Nothing arrives, no error | `agentbell history --limit 10` shows `suppressed` / `queued` / `deferred` |
-| Telegram buttons missing | the answer daemon isn't running → `agentbell bot install-service` |
-| Topic too guessable | `agentbell config set ntfy.topic <long-random>`, then re-subscribe in the app |
-| "webhook is active" | another process holds a Telegram webhook: `curl -s "https://api.telegram.org/bot<TOKEN>/deleteWebhook"`, then restart the bot |
-| Hooks don't fire | `agentbell hooks status`; for Codex check `/hooks` inside Codex |
-| Start over | `agentbell uninstall` → `--yes`, then `pipx install agentbell && agentbell init` (or `./install.sh` from a checkout) |
+| Nothing arrives | Are you subscribed to the topic in the ntfy app? Run `agentbell test`, then `agentbell doctor`. |
+| Nothing arrives, no error | `agentbell history --limit 10` shows `suppressed`, `deferred`, `queued` or `hook.skipped_short`. |
+| Pushes are waiting | `agentbell queue list`, then `agentbell queue flush`. |
+| An agent never pushes | `agentbell hooks` (for a rule-file agent, run it inside that repo), then `agentbell verify --agent <slug> --since 1h` after one real turn. |
+| No buttons on the question | On a protected ntfy server, set `ntfy.action_auth`. On Telegram, the bot must be running (`agentbell bot status`). |
+| A typed reply was ignored | Another question was open, one had ended unanswered less than a minute before, or the reply reached agentbell more than 30 seconds after it was sent. Tap the button, use Reply, or send `APPROVED <id>`. `history` shows `stale_answer` with the reason. |
+| Upgraded and something is off | Re-run `agentbell hooks install <agent>` for each wired agent, and `agentbell bot install-service` if you use it. Restart a bot that is still running from the old version. |
 
----
+When you [open an issue](https://github.com/MoodTechBasti/agentbell/issues/new/choose), include `agentbell --version` and the output of `agentbell verify`, not `doctor`.
 
-## FAQ
+## Status and limits
 
-**Is my data private?**
-Nothing goes to me — there's no account, no telemetry, and no phone-home, and the license check is offline. But your notification text does pass through whichever ntfy server you use, and on the default `ntfy.sh` that's a third-party relay. Self-host ntfy if your message text is sensitive; see the [trust model](#trust-model).
+agentbell is in beta. [FIELD_TEST.md](https://github.com/MoodTechBasti/agentbell/blob/main/FIELD_TEST.md) records what has been checked on a real machine with a real phone, and what has not.
 
-**Does it work self-hosted?**
-Yes, and that's the recommended setup for anything sensitive. Point `ntfy.server` at your own instance, put credentials in `ntfy.auth`, and give the approval buttons a scoped publish-only token via `ntfy.action_auth`. Everything else — hooks, approvals, quiet hours, queue — behaves identically.
+**Used for real** (Linux/WSL2, August–September 2026, versions 1.6.x):
 
-**Can I use it without Telegram?**
-Yes. Telegram is the premium add-on; the free core is complete without it, approval flow included. ntfy alone gives you push, Approve/Deny buttons and free-text replies.
+- ntfy pushes, and `ask` answered and approved from the phone.
+- Telegram in parallel with ntfy.
+- The Claude Code, Codex, OpenCode and Kimi Code hooks in daily use.
+- `pip install agentbell` from PyPI in a clean venv, and pipx with a locally built wheel.
+- Self-integration by GitHub Copilot CLI (hooks, MCP only, and rules only).
 
-**Why is Telegram paid if it's MIT?**
-Because the code being open and the work being worth paying for aren't in conflict. The gate is one `if` you can read, and deleting it in a fork is legal — €4.99 once is priced below the effort of doing that. It funds the maintenance; it isn't a moat, and it isn't pretending to be one.
+**Covered by the automated tests, not yet checked on a real machine:**
 
-**Found a bug, or stuck on something?**
-[Open an issue](https://github.com/MoodTechBasti/agentbell/issues) — the bug template asks for `agentbell doctor` output (redact your topic names first).
+- Everything 1.7.0 changed (FIELD_TEST rows 26–46), including:
+  - `watch` signal and terminal handling
+  - the Claude Code permission-dialog push
+  - refusing typed replies while two questions are open, or when they arrive late
+  - bot service stop and restart
+  - Codex configs with other tables
+  - clearing credentials on a server change
+  - the new OpenCode plugin
+- The Gemini CLI and Qwen Code hooks.
+- The six rule-file agents.
+- The MCP registrations for desktop apps.
+- `pipx install` from PyPI.
+- `bot install-service` under a real systemd or launchd.
+- Windows: CI and WSL-interop tests only.
+- macOS: CI only.
 
----
+**Known limits:**
 
-## Removal
+- Rule-file agents are best effort and per project. The model can skip the rule.
+- Zed's agent reads only the first project instruction file it finds, and `.rules` is first in its list, ahead of `AGENTS.md` and `CLAUDE.md` ([Zed docs](https://zed.dev/docs/ai/instructions)). In a repository without a `.rules` file, `hooks install zed` creates one, and Zed then ignores those other files there.
+- Codex and Gemini CLI push no failures: agentbell wires no failure hook for Codex, and Gemini CLI has no failure event. Gemini CLI turns carry no duration, so every turn pushes.
+- Among the hook agents, only Claude Code (needs input, permission dialog) and OpenCode (permission asked) push when the agent is waiting for you. The rule-file agents do so only when the model follows the rule.
+- A timed-out send may still have reached the server, so a retry can very rarely produce a duplicate push.
+- The queue and deferred pushes live on this machine only. Deferred pushes go out with the next activity, not exactly at the end of the window.
+- `bot install-service` is not available on Windows. Run `agentbell bot` in a terminal there instead.
+- MCP pushes are attributed to an agent only when the client passes `agent`.
+- `ask` and `bot` need file locks in the state directory. On a filesystem without them (some network mounts) `ask` exits 3 with an error and the bot does not start.
+
+## Premium: Telegram
+
+The free version includes ntfy and desktop notifications, all agent hooks, approvals with buttons and typed replies, `watch`, MCP, the webhook, quiet hours, the queue, `doctor`, `verify` and `uninstall`. A premium key adds Telegram:
+
+- **Telegram as a channel**, alone or in parallel with ntfy. Questions go to both, and the first answer wins.
+- **Telegram approvals** with inline buttons, answered through the `agentbell bot` daemon (long polling, no public endpoint). Only the private chat you configured can answer. A Telegram chat belongs to your account, while an ntfy topic can be answered by anyone who knows its name.
 
 ```bash
-agentbell uninstall        # dry run: lists everything, deletes nothing
-agentbell uninstall --yes  # binary, config, state, hooks, MCP entries
+agentbell license activate AB1-...
+agentbell init                  # paste the bot token from BotFather, then message your bot so init finds the chat id
+agentbell bot install-service   # systemd user unit or launchd; or run `agentbell bot`
+agentbell bot status
 ```
 
-Only its own markers are removed — your other hooks and MCP servers stay. Not removed automatically: the ntfy subscription on your phone, a Telegram bot at BotFather, `AGENTBELL_*` env vars in your shell rc.
+A key is a one-time purchase and is not tied to a machine. It is an Ed25519 signature that is checked offline against the public key in `agentbell.py`, with no network call. **There is no online checkout at the moment.** To get a key, e-mail basti@moodtechsolutions.com or [open a GitHub issue](https://github.com/MoodTechBasti/agentbell/issues). The project is MIT-licensed: the check is a few lines you can read. [DECISIONS.md](https://github.com/MoodTechBasti/agentbell/blob/main/DECISIONS.md) (§2b) explains the scheme.
 
----
-
-## Development
+## Contributing
 
 ```bash
-python3 -m unittest discover -s tests -v   # macOS/Linux, no external deps
+python3 -m unittest discover -s tests -v   # macOS / Linux, no dependencies
 py -m unittest discover -s tests -v        # Windows
 ```
 
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to propose a change, and what gets merged
-- [`SECURITY.md`](SECURITY.md) — how to report a vulnerability
-- [`DECISIONS.md`](DECISIONS.md) — why the tool is built the way it is, including what was deliberately left out
-- [`CHANGELOG.md`](CHANGELOG.md) — what changed per version
-- [`FIELD_TEST.md`](FIELD_TEST.md) — the 2-week field-test checklist this build is running against
-- [`examples/`](examples/) — reference copies of every config it writes, plus script patterns
-
----
+- [CONTRIBUTING.md](https://github.com/MoodTechBasti/agentbell/blob/main/CONTRIBUTING.md): how to propose a change
+- [CODE_OF_CONDUCT.md](https://github.com/MoodTechBasti/agentbell/blob/main/CODE_OF_CONDUCT.md)
+- [CHANGELOG.md](https://github.com/MoodTechBasti/agentbell/blob/main/CHANGELOG.md): what changed in each version; read it before upgrading
+- [DECISIONS.md](https://github.com/MoodTechBasti/agentbell/blob/main/DECISIONS.md): why it is built this way
+- [FIELD_TEST.md](https://github.com/MoodTechBasti/agentbell/blob/main/FIELD_TEST.md): what has been checked by hand
+- Field reports are welcome, especially for the agents marked "not yet".
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT. See [LICENSE](https://github.com/MoodTechBasti/agentbell/blob/main/LICENSE).

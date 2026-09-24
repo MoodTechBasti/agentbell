@@ -5,7 +5,7 @@
 # "finished" push can report the turn duration. --min-duration 60 keeps turns
 # shorter than a minute silent — see the README for how to change it.
 
-features.hooks = true
+features.hooks = true  # added by agentbell
 
 # --- agentbell:start ---
 [[hooks.UserPromptSubmit]]
