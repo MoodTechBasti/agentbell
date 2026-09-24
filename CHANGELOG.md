@@ -372,6 +372,8 @@ that is still running from an earlier version. Until it restarts, `ask`,
   lines built like the hosts', not inside the host apps.
 - An install that changes nothing no longer rewrites the file, and new
   agent config files follow your umask instead of 0644.
+- Writing a JSON config keeps non-ASCII text as it is. It used to turn
+  every "—" or "ü" in your own settings into a `\u2014`-style escape.
 
 #### Codex and Kimi Code config.toml
 

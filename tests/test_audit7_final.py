@@ -16,6 +16,8 @@ S-1    HTTPError objects were never closed (Python 3.14 ResourceWarning)
 CI-1   items queued within one step of a coarse clock (Windows before 3.13)
        tied and sorted by their random id, so the queue overflow could drop
        a newer item than the oldest
+JS-1   the JSON writer escaped every non-ASCII character, so an install or
+       uninstall rewrote "—" in the user's own settings as \u2014
 """
 
 import contextlib
@@ -27,6 +29,7 @@ import random
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -691,6 +694,31 @@ class TestQueueOrderOnACoarseClock(unittest.TestCase):
         with unittest.mock.patch.object(an.time, "time_ns", return_value=1):
             stamps = [an._item_time_ns() for _ in range(5)]
         self.assertEqual(stamps, sorted(set(stamps)))
+
+
+class TestJsonKeepsText(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _raw(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_non_ascii_text_is_written_as_is(self):
+        path = os.path.join(self.tmp, "settings.json")
+        an.write_json_atomic(path, {"note": "Team — Größe 👍"})
+        raw = self._raw(path)
+        self.assertIn("Team — Größe 👍", raw)
+        self.assertNotIn("\\u", raw)
+        self.assertEqual(an._read_json_object(path), {"note": "Team — Größe 👍"})
+
+    def test_a_lone_surrogate_falls_back_to_escapes(self):
+        path = os.path.join(self.tmp, "settings.json")
+        data = json.loads('{"odd": "\\ud800", "dash": "—"}')
+        an.write_json_atomic(path, data)
+        self.assertIn("\\ud800", self._raw(path))
+        self.assertEqual(an._read_json_object(path), data)
 
 
 if __name__ == "__main__":

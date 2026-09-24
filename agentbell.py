@@ -633,8 +633,17 @@ def write_json_atomic(path, data, mode=None):
 
     A symlinked config (a dotfiles checkout) is updated where it points,
     same as the TOML configs: see _write_text_atomic.
+
+    Text stays as written: "—" or "ü" in someone else's settings must not
+    come back as \u2014 escapes. Only a lone surrogate (an escape that is
+    no character) cannot be UTF-8, and then the file is escaped as before.
     """
-    _write_text_atomic(path, json.dumps(data, indent=2) + "\n", mode=mode)
+    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = json.dumps(data, indent=2) + "\n"
+    _write_text_atomic(path, text, mode=mode)
 
 
 class _NotJsonObject(ValueError):
