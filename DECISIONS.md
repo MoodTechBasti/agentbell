@@ -1564,7 +1564,10 @@ A "yes" typed under an ended question more than 60 s after it ended can
 reach a later single open ask; so can a duplicate "yes" meant for an
 ask that was already answered on that channel more than a few seconds
 before it was typed. Excluding them is the price of not blocking every
-reply after every ask. A marker needs a filesystem with `flock` (not some network
+reply after every ask. The time a reply was sent is the server's: a
+reply typed while the phone was offline (or held in Telegram's outbox)
+and sent on reconnect is judged when it arrives, and can reach an ask
+that is by then the only one open. A marker needs a filesystem with `flock` (not some network
 mounts): where it cannot be locked, `ask` fails with that error, like
 the bot. An ask started by an earlier version holds no lock and counts
 as ended once a new reader sees it; its markers still carry `expires`
