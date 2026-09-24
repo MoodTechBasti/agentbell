@@ -416,9 +416,12 @@ LICENSE_ENV = "AGENTBELL_LICENSE"
 LICENSE_SECRET_ENV = "AGENTBELL_LICENSE_SECRET"   # author-side signing seed (hex)
 LICENSE_SEED_FILE = ".license-secret"
 LICENSE_PUBLIC_KEY = "168fdee4a321ec5b5c31cb6f52fe1b4ae69af8ebfff94f05d8beadb552a939d7"
+# There is no online checkout: keys are requested by e-mail or issue (README).
+LICENSE_REQUEST_HINT = ("To get a key, e-mail basti@moodtechsolutions.com or open an issue "
+                        "at https://github.com/MoodTechBasti/agentbell/issues")
 LICENSE_PREMIUM_MSG = (
-    "Telegram is a premium feature. Get a lifetime key (one-time €4.99) or use "
-    "ntfy/OS channels for free. Activate with: agentbell license activate <key>"
+    "Telegram is a premium feature (a one-time key); ntfy and OS channels are free. "
+    f"{LICENSE_REQUEST_HINT}. Activate with: agentbell license activate <key>"
 )
 
 # One verification is a few milliseconds of pure-Python big-int math and
@@ -3480,20 +3483,21 @@ class TelegramAnswerWaiter:
         return {"timeout": True, "message": None}
 
 
-def wait_first(waiters, timeout_seconds, print_status):
+def wait_first(waiters, timeout_seconds, print_status, abort=None):
     """Wait for the first answer across channel waiters; the others are stopped.
 
     `waiters` may grow while this runs. ntfy is armed on another thread when
     Telegram is also configured, and that thread appends its waiter only
     after the response topic has been primed. A slice each pass picks up
-    the newcomer; append is the only mutation.
+    the newcomer; append is the only mutation. A set `abort` event ends the
+    wait early, as a timeout.
     """
     results = queue.Queue()
     started = set()
     deadline = time.monotonic() + timeout_seconds
     spinner = ["|", "/", "-", "\\"]
     tick = 0
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline and not (abort is not None and abort.is_set()):
         for name, waiter in waiters[:]:
             if id(waiter) in started:
                 continue
@@ -3622,6 +3626,10 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
     ntfy_waiter = None
     ntfy_error = {}
     ask_closed = threading.Event()
+    # no lock on the ntfy marker (a filesystem without flock): the ask
+    # fails like a Telegram marker that cannot be locked, not ntfy alone
+    marker_error = []
+    marker_failed = threading.Event()
     arm_lock = threading.Lock()
     arm_thread = None
     if "telegram" in channels:
@@ -3678,7 +3686,13 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
             if ask_closed.is_set() or ntfy_waiter.stop_event.is_set():
                 ntfy_waiter.stop_event.set()
                 return
-            write_ntfy_pending(approval_id, message, timeout_seconds)
+            try:
+                write_ntfy_pending(approval_id, message, timeout_seconds)
+            except RuntimeError as exc:
+                marker_error.append(exc)
+                ntfy_waiter.stop_event.set()
+                marker_failed.set()
+                return
         try:
             sent = _publish_ntfy_question()
         except RuntimeError as exc:
@@ -3724,6 +3738,8 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
             arm_thread.start()
         elif ntfy_waiter is not None:
             _arm_ntfy()
+            if marker_error:
+                raise marker_error[0]
             if ntfy_error.get("exc") is not None:
                 raise ntfy_error["exc"]
 
@@ -3749,6 +3765,8 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
                 # can carry the ask; do not burn the approval timeout on a
                 # channel that never got the question.
                 arm_thread.join()
+            if marker_error:
+                raise marker_error[0]
             if telegram_error is not None and not any(name == "ntfy" for name, _ in waiters):
                 parts = []
                 if ntfy_error.get("exc") is not None:
@@ -3761,7 +3779,9 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         write_history({"event": "ask", "message": message, "approval_id": approval_id,
                        "timeout": timeout_seconds, "buttons": buttons, "channels": channels})
 
-        result = wait_first(waiters, timeout_seconds, print_status)
+        result = wait_first(waiters, timeout_seconds, print_status, abort=marker_failed)
+        if result.get("timeout") and marker_error:
+            raise marker_error[0]
         answered_on = None if result.get("timeout") else result.get("channel")
         # A response topic we cannot read (403, wrong auth, DNS) otherwise
         # looks exactly like "nobody answered" for the whole timeout.
@@ -5939,6 +5959,19 @@ MCP_TOOLS = [
 ]
 
 
+MCP_TOOL_BLURBS = {"notify": "push to your phone",
+                   "ask_approval": "ask and wait for your answer"}
+
+
+def mcp_tool_signature(tool):
+    """`name(required, optional?)` from a tool's schema, as the README shows it."""
+    schema = tool.get("inputSchema") or {}
+    required = schema.get("required") or []
+    params = [name if name in required else f"{name}?"
+              for name in schema.get("properties") or {}]
+    return f"{tool['name']}({', '.join(params)})"
+
+
 def mcp_tool_call(name, arguments):
     if name == "notify":
         message = str(arguments.get("message", ""))
@@ -7113,10 +7146,13 @@ def _project_entries(project):
             action = "remove the agentbell block (the rest of the file stays)"
         else:
             action = "delete the agentbell rule file"
+        if _dirs_below(path, project):
+            action += "; then its folders, if that leaves them empty"
         entries.append({
             "kind": "hooks", "label": f"{agent} rule {path}",
             "action": action,
-            "apply": lambda s=spec, p=project: _removed_or_raise(s["install"](p, add=False)),
+            "apply": lambda s=spec, p=project, f=path: _prune_empty_dirs(
+                _removed_or_raise(s["install"](p, add=False)), f, p),
         })
     for scope, target in (("global", None), ("project", project)):
         preferred, others = opencode_plugin_paths(target)
@@ -7140,6 +7176,40 @@ def _project_entries(project):
                 _block_file_result("agentbell", p, "AGENTS.md", None, False)),
         })
     return entries
+
+
+def _dirs_below(path, project):
+    """The folders between `project` and the file `path`, innermost first
+    (.cursor/rules, then .cursor); none for a file in the project itself."""
+    top = os.path.abspath(project)
+    directory, dirs = os.path.dirname(path), []
+    while (os.path.abspath(directory) != top
+           and os.path.abspath(directory).startswith(os.path.join(top, ""))):
+        dirs.append(directory)
+        directory = os.path.dirname(directory)
+    return dirs
+
+
+def _prune_empty_dirs(changed, path, project):
+    """After our rule file is gone, remove the folders it sat in that are now
+    empty (.cursor/rules, .cursor). os.rmdir only: a folder with anything
+    else in it stays, and so does every folder above it."""
+    result = {"changed": changed, "notes": []}
+    if not changed or os.path.lexists(path):
+        return result
+    dirs = _dirs_below(path, project)
+    if any(os.path.islink(directory) for directory in dirs):
+        return result             # the folder is somewhere else: not ours to tidy
+    removed = []
+    for directory in dirs:
+        try:
+            os.rmdir(directory)
+        except OSError:
+            break
+        removed.append(directory)
+    if removed:
+        result["notes"].append("removed the empty folder(s) " + ", ".join(removed))
+    return result
 
 
 def _removed_or_raise(result):
@@ -9022,7 +9092,8 @@ def cmd_init(args):
     elif interactive:
         want = ask("Configure Telegram too? (premium, y/n)", "n").lower().startswith("y")
         if want and not premium_enabled(cfg):
-            print("  Telegram is a premium feature (one-time lifetime key, €4.99).")
+            print("  Telegram is a premium feature (a one-time key).")
+            print(f"  {LICENSE_REQUEST_HINT}.")
             key = input("  License key (blank = skip Telegram): ").strip()
             if not key:
                 want = False
@@ -10169,8 +10240,11 @@ def cmd_mcp(args):
                   f"  (force with: agentbell mcp add {skipped[0]})")
     print()
     print("Restart the client so it picks up the new MCP server. It can then call:")
-    print("  notify(message, title, priority, tags)      - push to your phone")
-    print("  ask_approval(message, timeout_seconds)      - ask and wait for your answer")
+    signatures = [mcp_tool_signature(tool) for tool in MCP_TOOLS]
+    width = max(len(signature) for signature in signatures)
+    for tool, signature in zip(MCP_TOOLS, signatures):
+        blurb = MCP_TOOL_BLURBS.get(tool["name"])
+        print(f"  {signature:{width}s}  - {blurb}" if blurb else f"  {signature}")
     if any(message.startswith("FAILED") for _client, message in rows):
         raise SystemExit(1)     # a refused config fails like `hooks install` does
 
@@ -10218,7 +10292,8 @@ def cmd_license(args):
             raise SystemExit(
                 f"{PROG}: invalid license key\n"
                 "  Check for a typo (copy the whole key, including the AB1- prefix).\n"
-                "  Still refused? Reply to your purchase email and I'll sort it out.")
+                "  Still refused? E-mail basti@moodtechsolutions.com or open an issue at "
+                "https://github.com/MoodTechBasti/agentbell/issues")
         cfg.data["license"] = key
         cfg.save()
         print("license activated - premium features unlocked:")
@@ -10369,7 +10444,8 @@ def config_set(cfg, key, raw):
         target = target.setdefault(part, {})
     target[parts[-1]] = value
     cfg.save()
-    if key in ("ntfy.server", "ntfy.auth", "ntfy.action_auth"):
+    # clearing a credential sends none: no warning about the one that is left
+    if key == "ntfy.server" or (key in ("ntfy.auth", "ntfy.action_auth") and value):
         ntfy = cfg.data.get("ntfy") or {}
         warn_cleartext_auth(ntfy.get("server"), ntfy.get("auth") or ntfy.get("action_auth"))
     return value
@@ -10383,7 +10459,8 @@ def cmd_config(args):
         return
     if sub == "set":
         value = config_set(cfg, args.key, args.value)
-        shown = "<redacted>" if "auth" in args.key or "token" in args.key else value
+        secret = "auth" in args.key or "token" in args.key
+        shown = "<redacted>" if secret and value is not None else value
         print(f"{args.key} = {json.dumps(shown)}")
         if args.key == "ntfy.topic":
             print(f"\nIn the ntfy app, subscribe to the new topics:\n"

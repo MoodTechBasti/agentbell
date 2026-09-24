@@ -202,9 +202,13 @@ Set a token with `agentbell config set webhook.token <random>` and send
 `WEBHOOK_TOKEN` is set. The server refuses to listen on a non-loopback
 address without a token.
 
-`/ask` answers HTTP 200 for every outcome — approved, denied, timed out or
-free text — so `curl -f ... && deploy` is not a gate. The commented example
-deploys only when the JSON response has `"approved": true`.
+`/ask` answers HTTP 200 for every answer and for a timeout — approved,
+denied, timed out or free text — so `curl -f ... && deploy` is not a gate.
+The commented example deploys only when the JSON response has
+`"approved": true`. A bad request (invalid JSON, a `timeout_seconds` outside
+1–3600) gets 400, a missing or wrong token 401, and a question that cannot be
+asked (agentbell not configured, the send failed) 500 with an `"error"`
+field; `curl -f` stops the script on each of them.
 
 ### `agentbell-bot.service`
 

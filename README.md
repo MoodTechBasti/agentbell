@@ -158,7 +158,7 @@ Only an explicit yes approves. Free text exits 0 so that an agent can use the an
 
 To type an answer, send a message to `<topic>-responses` in the ntfy app, or write in the Telegram bot chat.
 
-**Which question a reply answers.** A button always answers its own question. So do a typed `APPROVED <id>` / `DENIED <id>` and Telegram's Reply on the question. A typed reply that names no question is used only when exactly one approval question can still be open. With two open questions, or while an earlier question that went unanswered may still be on the phone (up to its timeout plus a minute), agentbell refuses the reply and does not guess. It sends a notice on the same channel ("Reply not used" on ntfy) and records `stale_answer` in `history`. Use the buttons or Reply in that case.
+**Which question a reply answers.** A button always answers its own question. So do a typed `APPROVED <id>` / `DENIED <id>` and Telegram's Reply on the question. A typed reply that names no question is used only when exactly one approval question can still be on the phone. A question counts while its `ask` is still waiting (its process holds a lock on the question's marker file). One that ended without an answer on that channel (its timeout ran out, its send timed out, it was killed, or it was answered on the other channel) counts for 60 seconds after it ended. One the server refused never reached the phone and does not count. With two questions that count, or when the only one has already ended, agentbell refuses the reply and does not guess. It sends a notice on the same channel ("Reply not used" on ntfy; the Telegram bot sends at most one per reason a minute) and records `stale_answer` in `history`. Use the buttons, Telegram's Reply or `APPROVED <id>` / `DENIED <id>` in that case.
 
 ### Gating a script on an approval
 
@@ -385,7 +385,7 @@ Start with `agentbell doctor`. It checks the install, PATH, config, server, quie
 | Pushes are waiting | `agentbell queue list`, then `agentbell queue flush`. |
 | An agent never pushes | `agentbell hooks` (for a rule-file agent, run it inside that repo), then `agentbell verify --agent <slug> --since 1h` after one real turn. |
 | No buttons on the question | On a protected ntfy server, set `ntfy.action_auth`. On Telegram, the bot must be running (`agentbell bot status`). |
-| A typed reply was ignored | Another question was open or had just ended unanswered, so tap the button or use Reply. `history` shows `stale_answer`. |
+| A typed reply was ignored | Another question was open, or one had ended unanswered less than a minute before. Tap the button, use Reply, or send `APPROVED <id>`. `history` shows `stale_answer`. |
 | Upgraded and something is off | Re-run `agentbell hooks install <agent>` for each wired agent, and `agentbell bot install-service` if you use it. Restart a bot that is still running from the old version. |
 
 When you [open an issue](https://github.com/MoodTechBasti/agentbell/issues/new/choose), include `agentbell --version` and the output of `agentbell verify`, not `doctor`.
@@ -430,6 +430,7 @@ agentbell is in beta. [FIELD_TEST.md](https://github.com/MoodTechBasti/agentbell
 - The queue and deferred pushes live on this machine only. Deferred pushes go out with the next activity, not exactly at the end of the window.
 - `bot install-service` is not available on Windows. Run `agentbell bot` in a terminal there instead.
 - MCP pushes are attributed to an agent only when the client passes `agent`.
+- `ask` and `bot` need file locks in the state directory. On a filesystem without them (some network mounts) `ask` exits 3 with an error and the bot does not start.
 
 ## Premium: Telegram
 

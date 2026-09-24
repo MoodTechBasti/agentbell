@@ -17,9 +17,12 @@ curl -fsS -X POST "$WEBHOOK/notify" ${auth[@]+"${auth[@]}"} \
     -d '{"message":"CI pipeline finished","title":"CI: my-project","priority":"normal","tags":"ci"}'
 
 # Blocking approval from CI (agentbell server keeps the request open until you
-# answer). /ask returns HTTP 200 for every answer - denied, timed out or free
-# text alike - so `curl -f ... && deploy` is not a gate. Read the JSON and
-# deploy only on "approved": true (curl -f still stops on a 4xx/5xx error):
+# answer). /ask returns HTTP 200 for every answer and for a timeout - denied,
+# timed out or free text alike - so `curl -f ... && deploy` is not a gate.
+# Read the JSON and deploy only on "approved": true. A bad request is a 400
+# (401 without the right token), and a question that cannot be asked (not
+# configured, the send failed) is a 500 with an "error" field; curl -f stops
+# the script on those, and -sS prints curl's error line:
 #
 # answer=$(curl -fsS -X POST "$WEBHOOK/ask" ${auth[@]+"${auth[@]}"} \
 #     -H "Content-Type: application/json" \

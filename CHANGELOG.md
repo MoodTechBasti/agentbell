@@ -221,6 +221,10 @@ that is still running from an earlier version. Until it restarts, `ask`,
   without waiting and only records refused replies in it. After that it
   sends at most one notice per reason a minute; the others are recorded
   as `stale_answer` with the reason they were not sent.
+- A pending-question file that cannot be locked (a state directory on a
+  filesystem without file locks) makes `ask` fail with one error line and
+  exit 3, also when Telegram is configured. Before, the ntfy half ended in
+  a thread traceback and the ask went on with Telegram alone.
 
 #### Queue and quiet hours
 
@@ -401,6 +405,9 @@ that is still running from an earlier version. Until it restarts, `ask`,
   sub-tables, not the comment lines after it; a quoted
   `[mcp_servers."agentbell"]` header is found, and a comment mentioning
   the table is not counted as an entry.
+- `mcp add` lists every parameter of the two tools (`agent` for `notify`,
+  `yes_label` and `no_label` for `ask_approval`), read from the tool
+  schemas the server offers.
 
 #### Rule files and OpenCode
 
@@ -448,6 +455,11 @@ that is still running from an earlier version. Until it restarts, `ask`,
   are reported as kept, without "Done".
 - The running-bot warning says the service is stopped first; only a bot
   started by hand has to be stopped by you.
+- `uninstall --yes` removes the `.cursor/rules`, `.windsurf/rules`,
+  `.continue/rules` and `.clinerules` folders (and `.cursor`, `.windsurf`,
+  `.continue`) when agentbell's rule file was the last thing in them, and
+  says which folders it removed. A folder with anything else in it, or a
+  symlinked one, stays.
 
 #### doctor, verify, test, history, config
 
@@ -477,6 +489,13 @@ that is still running from an earlier version. Until it restarts, `ask`,
 - The webhook server reads the request body before it refuses a request
   (401, 403, 413; up to 1 MiB of a body over the cap). Before, a
   client on Windows got a connection reset instead of the answer.
+- `config set ntfy.auth none` (and `ntfy.action_auth none`) no longer
+  warns that a credential travels over plain http while clearing it, and
+  shows the cleared value as `null` instead of `"<redacted>"`.
+- `license activate` with an invalid key, `init` and the premium refusal
+  no longer point to a purchase e-mail or a price: there is no online
+  checkout, and they say to e-mail basti@moodtechsolutions.com or open a
+  GitHub issue for a key, as the README does.
 
 ### Security
 
