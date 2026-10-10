@@ -117,7 +117,7 @@ class TestSharedDirsM10(_UninstallFixture):
         """Every kind of file agentbell writes, through its own writers."""
         cfg = base.make_config("http://127.0.0.1:9")
         cfg.path = an.config_path()
-        cfg.data["license"] = "AB1-secret"
+        cfg.data["telegram"] = {"bot_token": "123:secret", "chat_id": "42"}
         cfg.save()
         an.write_history({"event": "notify", "message": "m"})
         an.enqueue_item(cfg, {"message": "queued", "channels": ["ntfy"],
@@ -257,7 +257,7 @@ class TestCustomConfigFile(_UninstallFixture):
 
     def test_custom_config_file_is_listed_and_removed(self):
         custom = self._write(os.path.join(self.home, "dotfiles", "agentbell.json"),
-                             json.dumps({"license": "AB1-secret"}))
+                             json.dumps({"telegram": {"bot_token": "123:secret"}}))
         sibling = self._write(os.path.join(self.home, "dotfiles", "zshrc"), "keep")
         old = self._write(os.path.join(an.config_dir(), "config.json"), "{}")
         os.environ[an.CONFIG_FILE_ENV] = custom

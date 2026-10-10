@@ -331,8 +331,7 @@ class TestEndedAskGrace(unittest.TestCase):
         sandbox = tempfile.mkdtemp(prefix="agentbell-as5-")
         self.addCleanup(shutil.rmtree, sandbox, ignore_errors=True)
         env = dict(os.environ)
-        for key in ("AGENTBELL_CONFIG", an.LICENSE_ENV):
-            env.pop(key, None)
+        env.pop("AGENTBELL_CONFIG", None)
         env[an.CONFIG_DIR_ENV] = os.path.join(sandbox, "config")
         env[an.STATE_DIR_ENV] = state = os.path.join(sandbox, "state")
         os.makedirs(env[an.CONFIG_DIR_ENV])

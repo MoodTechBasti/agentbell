@@ -1,8 +1,7 @@
 """Audit 2026-09-22, review round 1, cluster "bot": regression tests.
 
 BOT-1/IW-3  the service runs a command that works from a checkout, and Type=exec
-BOT-5       the service gets this shell's config and state paths; a key that
-            only lives in the environment is refused
+BOT-5       the service gets this shell's config and state paths
 BOT-7       a missing launchctl is an error message, not a traceback
 BOT-2       uninstall stops, disables and deletes the bot service
 BOT-4/IW-5  the deferred flush shares the bot's drain budget
@@ -73,17 +72,8 @@ def _systemd(present=True):
 
 
 class _ServiceFixture(unittest.TestCase):
-    """A temp home, a licensed config, agentbell run from a checkout
+    """A temp home, a Telegram config, agentbell run from a checkout
     (agentbell.py, not executable) and a recording stand-in for systemctl."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.keypair = base.dev_keypair()
-        cls.keypair.__enter__()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.keypair.__exit__(None, None, None)
 
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="agentbell-audit3-service-")
@@ -95,8 +85,7 @@ class _ServiceFixture(unittest.TestCase):
         with open(self.script, "w", encoding="utf-8") as fh:
             fh.write("# a checkout\n")
         os.chmod(self.script, 0o644)
-        self.cfg = an.Config({"telegram": {"bot_token": "123:abc", "chat_id": "42"},
-                              "license": an.make_license_key("c", seed=base.TEST_SEED)})
+        self.cfg = an.Config({"telegram": {"bot_token": "123:abc", "chat_id": "42"}})
         self.calls = []
         self.returncode = 0
         for patch in (
@@ -107,7 +96,6 @@ class _ServiceFixture(unittest.TestCase):
         ):
             patch.start()
             self.addCleanup(patch.stop)
-        os.environ.pop(an.LICENSE_ENV, None)
         # every agent config purge_report() looks at lives in the temp home
         for key in ("XDG_CONFIG_HOME", "XDG_BIN_HOME", "APPDATA", "LOCALAPPDATA"):
             os.environ[key] = os.path.join(self.home, key.lower())
@@ -189,14 +177,6 @@ class TestServiceEnvironment(_ServiceFixture):
         self.assertEqual(code, 0, err)
         with open(an.launchd_plist_path(), "rb") as fh:
             self.assertEqual(plistlib.load(fh)["EnvironmentVariables"], self._pinned())
-
-    def test_a_key_only_in_the_environment_is_refused(self):
-        os.environ[an.LICENSE_ENV] = self.cfg.data.pop("license")
-        with _systemd():
-            code, _out, _err = self._install()
-        self.assertIn("agentbell license activate", str(code))
-        self.assertFalse(os.path.exists(an.systemd_unit_path()))
-        self.assertEqual(self.calls, [])
 
 
 @unittest.skipIf(os.name == "nt", "no service installer on Windows (by design)")

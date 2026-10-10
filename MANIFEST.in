@@ -1,3 +1,2 @@
 prune tests
 prune internal
-exclude .license-secret

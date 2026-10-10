@@ -36,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 PROG = "agentbell"
 
 # The self-integration contract printed by `agentbell integrate` (bumped only
@@ -273,266 +273,6 @@ TOML_END = "# --- agentbell:end ---"
 CODEX_FLAG_MARKER = "# added by agentbell"
 
 
-# ---------------------------------------------------------------------------
-# Ed25519 (RFC 8032), pure stdlib: SHA-512 plus integer arithmetic.
-# Only the *public* key ships in this file, so nothing a user can read lets
-# them mint a license key. Signing lives here too - it is inert without the
-# private seed, which never leaves the author's machine (see DECISIONS.md §2b);
-# the tests and the author-side minting tool (untracked) import it from here.
-# Points are extended coordinates (X, Y, Z, T): x = X/Z, y = Y/Z, x*y = T/Z.
-# ---------------------------------------------------------------------------
-
-_ED_P = 2 ** 255 - 19                                          # field prime
-_ED_Q = 2 ** 252 + 27742317777372353535851937790883648493      # group order
-_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P        # curve constant
-_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)                  # sqrt(-1) mod p
-
-
-def _ed_inv(x):
-    return pow(x, _ED_P - 2, _ED_P)
-
-
-def _ed_add(P, Q):
-    A = (P[1] - P[0]) * (Q[1] - Q[0]) % _ED_P
-    B = (P[1] + P[0]) * (Q[1] + Q[0]) % _ED_P
-    C = 2 * P[3] * Q[3] * _ED_D % _ED_P
-    D = 2 * P[2] * Q[2] % _ED_P
-    E, F, G, H = B - A, D - C, D + C, B + A
-    return (E * F % _ED_P, G * H % _ED_P, F * G % _ED_P, E * H % _ED_P)
-
-
-def _ed_mul(s, P):
-    """Scalar multiplication, double-and-add over the bits of s."""
-    R = (0, 1, 1, 0)                     # neutral element
-    while s > 0:
-        if s & 1:
-            R = _ed_add(R, P)
-        P = _ed_add(P, P)
-        s >>= 1
-    return R
-
-
-def _ed_equal(P, Q):
-    # projective coordinates: compare X1*Z2 == X2*Z1 and Y1*Z2 == Y2*Z1
-    return ((P[0] * Q[2] - Q[0] * P[2]) % _ED_P == 0
-            and (P[1] * Q[2] - Q[1] * P[2]) % _ED_P == 0)
-
-
-def _ed_recover_x(y, sign):
-    """The x with the given low bit for this y, or None if there is none."""
-    if y >= _ED_P:
-        return None
-    x2 = (y * y - 1) * _ed_inv(_ED_D * y * y + 1) % _ED_P
-    if x2 == 0:
-        return None if sign else 0
-    x = pow(x2, (_ED_P + 3) // 8, _ED_P)
-    if (x * x - x2) % _ED_P != 0:
-        x = x * _ED_SQRT_M1 % _ED_P
-    if (x * x - x2) % _ED_P != 0:
-        return None                      # y is not on the curve
-    if (x & 1) != sign:
-        x = _ED_P - x
-    return x
-
-
-_ED_G_Y = 4 * _ed_inv(5) % _ED_P
-_ED_G_X = _ed_recover_x(_ED_G_Y, 0)
-_ED_G = (_ED_G_X, _ED_G_Y, 1, _ED_G_X * _ED_G_Y % _ED_P)       # base point
-
-
-def _ed_compress(P):
-    zinv = _ed_inv(P[2])
-    x = P[0] * zinv % _ED_P
-    y = P[1] * zinv % _ED_P
-    return (y | ((x & 1) << 255)).to_bytes(32, "little")
-
-
-def _ed_decompress(data):
-    if len(data) != 32:
-        return None
-    y = int.from_bytes(data, "little")
-    sign = y >> 255
-    y &= (1 << 255) - 1
-    x = _ed_recover_x(y, sign)
-    if x is None:
-        return None
-    return (x, y, 1, x * y % _ED_P)
-
-
-def _ed_hash_mod_q(data):
-    return int.from_bytes(hashlib.sha512(data).digest(), "little") % _ED_Q
-
-
-def _ed_expand_seed(seed_bytes):
-    """Clamped scalar + prefix, from SHA-512 of the 32-byte private seed."""
-    if len(seed_bytes) != 32:
-        raise ValueError("ed25519 seed must be 32 bytes")
-    digest = hashlib.sha512(seed_bytes).digest()
-    a = int.from_bytes(digest[:32], "little")
-    a &= (1 << 254) - 8                  # clamp: clear the low 3 bits...
-    a |= 1 << 254                        # ...set bit 254, clear bit 255
-    return a, digest[32:]
-
-
-def _ed25519_public_key(seed_bytes):
-    """The 32-byte public key belonging to a 32-byte private seed."""
-    a, _ = _ed_expand_seed(seed_bytes)
-    return _ed_compress(_ed_mul(a, _ED_G))
-
-
-def _ed25519_sign(seed_bytes, message_bytes):
-    """A 64-byte RFC 8032 signature over message_bytes."""
-    a, prefix = _ed_expand_seed(seed_bytes)
-    public = _ed_compress(_ed_mul(a, _ED_G))
-    r = _ed_hash_mod_q(prefix + message_bytes)
-    rs = _ed_compress(_ed_mul(r, _ED_G))
-    k = _ed_hash_mod_q(rs + public + message_bytes)
-    s = (r + k * a) % _ED_Q
-    return rs + s.to_bytes(32, "little")
-
-
-def _ed25519_verify(public_key_bytes, message_bytes, signature_bytes):
-    """True when the signature is valid for this message and key. Never raises."""
-    try:
-        if len(public_key_bytes) != 32 or len(signature_bytes) != 64:
-            return False
-        A = _ed_decompress(public_key_bytes)
-        if A is None:
-            return False
-        rs = signature_bytes[:32]
-        R = _ed_decompress(rs)
-        if R is None:
-            return False
-        s = int.from_bytes(signature_bytes[32:], "little")
-        if s >= _ED_Q:                   # non-canonical S (RFC 8032 §5.1.7)
-            return False
-        k = _ed_hash_mod_q(rs + public_key_bytes + message_bytes)
-        return _ed_equal(_ed_mul(s, _ED_G), _ed_add(R, _ed_mul(k, A)))
-    except (ValueError, TypeError):
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Premium license (offline-checkable lifetime keys, Ed25519-signed)
-# The free core (ntfy + OS + hooks + approval) needs no license.
-# Premium features (Telegram channel, parallel Telegram delivery) do.
-# Key format: AB1-<base32(payload)>-<base32(signature)>
-#             payload = "agentbell|customer|expiry"
-# The key pair is asymmetric on purpose: this file carries only the public
-# key, so every build - checkout, pipx install, single file copied by hand -
-# verifies keys the same way, and none of them contains anything that could
-# mint one. The private seed stays on the author's machine (git-ignored
-# .license-secret). See DECISIONS.md §2b.
-# ---------------------------------------------------------------------------
-
-LICENSE_PREFIX = "AB1"
-LICENSE_MAGIC = "agentbell"
-LICENSE_ENV = "AGENTBELL_LICENSE"
-LICENSE_SECRET_ENV = "AGENTBELL_LICENSE_SECRET"   # author-side signing seed (hex)
-LICENSE_SEED_FILE = ".license-secret"
-LICENSE_PUBLIC_KEY = "168fdee4a321ec5b5c31cb6f52fe1b4ae69af8ebfff94f05d8beadb552a939d7"
-# There is no online checkout: keys are requested by e-mail or issue (README).
-LICENSE_REQUEST_HINT = ("To get a key, e-mail basti@moodtechsolutions.com or open an issue "
-                        "at https://github.com/MoodTechBasti/agentbell/issues")
-LICENSE_PREMIUM_MSG = (
-    "Telegram is a premium feature (a one-time key); ntfy and OS channels are free. "
-    f"{LICENSE_REQUEST_HINT}. Activate with: agentbell license activate <key>"
-)
-
-# One verification is a few milliseconds of pure-Python big-int math and
-# premium_enabled() runs on every send, so each key is verified at most once
-# per process. The public key never changes at runtime; an expiry that falls
-# during the life of a process is the only staleness this can cause, and
-# processes are short.
-_LICENSE_CACHE = {}
-
-
-def _seed_bytes(value):
-    """A 32-byte signing seed from 64 hex chars (or raw bytes); None if unusable."""
-    if isinstance(value, (bytes, bytearray)):
-        raw = bytes(value)
-    else:
-        try:
-            raw = bytes.fromhex(str(value).strip())
-        except (ValueError, TypeError):
-            return None
-    return raw if len(raw) == 32 else None
-
-
-def _signing_seed(seed=None):
-    """The private seed used to MINT keys, or None - which is the normal case.
-
-    Only the author has one. Verification never touches this: it uses
-    LICENSE_PUBLIC_KEY and nothing else, so no environment variable, config
-    entry or file can talk this code into accepting a key it did not sign.
-    """
-    if seed:
-        return _seed_bytes(seed)
-    from_env = os.environ.get(LICENSE_SECRET_ENV)
-    if from_env:
-        return _seed_bytes(from_env)
-    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), LICENSE_SEED_FILE)
-    try:
-        with open(local, "r", encoding="utf-8") as handle:
-            return _seed_bytes(handle.read())
-    except OSError:
-        return None
-
-
-def make_license_key(customer_id, expiry=None, seed=None):
-    """Mint a key, or None when no signing seed is available (every user build)."""
-    seed_bytes = _signing_seed(seed)
-    if not seed_bytes:
-        return None
-    payload = f"{LICENSE_MAGIC}|{customer_id}|{expiry or 'lifetime'}".encode()
-    signature = _ed25519_sign(seed_bytes, payload)
-    encoded = base64.b32encode(payload).decode().rstrip("=")
-    signed = base64.b32encode(signature).decode().rstrip("=")
-    return f"{LICENSE_PREFIX}-{encoded}-{signed}"
-
-
-def _verify_license_key(key):
-    try:
-        parts = key.split("-")
-        if len(parts) != 3 or parts[0] != LICENSE_PREFIX:
-            return False
-        payload = base64.b32decode(parts[1] + "=" * (-len(parts[1]) % 8))
-        signature = base64.b32decode(parts[2] + "=" * (-len(parts[2]) % 8))
-        if not _ed25519_verify(bytes.fromhex(LICENSE_PUBLIC_KEY), payload, signature):
-            return False
-        magic, customer_id, expiry = payload.decode("utf-8").split("|")
-        if magic != LICENSE_MAGIC or not customer_id:
-            return False
-        if expiry and expiry != "lifetime":
-            # inclusive: a key stamped 2026-08-14 is valid all of that day,
-            # in whatever timezone the user happens to be in
-            if datetime.datetime.strptime(expiry, "%Y-%m-%d").date() < datetime.date.today():
-                return False
-        return True
-    except (ValueError, TypeError, UnicodeDecodeError, AttributeError):
-        return False
-
-
-def check_license_key(key):
-    """True for a non-expired key signed by the author's private seed."""
-    if not key:
-        return False
-    key = str(key).strip()
-    cached = _LICENSE_CACHE.get(key)
-    if cached is not None:
-        return cached
-    result = _verify_license_key(key)
-    if len(_LICENSE_CACHE) > 32:         # a process sees one key; bound it anyway
-        _LICENSE_CACHE.clear()
-    _LICENSE_CACHE[key] = result
-    return result
-
-
-def premium_enabled(cfg):
-    key = os.environ.get(LICENSE_ENV) or cfg.data.get("license")
-    return bool(check_license_key(key))
-
-
 def xdg_dir(env_name, default_rel):
     env_val = os.environ.get(env_name)
     if env_val:
@@ -615,7 +355,6 @@ def default_config():
         "quiet_hours_mode": "suppress",
         "approval_timeout": DEFAULT_APPROVAL_TIMEOUT,
         "webhook": {"listen": "127.0.0.1", "port": DEFAULT_WEBHOOK_PORT, "token": None},
-        "license": None,
     }
 
 
@@ -624,8 +363,8 @@ def write_json_atomic(path, data, mode=None):
 
     The temp file is *created* with its final permissions. Creating it at the
     umask default and chmod'ing afterwards leaves a short window in which a
-    config holding the license key, the Telegram token and the ntfy password
-    is world-readable.
+    config holding the Telegram token and the ntfy password is
+    world-readable.
 
     `mode` (e.g. 0o600) is what a file we own must end up as. Without it the
     file belongs to someone else (~/.claude.json, an agent's settings.json):
@@ -685,9 +424,14 @@ class Config:
         return merged
 
     def save(self):
-        # 0600: this file holds the license key, the Telegram bot token and the
-        # ntfy password - it must not be readable by other users on the box.
-        write_json_atomic(self.path, self.data, mode=0o600)
+        # 0600: this file holds the Telegram bot token and the ntfy
+        # password - it must not be readable by other users on the box.
+        try:
+            write_json_atomic(self.path, self.data, mode=0o600)
+        except OSError as exc:
+            # like _load: a message that names the file, not a traceback. The
+            # writer's text already says what to do for a link into a store.
+            raise SystemExit(f"{PROG}: {exc}")
 
     def ntfy_ready(self):
         n = self.data["ntfy"]
@@ -2592,9 +2336,6 @@ def _publish_item_channels(cfg, item, timeout=10.0, deadline=None):
     delivered, transient, permanent = [], {}, {}
     interrupted = None
     for channel in channels:
-        if channel == "telegram" and not premium_enabled(cfg):
-            permanent[channel] = LICENSE_PREMIUM_MSG
-            continue
         if interrupted or (deadline is not None and time.time() >= deadline):
             transient[channel] = interrupted or "not tried: the send time budget was used up"
             continue
@@ -3070,15 +2811,9 @@ def send_notification(cfg, message, title=None, priority="normal", tags=None,
     # a number was sent as "normal" and crashed `history` and `queue list`.
     priority = priority_name(priority or "normal")
     prio_num = priority_number(priority)
-    explicit_channels = channels is not None
-    channels = channels if explicit_channels else cfg.channels()
+    channels = channels if channels is not None else cfg.channels()
     if isinstance(channels, str):
         channels = [c.strip() for c in channels.split(",") if c.strip()]
-    if not explicit_channels and "telegram" in channels and not premium_enabled(cfg):
-        # Config lists telegram but premium is not active: deliver on the free
-        # channels instead of failing the whole call. An explicit
-        # `--channel telegram` still fails loudly - the user asked for it.
-        channels = [c for c in channels if c != "telegram"] or ["ntfy"]
     results = []
     quiet = suppressed_by_quiet_hours(cfg, prio_num, force)
     mode = "defer" if defer else str(cfg.data.get("quiet_hours_mode") or "suppress")
@@ -3680,8 +3415,8 @@ def resolve_ask_channels(cfg, channels=None):
     """Which channels carry the approval roundtrip.
 
     Explicit `--channel` is honored and validated. When derived from the
-    config, telegram silently drops out without a premium license (the free
-    ntfy approval flow must keep working untouched).
+    config, telegram silently drops out while it is not configured (the ntfy
+    approval flow must keep working untouched).
     """
     if channels:
         if isinstance(channels, str):
@@ -3694,9 +3429,6 @@ def resolve_ask_channels(cfg, channels=None):
         return channels
     chosen = [c for c in cfg.channels() if c in ASK_CHANNELS]
     if not chosen:
-        chosen = ["ntfy"]
-    if "telegram" in chosen and not premium_enabled(cfg):
-        sys.stderr.write(f"{PROG}: Telegram approval needs a premium license - asking via ntfy only\n")
         chosen = ["ntfy"]
     if "telegram" in chosen and not cfg.telegram_ready():
         sys.stderr.write(f"{PROG}: Telegram is not configured - asking via ntfy only\n")
@@ -3773,8 +3505,6 @@ def run_ask(cfg, message, timeout_seconds=None, yes_label="Approve", no_label="D
         validate_topic(resp_topic)
         _warn_insecure_ask(cfg, message)
     if "telegram" in channels:
-        if not premium_enabled(cfg):
-            raise RuntimeError(LICENSE_PREMIUM_MSG)
         if not cfg.telegram_ready():
             raise RuntimeError("Telegram is not configured (bot_token/chat_id). Run 'agentbell init' first.")
 
@@ -5151,6 +4881,36 @@ def _instructions_text(agent):
 # A prompt created before the last idle therefore never starts a turn, and
 # every idle - one the dedupe swallows too - ends one. Otherwise the next
 # turn was timed from the old prompt and counted the user's reading time.
+#
+# OpenCode 1.x and 2.x read the same file through different loaders, so the
+# default export has to satisfy both. See DECISIONS §38 for the full record.
+#
+# 1.x (source: packages/opencode/src/plugin/index.ts and shared.ts at tag
+# v1.18.18, github.com/anomalyco/opencode):
+#   - `applyPlugin` calls `readV1Plugin(mod, spec, "server", "detect")`.
+#     That reader takes `mod.default`; a non-object default is not a 1.x
+#     plugin, and in detect mode an object with none of `id`/`server`/`tui`
+#     is not one either. Otherwise it validates `server`/`tui` and *throws*
+#     when the object has `id` but no callable `server`.
+#   - when it returns a plugin, `applyPlugin` pushes exactly one hook and
+#     returns; only when it returns nothing does the legacy
+#     `getLegacyPlugins` path walk `Object.values(mod)` and reject any export
+#     that is not a function ("Plugin export is not a function").
+#   - so `default` carries `server: AgentBell`: one hook, and the legacy walk
+#     is never reached.
+# 2.x (read out of the installed 2.0.16 binary):
+#   - the module is decoded with Struct({default: Union([{id, effect},
+#     {id, setup}])}); extra keys such as `server` are ignored, a callable
+#     default is rejected ("Expected object") and a missing default is
+#     rejected ("Missing key"). `setup(ctx)` may return a cleanup function
+#     and `ctx.event.subscribe({ signal })` is an async iterable.
+#   - the event payload moved from `event.properties` to `event.data`, the
+#     turn end from `session.idle` to `session.execution.succeeded`, the
+#     failure from `session.error` to `session.execution.failed`, and
+#     session.created carries `parentID` on the payload instead of under
+#     `info`. `permission.updated` is gone; `permission.asked` remains.
+#     The 2.0.16 runtime sends `data`; the older SDK typings (which describe
+#     1.x) say `properties`. The handler reads whichever is present.
 OPENCODE_PLUGIN = """// agentbell: phone notifications for OpenCode.
 // Installed by `agentbell hooks install opencode`.
 // Remove with   `agentbell hooks uninstall opencode`.
@@ -5163,6 +4923,84 @@ const turnEnded = new Map()             // sessionID -> ms of the last idle, rep
 const lastIdle = new Map()              // sessionID -> ms of the last turn end reported
 let lastPermission = 0
 
+// OpenCode 1.x sends { type, properties }, 2.x sends { type, data }. Reading
+// both here keeps one handler for either host.
+const payloadOf = (event) => event.data || event.properties || {}
+
+const handleEvent = async (event, fire) => {
+  if (!event) return
+  const payload = payloadOf(event)
+  const info = payload.info || {}
+  const sid = payload.sessionID || info.sessionID
+  // subagent sessions go idle too - they would notify twice
+  if (event.type === "session.created") {
+    // 2.x carries parentID on the payload, 1.x under info; the new session's
+    // id is the payload/session id in either shape, and only the 1.x form
+    // needs info.id as a fallback (in message.updated info.id is the message).
+    if (payload.parentID || info.parentID) {
+      const child = sid || info.id
+      if (child) childSessions.add(child)
+      return
+    }
+  }
+  if (sid && childSessions.has(sid)) return
+  if (event.type === "message.updated") {
+    // the user's prompt starts the turn; assistant updates stream all turn long.
+    // A prompt created before the last idle is the previous turn's, re-sent.
+    const created = info.time && info.time.created
+    const resent = typeof created === "number" && created <= (turnEnded.get(sid) || 0)
+    if (info.role === "user" && sid && !resent && !turnStarted.has(sid)) {
+      turnStarted.set(sid, Date.now())
+    }
+    return
+  }
+  if (event.type === "session.execution.succeeded" || event.type === "session.idle") {
+    const now = Date.now()
+    const started = sid ? turnStarted.get(sid) : undefined
+    if (sid) {
+      turnStarted.delete(sid)
+      if (turnEnded.size > 500) turnEnded.clear()
+      turnEnded.set(sid, now)
+    }
+    // the same session can report the end of its turn twice - one push, not two
+    if (sid && now - (lastIdle.get(sid) || 0) < IDLE_DEDUPE_MS) return
+    if (sid) {
+      if (lastIdle.size > 500) lastIdle.clear()
+      lastIdle.set(sid, now)
+    }
+    const args = ["hook", "run_completed", "--agent", "opencode"]
+    if (started) {
+      args.push("--duration", String(Math.round((now - started) / 1000)),
+                "--min-duration", String(MIN_DURATION))
+    }
+    await fire(...args)
+  } else if (event.type === "session.execution.failed" || event.type === "session.error") {
+    // the turn is over either way; remembering when keeps a prompt OpenCode
+    // re-sends afterwards from being read as the start of the next turn
+    if (sid) {
+      turnStarted.delete(sid)
+      if (turnEnded.size > 500) turnEnded.clear()
+      turnEnded.set(sid, Date.now())
+    }
+    await fire("hook", "run_failed", "--agent", "opencode")
+  } else if (event.type === "session.execution.interrupted") {
+    // the turn was cut short - by the user, or by the host (shutdown,
+    // superseded by a new prompt, inactivity). Nothing is pushed for it; the
+    // timestamp only keeps the next turn from inheriting this start time.
+    if (sid) {
+      turnStarted.delete(sid)
+      if (turnEnded.size > 500) turnEnded.clear()
+      turnEnded.set(sid, Date.now())
+    }
+  } else if (event.type === "permission.asked" || event.type === "permission.updated") {
+    // 2.x has permission.asked only; 1.x also sent permission.updated
+    const now = Date.now()
+    if (now - lastPermission < 3000) return
+    lastPermission = now
+    await fire("hook", "permission_required", "--agent", "opencode")
+  }
+}
+
 export const AgentBell = async ({ $ }) => {
   const fire = async (...args) => {
     // never let a notification failure break or slow down the session
@@ -5170,60 +5008,37 @@ export const AgentBell = async ({ $ }) => {
       await $`${BIN} ${args}`.quiet().nothrow()
     } catch (_) {}
   }
-  return {
-    event: async ({ event }) => {
-      if (!event) return
-      const props = event.properties || {}
-      const info = props.info || {}
-      const sid = props.sessionID || info.sessionID
-      // subagent sessions go idle too - they would notify twice
-      if (event.type === "session.created" && info.parentID) {
-        childSessions.add(info.id)
-        return
-      }
-      if (sid && childSessions.has(sid)) return
-      if (event.type === "message.updated") {
-        // the user's prompt starts the turn; assistant updates stream all turn long.
-        // A prompt created before the last idle is the previous turn's, re-sent.
-        const created = info.time && info.time.created
-        const resent = typeof created === "number" && created <= (turnEnded.get(sid) || 0)
-        if (info.role === "user" && sid && !resent && !turnStarted.has(sid)) {
-          turnStarted.set(sid, Date.now())
+  return { event: async ({ event }) => handleEvent(event, fire) }
+}
+
+export default {
+  id: "agentbell",
+  // 1.x reads exactly one of these from `default` and returns before it ever
+  // looks at the other exports; its reader treats an object that has `id` but
+  // no `server` as a broken module and throws. 2.x decodes the same object and
+  // ignores every key except `id` and `setup`.
+  server: AgentBell,
+  setup(ctx) {
+    // 2.x hands the plugin a context with an event stream; a host that calls
+    // setup without one is a no-op rather than a failed plugin load
+    if (!ctx || !ctx.event || typeof ctx.event.subscribe !== "function") return
+    const controller = new AbortController()
+    const fire = async (...args) => {
+      try {
+        const command = Array.isArray(BIN) ? BIN : [BIN]
+        const child = Bun.spawn([...command, ...args], { stdout: "ignore", stderr: "ignore" })
+        await child.exited
+      } catch (_) {}
+    }
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          await handleEvent(event, fire)
         }
-        return
-      }
-      if (event.type === "session.idle") {
-        const now = Date.now()
-        const started = sid ? turnStarted.get(sid) : undefined
-        if (sid) {
-          turnStarted.delete(sid)
-          if (turnEnded.size > 500) turnEnded.clear()
-          turnEnded.set(sid, now)
-        }
-        // the same session can report idle twice for one turn - one push, not two
-        if (sid && now - (lastIdle.get(sid) || 0) < IDLE_DEDUPE_MS) return
-        if (sid) {
-          if (lastIdle.size > 500) lastIdle.clear()
-          lastIdle.set(sid, now)
-        }
-        const args = ["hook", "run_completed", "--agent", "opencode"]
-        if (started) {
-          args.push("--duration", String(Math.round((now - started) / 1000)),
-                    "--min-duration", String(MIN_DURATION))
-        }
-        await fire(...args)
-      } else if (event.type === "session.error") {
-        if (sid) turnStarted.delete(sid)
-        await fire("hook", "run_failed", "--agent", "opencode")
-      } else if (event.type === "permission.asked" || event.type === "permission.updated") {
-        // both names exist across versions; collapse them into one ping
-        const now = Date.now()
-        if (now - lastPermission < 3000) return
-        lastPermission = now
-        await fire("hook", "permission_required", "--agent", "opencode")
-      }
-    },
-  }
+      } catch (_) {}
+    })()
+    return () => controller.abort()
+  },
 }
 """
 
@@ -6123,6 +5938,9 @@ MCP_TOOLS = [
 MCP_TOOL_BLURBS = {"notify": "push to your phone",
                    "ask_approval": "ask and wait for your answer"}
 
+# The advertised schema is the contract `mcp_argument_error` enforces.
+MCP_TOOL_SCHEMAS = {tool["name"]: tool["inputSchema"] for tool in MCP_TOOLS}
+
 
 def mcp_tool_signature(tool):
     """`name(required, optional?)` from a tool's schema, as the README shows it."""
@@ -6133,7 +5951,50 @@ def mcp_tool_signature(tool):
     return f"{tool['name']}({', '.join(params)})"
 
 
+def mcp_argument_error(name, arguments):
+    """Why this call to a known tool cannot run, or None when it may.
+
+    Deliberately narrow: presence of the required keys, the declared type of a
+    value that is actually there, and enum membership - the whole of what
+    MCP_TOOLS advertises. A general JSON Schema engine would be a dependency
+    in disguise (CONTRIBUTING.md) and the schema here is ours to keep small.
+    Unknown keys stay tolerated: JSON Schema's own default allows them, and
+    rejecting them would break a client that already sends more.
+    """
+    schema = MCP_TOOL_SCHEMAS[name]
+    properties = schema.get("properties") or {}
+    required = schema.get("required") or []
+    for field in required:
+        if field not in arguments:
+            return f"{name}: missing required argument '{field}'"
+    for field, spec in properties.items():
+        if field not in arguments:
+            continue
+        value = arguments[field]
+        if value is None and field not in required:
+            continue          # an explicit null is how a client says "not set"
+        if spec.get("type") == "string" and not isinstance(value, str):
+            return f"{name}: '{field}' must be a string"
+        if spec.get("type") == "integer" and (isinstance(value, bool)
+                                              or not isinstance(value, int)):
+            return f"{name}: '{field}' must be an integer"
+        if spec.get("type") == "string" and field in required and not value.strip():
+            return f"{name}: '{field}' must not be empty"
+        choices = spec.get("enum")
+        if choices and value not in choices:
+            return f"{name}: '{field}' must be one of: {', '.join(choices)}"
+    return None
+
+
 def mcp_tool_call(name, arguments):
+    if name in MCP_TOOL_SCHEMAS:
+        # First, before any Config(), notification, approval or history write:
+        # `arguments.get("message", "")` read a missing message as an empty
+        # one and pushed it (live-tested 2026-09-25). A call that breaks the
+        # schema the client was handed must have no side effect at all.
+        problem = mcp_argument_error(name, arguments)
+        if problem:
+            raise RuntimeError(problem)
     if name == "notify":
         message = str(arguments.get("message", ""))
         result = send_notification(
@@ -6973,7 +6834,7 @@ def cmd_integrate(args):
 
 # ---------------------------------------------------------------------------
 # Uninstall / purge (v1.3): one command that removes everything agentbell
-# installed or wrote - the CLI entry, config (incl. license key), state
+# installed or wrote - the CLI entry, config, state
 # (history, queue, deferred, bot files, run markers, pending asks), agent
 # hooks and MCP registrations. Dry-run by default; only `--yes` deletes.
 # Only our own markers are touched: user hooks and unrelated config keys are
@@ -7524,13 +7385,13 @@ def purge_report(project=None):
             "apply": lambda p=standalone: _delete_path(p),
         })
 
-    # 2. Config (incl. license key) + state. A default directory goes whole;
+    # 2. Config + state. A default directory goes whole;
     # of one set by env var only agentbell's own entries (see STATE_DIR_NAMES).
     cfile = config_path()
     whole, shared = [], []                        # shared: [kind, directory, names]
     for kind, directory, names, env, what in (
             ("config", config_dir(), CONFIG_DIR_NAMES, CONFIG_DIR_ENV,
-             "config.json incl. license key"),
+             "config.json"),
             ("state", state_dir(), STATE_DIR_NAMES, STATE_DIR_ENV,
              "history, queue, deferred, bot state/lock, run markers")):
         if not os.environ.get(env):
@@ -7549,7 +7410,7 @@ def purge_report(project=None):
             shared.append([kind, directory, tuple(names)])
     if os.path.islink(cfile) and os.path.isfile(cfile):
         warnings.append(f"{cfile} is a link: only the link is removed; "
-                        f"{os.path.realpath(cfile)} keeps the license key and tokens "
+                        f"{os.path.realpath(cfile)} keeps your tokens "
                         "(delete it yourself if you want them gone)")
     if os.environ.get(CONFIG_FILE_ENV) and os.path.isfile(cfile):
         home = next((item for item in shared
@@ -7560,7 +7421,7 @@ def purge_report(project=None):
             entries.append({
                 "kind": "config", "label": f"config file {cfile} ({CONFIG_FILE_ENV})",
                 "action": ("remove the link (see the note above)" if os.path.islink(cfile)
-                           else "delete file (incl. license key)"),
+                           else "delete file"),
                 "apply": lambda p=cfile: _delete_path(p),
             })
     entries.extend(whole)
@@ -7870,7 +7731,7 @@ def webhook_server(cfg):
 
 
 # ---------------------------------------------------------------------------
-# Telegram answer daemon (premium)
+# Telegram answer daemon
 # ---------------------------------------------------------------------------
 
 TG_CALLBACK_RE = re.compile(r"^agentbell\|([0-9a-f]{8,16})\|(approved|denied)$")
@@ -8064,8 +7925,6 @@ def _bot_poll_error(error):
 
 
 def run_bot(cfg, poll_timeout=25):
-    if not premium_enabled(cfg):
-        raise SystemExit(f"{PROG}: {LICENSE_PREMIUM_MSG}")
     tg = cfg.data.get("telegram", {})
     if not cfg.telegram_ready():
         raise SystemExit(f"{PROG}: Telegram is not configured. Run 'agentbell init' first.")
@@ -8198,12 +8057,7 @@ def print_queue_list(data):
 
 
 def print_bot_status(cfg):
-    premium = premium_enabled(cfg)
     ready = cfg.telegram_ready()
-    if not premium:
-        print("premium:   not activated (Telegram approvals are a premium feature)")
-        return
-    print("premium:   activated")
     if not ready:
         print("telegram:  not configured (run 'agentbell init')")
         return
@@ -8263,6 +8117,33 @@ def _check(status, name, detail, fix=None):
     return {"status": status, "name": name, "detail": detail, "fix": fix}
 
 
+def _telegram_setup_check(cfg, listed):
+    """The doctor row for a Telegram setup that cannot send yet.
+
+    It says which half is missing, whether ntfy is unaffected, and the one
+    command that closes the gap. `agentbell init` saves a token on its own and
+    `init --telegram-token` keeps a saved chat id, so each gap has a short fix.
+    """
+    tg = cfg.data.get("telegram") or {}
+    if tg.get("bot_token"):
+        gap = "the chat id is missing"
+        fix = ("agentbell config set telegram.chat_id <id>   # message your bot first, "
+               "then ask @userinfobot for your id")
+    elif tg.get("chat_id"):
+        gap = "the bot token is missing"
+        fix = "agentbell init --telegram-token <token>   # from @BotFather; keeps your saved chat id"
+    else:
+        gap = "there is no bot token and no chat id"
+        fix = "agentbell init   # asks for the token from @BotFather and finds your chat id"
+    if not listed:
+        return _check(WARN, "telegram", f"{gap} - saved, but Telegram is not set up", fix)
+    effect = ("ntfy still delivers" if "ntfy" in cfg.channels()
+              else "nothing is sent on Telegram until then")
+    return _check(FAIL, "telegram",
+                  f"listed as a channel, but {gap} - Telegram sends nothing yet; {effect}",
+                  f"{fix}   (or leave it out: agentbell config set channels ntfy)")
+
+
 def rate_topic(topic):
     """(status, problem) for an ntfy topic - the one rule doctor, verify and
     `config set` apply. They used to disagree: doctor passed a 60-character
@@ -8290,10 +8171,9 @@ def rate_topic(topic):
 
 def _ntfy_in_use(cfg):
     """False only when Telegram carries both notifications and approvals:
-    `ask`, and a Telegram channel without premium, fall back to ntfy."""
+    `ask`, and a Telegram channel that is not configured, fall back to ntfy."""
     channels = cfg.channels()
-    return "ntfy" in channels or not (
-        "telegram" in channels and premium_enabled(cfg) and cfg.telegram_ready())
+    return "ntfy" in channels or not ("telegram" in channels and cfg.telegram_ready())
 
 
 def _path_fix_hint():
@@ -8335,11 +8215,11 @@ def doctor_checks(cfg, send=False):
             checks.append(_check(
                 WARN, "config",
                 "config exists, but this stdlib-only check cannot verify its Windows ACL; "
-                "it may contain a license key, Telegram token and ntfy password",
+                "it may contain a Telegram token and ntfy password",
                 f'check access with: icacls "{cfg.path}"'))
         elif mode != "600":
             checks.append(_check(
-                WARN, "config", f"{cfg.path} is mode {mode}; it holds your license key, "
+                WARN, "config", f"{cfg.path} is mode {mode}; it holds your "
                 "Telegram token and ntfy password", f"chmod 600 {shlex.quote(cfg.path)}"))
         else:
             checks.append(_check(OK, "config", cfg.path))
@@ -8404,23 +8284,11 @@ def doctor_checks(cfg, send=False):
         else:
             checks.append(_check(OK, "quiet hours", f"{window} (mode '{mode}'), not active now"))
 
-    premium = premium_enabled(cfg)
-    key = os.environ.get(LICENSE_ENV) or cfg.data.get("license")
-    if premium:
-        checks.append(_check(OK, "license", "premium activated (Telegram + parallel delivery)"))
-    elif key:
-        checks.append(_check(FAIL, "license", "the configured key is not valid",
-                             "agentbell license activate <key>"))
-    else:
-        checks.append(_check(OK, "license", "free core (Telegram is the paid extra)"))
-
-    if "telegram" in channels or cfg.telegram_ready():
+    tg = cfg.data.get("telegram") or {}
+    half_set_up = bool(tg.get("bot_token")) != bool(tg.get("chat_id"))
+    if "telegram" in channels or cfg.telegram_ready() or half_set_up:
         if not cfg.telegram_ready():
-            checks.append(_check(FAIL, "telegram", "listed as a channel but not configured",
-                                 "agentbell init"))
-        elif not premium:
-            checks.append(_check(FAIL, "telegram", "configured but premium is not active",
-                                 "agentbell license activate <key>"))
+            checks.append(_telegram_setup_check(cfg, listed="telegram" in channels))
         elif bot_heartbeat_fresh():
             checks.append(_check(OK, "telegram bot", "answer daemon running (approval buttons live)"))
         else:
@@ -9115,7 +8983,7 @@ def prompt_bot_token(attempts=3, reader=None):
         called every error "invalid bot token", so an unreachable API sent
         the user back to BotFather to create bots that were never the problem;
       * giving up here only skips Telegram. It never aborts setup, because
-        everything already entered (license key, topic, hooks) would be lost.
+        everything already entered (topic, hooks) would be lost.
     """
     read = reader or (lambda prompt: input(prompt).strip())
     for attempt in range(attempts):
@@ -9176,7 +9044,7 @@ def print_next_steps(cfg):
         print(f"   {', '.join(per_repo)}: a rule file in the current repo only -")
         print("   run `agentbell hooks install <agent>` in each repo (the others are global).")
     print()
-    if cfg.telegram_ready() and premium_enabled(cfg):
+    if cfg.telegram_ready():
         print("4) Telegram Approve/Deny buttons need the answer daemon running:")
         print("     agentbell bot install-service")
         print()
@@ -9258,27 +9126,14 @@ def cmd_init(args):
     warn_cleartext_auth(ntfy.get("server"), ntfy.get("auth"))
 
     tg = cfg.data["telegram"]
-    if args.license:
-        cfg.data["license"] = args.license
     if args.telegram_token:
-        if not premium_enabled(cfg):
-            raise SystemExit(f"{PROG}: {LICENSE_PREMIUM_MSG}")
         tg["bot_token"] = args.telegram_token
-        tg["chat_id"] = args.telegram_chat
+        # a new token alone keeps the chat id already saved: replacing it with
+        # nothing left a working Telegram setup half-configured without a word
+        if args.telegram_chat:
+            tg["chat_id"] = args.telegram_chat
     elif interactive:
-        want = ask("Configure Telegram too? (premium, y/n)", "n").lower().startswith("y")
-        if want and not premium_enabled(cfg):
-            print("  Telegram is a premium feature (a one-time key).")
-            print(f"  {LICENSE_REQUEST_HINT}.")
-            key = input("  License key (blank = skip Telegram): ").strip()
-            if not key:
-                want = False
-            elif check_license_key(key):
-                cfg.data["license"] = key
-                print("  License activated.")
-            else:
-                print("  Invalid license key - skipping Telegram.")
-                want = False
+        want = ask("Configure Telegram too? (y/n)", "n").lower().startswith("y")
         if want:
             print()
             print("  Create your bot (2 minutes, once):")
@@ -9306,7 +9161,7 @@ def cmd_init(args):
                     chat_id = input("  Enter your chat id (get it from @userinfobot): ").strip()
             tg["bot_token"] = token
             tg["chat_id"] = chat_id
-    if tg.get("bot_token") and tg.get("chat_id") and premium_enabled(cfg):
+    if tg.get("bot_token") and tg.get("chat_id"):
         cfg.data["channels"] = ["ntfy", "telegram"]
 
     qh = cfg.data["quiet_hours"]
@@ -9318,7 +9173,7 @@ def cmd_init(args):
             raise SystemExit(f"{PROG}: {exc} ({expected})")
     elif interactive:
         # Ask again on a typo: exiting here threw away every answer above
-        # (topic, Telegram token, license) because nothing is saved yet.
+        # (topic, Telegram token) because nothing is saved yet.
         # Enter keeps the current windows, like every other prompt.
         current = ",".join(f"{w['start']}-{w['end']}" for w in normalize_quiet_hours(qh))
         while True:
@@ -10297,14 +10152,6 @@ def cmd_bot(args):
         print_bot_status(cfg)
         return
     if sub == "install-service":
-        # two different problems, two different fixes - collapsing them sent
-        # licensed users to 'init' and unlicensed ones nowhere
-        if not premium_enabled(cfg):
-            raise SystemExit(f"{PROG}: {LICENSE_PREMIUM_MSG}")
-        if not check_license_key(cfg.data.get("license")):
-            # the key is only in this shell's environment
-            raise SystemExit(f"{PROG}: the service will not see {LICENSE_ENV}. Store the key "
-                             "in the config first: agentbell license activate <key>")
         if not cfg.telegram_ready():
             raise SystemExit(f"{PROG}: Telegram is not configured. Run: agentbell init")
         path, started, note = install_bot_service()
@@ -10460,40 +10307,6 @@ def cmd_history(args):
         )
 
 
-def cmd_license(args):
-    cfg = Config()
-    if args.sub == "activate":
-        key = args.key.strip()
-        if not check_license_key(key):
-            raise SystemExit(
-                f"{PROG}: invalid license key\n"
-                "  Check for a typo (copy the whole key, including the AB1- prefix).\n"
-                "  Still refused? E-mail basti@moodtechsolutions.com or open an issue at "
-                "https://github.com/MoodTechBasti/agentbell/issues")
-        cfg.data["license"] = key
-        cfg.save()
-        print("license activated - premium features unlocked:")
-        print("  - Telegram channel (including parallel ntfy + Telegram)")
-        print("  - interactive Telegram approval buttons (agentbell bot + ask)")
-    else:
-        key = os.environ.get(LICENSE_ENV) or cfg.data.get("license")
-        valid = check_license_key(key)
-        print(f"premium: {'activated' if valid else 'not activated'}")
-        print("free core: ntfy channel, OS notifications, agent hooks, approval flow, webhook, MCP")
-        print("premium:   Telegram channel, parallel delivery, interactive Telegram approvals")
-        if not valid:
-            print(f"activate:  agentbell license activate <key>  (or set {LICENSE_ENV})")
-        if args.verbose and key:
-            customer = "(unknown)"
-            try:
-                _, encoded, _ = key.split("-")
-                payload = base64.b32decode(encoded + "=" * (-len(encoded) % 8)).decode()
-                customer = payload.split("|")[1]
-            except Exception:
-                pass
-            print(f"key:       {key[:16]}... (customer: {customer})")
-
-
 def _redact(value, keep=8):
     """Show enough of a secret to recognise it, never enough to use it."""
     text = str(value)
@@ -10503,7 +10316,7 @@ def _redact(value, keep=8):
 def redacted_config(data):
     """A copy of the config safe to print, paste into an issue, or log.
 
-    Everything that is a credential is redacted: license key, Telegram bot
+    Everything that is a credential is redacted: Telegram bot
     token, ntfy basic-auth (self-hosted password!), the webhook token - and
     the ntfy topic, which IS the credential on a public server: whoever knows
     it reads every notification and can publish fake approvals.
@@ -10528,8 +10341,6 @@ def redacted_config(data):
     if hook_token:
         # a live shared secret with no recognisable prefix: show none of it
         safe["webhook"]["token"] = _redact(hook_token, keep=0)
-    if safe.get("license"):
-        safe["license"] = _redact(safe["license"], keep=12)
     return safe
 
 
@@ -10695,9 +10506,8 @@ def build_parser():
     p_init.add_argument("--topic",
                         help="ntfy topic (default: the configured one, else a random one)")
     p_init.add_argument("--ntfy-auth", help="user:pass for self-hosted ntfy")
-    p_init.add_argument("--telegram-token", help="Telegram bot token (premium)")
+    p_init.add_argument("--telegram-token", help="Telegram bot token")
     p_init.add_argument("--telegram-chat", help="Telegram chat id")
-    p_init.add_argument("--license", help="premium license key (AB1-...)")
     p_init.add_argument("--quiet-hours",
                         help="windows that hold back pushes below quiet_hours_min_priority "
                              "(default: normal), e.g. '22:00-07:30' or "
@@ -10793,7 +10603,7 @@ def build_parser():
     p_watch.set_defaults(func=cmd_watch)
 
     p_doctor = sub.add_parser(
-        "doctor", help="check everything (config, server, hooks, MCP, license) and print fixes")
+        "doctor", help="check everything (config, server, hooks, MCP) and print fixes")
     p_doctor.add_argument("--send", action="store_true",
                           help="also send a real test notification and confirm delivery")
     p_doctor.add_argument("--json", action="store_true",
@@ -10859,14 +10669,14 @@ def build_parser():
     p_server.set_defaults(func=cmd_server)
 
     p_bot = sub.add_parser(
-        "bot", help="run the Telegram answer daemon (premium; bare `bot` = `bot run`)",
+        "bot", help="run the Telegram answer daemon (bare `bot` = `bot run`)",
         description="Without a subcommand, `agentbell bot` runs the bot in the foreground.")
     p_bot_sub = p_bot.add_subparsers(dest="sub")
     p_bot_run = p_bot_sub.add_parser(
         "run", help="run the bot in the foreground (one bot per state dir; "
                     "SIGTERM ends it with exit 0)")
     p_bot_run.set_defaults(func=cmd_bot)
-    p_bot_status = p_bot_sub.add_parser("status", help="show premium/bot status")
+    p_bot_status = p_bot_sub.add_parser("status", help="show bot status")
     p_bot_status.set_defaults(func=cmd_bot)
     p_bot_service = p_bot_sub.add_parser(
         "install-service", help="keep the bot running in the background (systemd user "
@@ -10943,18 +10753,6 @@ def build_parser():
     p_config_set.add_argument("key", help="dotted key, e.g. ntfy.topic or quiet_hours")
     p_config_set.add_argument("value")
     p_config_set.set_defaults(func=cmd_config)
-
-    p_license = sub.add_parser("license", help="activate / inspect the premium license")
-    p_license_sub = p_license.add_subparsers(dest="sub")
-    p_license_act = p_license_sub.add_parser("activate", help="activate a license key")
-    p_license_act.add_argument("key")
-    p_license_act.set_defaults(func=cmd_license)
-    p_license_status = p_license_sub.add_parser("status", help="show license status")
-    # -v as well: doctor's fix line for an unverifiable build prints it, and a
-    # 'fix:' command that argparse rejects is worse than no fix at all
-    p_license_status.add_argument("-v", "--verbose", action="store_true",
-                                  help="also show the start of the key and the customer")
-    p_license_status.set_defaults(func=cmd_license)
 
     return parser
 

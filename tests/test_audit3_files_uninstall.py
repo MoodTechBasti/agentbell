@@ -266,16 +266,16 @@ class TestPipUserExactNamesFU5(_Fixture):
 @NEEDS_SYMLINK
 class TestSymlinksFU6FU7(_Fixture):
 
-    def test_symlinked_config_file_says_the_target_keeps_the_key(self):
+    def test_symlinked_config_file_says_the_target_keeps_the_tokens(self):
         target = self._write(os.path.join(self.root, "dotfiles", "agentbell.json"),
-                             json.dumps({"license": "AB1-secret-key"}))
+                             json.dumps({"telegram": {"bot_token": "123:secret"}}))
         link = os.path.join(self.home, "ab.json")
         os.symlink(target, link)
         os.environ[an.CONFIG_FILE_ENV] = link
         report = an.purge_report(self.project)
         entry = next(e for e in report["entries"] if link in e["label"])
-        self.assertNotIn("license key", entry["action"])
-        self.assertTrue(any(target in w and "license key" in w for w in report["warnings"]),
+        self.assertEqual(entry["action"], "remove the link (see the note above)")
+        self.assertTrue(any(target in w and "keeps your tokens" in w for w in report["warnings"]),
                         report["warnings"])
         _, err = self._uninstall("--yes")
         self.assertIn(target, err)

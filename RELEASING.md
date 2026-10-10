@@ -71,7 +71,7 @@ The tag starts `.github/workflows/release.yml`. Follow it with `gh run list --wo
 - full unit-test suite
 - wheel and sdist build
 - `twine check`
-- archive-content checks (`agentbell.py` is the only Python file; the console entry point is present; `tests/`, `internal/` and `.license-secret` are absent)
+- archive-content checks (`agentbell.py` is the only Python file; the console entry point is present; `tests/` and `internal/` are absent)
 
 The publish job downloads only the files that build job produced and uploads them to PyPI.
 

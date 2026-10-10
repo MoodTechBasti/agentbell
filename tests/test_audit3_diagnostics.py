@@ -256,11 +256,10 @@ class TestHistoryVerifyCannotUse(_Sandbox):
 class TestDoctorTelegramOnly(_Sandbox):
     """D8: doctor blamed an unreachable ntfy on a Telegram-only setup."""
 
-    def premium_config(self, channels):
+    def telegram_config(self, channels):
         cfg = self.config(server="http://127.0.0.1:1")
         cfg.data["channels"] = list(channels)
         cfg.data["telegram"] = {"bot_token": "123:abc", "chat_id": "42"}
-        cfg.data["license"] = an.make_license_key("audit3", seed=base.TEST_SEED)
         cfg.save()
         return cfg
 
@@ -272,8 +271,7 @@ class TestDoctorTelegramOnly(_Sandbox):
         return checks, poll
 
     def test_telegram_only_does_not_check_ntfy(self):
-        with base.dev_keypair():
-            checks, poll = self.doctor(self.premium_config(["telegram"]))
+        checks, poll = self.doctor(self.telegram_config(["telegram"]))
         poll.assert_not_called()
         self.assertFalse([c for c in checks if c["name"].startswith("ntfy")
                           and c["status"] != an.OK])
@@ -281,13 +279,14 @@ class TestDoctorTelegramOnly(_Sandbox):
 
     def test_ask_still_needs_ntfy_without_telegram(self):
         # channels ["os"]: `ask` falls back to ntfy, so doctor still checks it
-        with base.dev_keypair():
-            checks, poll = self.doctor(self.premium_config(["os"]))
+        checks, poll = self.doctor(self.telegram_config(["os"]))
         poll.assert_called_once()
         self.assertIn(an.FAIL, [c["status"] for c in checks if c["name"] == "ntfy server"])
 
-    def test_telegram_without_premium_falls_back_to_ntfy(self):
-        cfg = self.premium_config(["telegram"])     # no dev_keypair: key invalid
+    def test_telegram_that_is_not_set_up_falls_back_to_ntfy(self):
+        cfg = self.telegram_config(["telegram"])
+        cfg.data["telegram"] = {"bot_token": None, "chat_id": None}
+        cfg.save()
         checks, poll = self.doctor(cfg)
         poll.assert_called_once()
 

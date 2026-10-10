@@ -119,7 +119,6 @@ jobs:
           for name in wheel_names + sdist_names:
               parts = pathlib.PurePosixPath(name).parts
               assert not ({"tests", "internal"} & set(parts)), name
-              assert ".license-secret" not in parts, name
           PY
 
       - uses: actions/upload-artifact@v7

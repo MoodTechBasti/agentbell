@@ -2,9 +2,7 @@
 # One-command install for agentbell: prefers pipx, falls back to
 # pip --user, falls back to a plain copy of the single source file.
 #
-# No build step. License keys are Ed25519-signed and every copy of
-# agentbell.py verifies them with the public key it already contains
-# (see DECISIONS.md 2b) - there is nothing to inject.
+# No build step.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

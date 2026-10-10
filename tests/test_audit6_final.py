@@ -1,7 +1,5 @@
 """Regression tests for the last leftovers before 1.7.0.
 
-BUY    the purchase hints pointed to a dead checkout ("Reply to your purchase
-       email", "€4.99"); they now say how to get a key: e-mail or an issue
 MCP    `mcp add` listed the MCP tools without agent, yes_label and no_label;
        the list now comes from MCP_TOOLS
 AUTH   `config set ntfy.auth none` warned about a plain-http credential while
@@ -16,6 +14,7 @@ LOCK   an ntfy marker that could not be locked, with Telegram configured,
 import contextlib
 import errno
 import io
+import json
 import os
 import shutil
 import sys
@@ -29,9 +28,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_agentbell as base  # noqa: E402  (module import: its classes do not re-run)
 import agentbell as an  # noqa: E402
-
-EMAIL = "basti@moodtechsolutions.com"
-ISSUES = "https://github.com/MoodTechBasti/agentbell/issues"
 
 
 class _Args:
@@ -49,47 +45,53 @@ def _temp_config(data):
     return directory, path
 
 
-class TestPurchaseHints(unittest.TestCase):
-    """BUY: every hint names a way to get a key that works."""
+class TestInitTelegramSetup(unittest.TestCase):
+    """Telegram is set up by init like any other channel: no extra step."""
 
-    def test_an_invalid_key_points_to_email_and_issues(self):
-        with self.assertRaises(SystemExit) as caught:
-            an.cmd_license(_Args(sub="activate", key="AB1-not-a-key"))
-        message = str(caught.exception.code)
-        self.assertIn("invalid license key", message)
-        self.assertIn(EMAIL, message)
-        self.assertIn(ISSUES, message)
-        self.assertNotIn("purchase", message)
-
-    def test_the_premium_refusal_says_how_to_get_a_key(self):
-        self.assertIn(EMAIL, an.LICENSE_PREMIUM_MSG)
-        self.assertIn(ISSUES, an.LICENSE_PREMIUM_MSG)
-        self.assertNotIn("€", an.LICENSE_PREMIUM_MSG)
-
-    def test_init_offers_telegram_with_a_way_to_get_a_key(self):
+    def _init(self, args, answers=None):
         directory, path = _temp_config({"ntfy": {"server": "https://ntfy.example",
-                                                 "topic": "buy-topic-0123456789abcdef"}})
+                                                 "topic": "tg-topic-0123456789abcdef"}})
         self.addCleanup(shutil.rmtree, directory)
         prompts = []
 
         def answer(prompt=""):
             prompts.append(prompt)
-            return "y" if "Configure Telegram" in prompt else ""
+            return (answers or {}).get(prompt.split(" (")[0].strip(), "")
 
-        args = base._init_args(non_interactive=False, no_test=True, no_hooks=True)
         stdout = io.StringIO()
         with unittest.mock.patch.dict(os.environ, {"AGENTBELL_CONFIG": path}), \
-                unittest.mock.patch.object(an.sys.stdin, "isatty", return_value=True), \
+                unittest.mock.patch.object(an.sys.stdin, "isatty",
+                                           return_value=not args.non_interactive), \
                 unittest.mock.patch("builtins.input", side_effect=answer), \
                 unittest.mock.patch.object(an, "http_request", return_value=(200, b"")), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
-            os.environ.pop(an.LICENSE_ENV, None)
             an.cmd_init(args)
-        self.assertTrue(any("License key" in prompt for prompt in prompts), prompts)
-        out = stdout.getvalue()
-        self.assertIn(EMAIL, out)
-        self.assertIn(ISSUES, out)
-        self.assertNotIn("€", out)
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh), prompts, stdout.getvalue()
+
+    def test_interactive_init_goes_straight_to_the_bot_token(self):
+        args = base._init_args(non_interactive=False, no_test=True, no_hooks=True)
+        saved, prompts, out = self._init(args, {"Configure Telegram too?": "y"})
+        asked = [p for p in prompts if "Configure Telegram" in p]
+        self.assertEqual(len(asked), 1, prompts)
+        after = prompts[prompts.index(asked[0]) + 1]
+        self.assertIn("Bot token", after)
+        self.assertIn("Create your bot", out)
+        self.assertIsNone(saved["telegram"]["bot_token"])      # blank token: skipped
+
+    def test_declining_telegram_adds_no_prompt(self):
+        args = base._init_args(non_interactive=False, no_test=True, no_hooks=True)
+        saved, prompts, out = self._init(args)
+        after = prompts[[i for i, p in enumerate(prompts) if "Configure Telegram" in p][0] + 1:]
+        self.assertFalse([p for p in after if "Bot token" in p], prompts)
+        self.assertNotIn("Create your bot", out)
+
+    def test_telegram_flags_work_on_their_own(self):
+        args = base._init_args(telegram_token="123456:abcdef", telegram_chat="42",
+                               no_test=True, no_hooks=True)
+        saved, _prompts, _out = self._init(args)
+        self.assertEqual(saved["telegram"], {"bot_token": "123456:abcdef", "chat_id": "42"})
+        self.assertEqual(saved["channels"], ["ntfy", "telegram"])
 
 
 class TestMcpAddToolList(unittest.TestCase):

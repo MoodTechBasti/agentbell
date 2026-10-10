@@ -106,38 +106,6 @@ def _fake_launcher(tmpdir, name="agentbell"):
     return path
 
 
-# One throwaway key pair for the whole suite: deriving one costs a few ms and
-# every test that needs a *valid* license signs with this instead of the real
-# private seed (which only the author's machine has).
-TEST_SEED = os.urandom(32)
-TEST_PUBLIC_KEY = an._ed25519_public_key(TEST_SEED).hex()
-
-
-@contextlib.contextmanager
-def dev_keypair(seed=TEST_SEED):
-    """Mint and verify with a throwaway key pair for the duration of the block.
-
-    Verification uses the hardcoded LICENSE_PUBLIC_KEY and nothing else - by
-    design there is no env var or config entry that points it somewhere else -
-    so a test that needs a valid key has to patch that constant. The env var
-    only hands `make_license_key` a signing seed.
-    """
-    old_public = an.LICENSE_PUBLIC_KEY
-    old_env = os.environ.get(an.LICENSE_SECRET_ENV)
-    an.LICENSE_PUBLIC_KEY = an._ed25519_public_key(seed).hex()
-    os.environ[an.LICENSE_SECRET_ENV] = seed.hex()
-    an._LICENSE_CACHE.clear()
-    try:
-        yield seed
-    finally:
-        an.LICENSE_PUBLIC_KEY = old_public
-        an._LICENSE_CACHE.clear()
-        if old_env is None:
-            os.environ.pop(an.LICENSE_SECRET_ENV, None)
-        else:
-            os.environ[an.LICENSE_SECRET_ENV] = old_env
-
-
 class MockNtfy:
     """Tiny in-process ntfy server: publish + JSON stream/poll subscribe."""
 
@@ -288,6 +256,15 @@ def make_config(server_url, topic="testtopic"):
         "approval_timeout": 60,
         "webhook": {"listen": "127.0.0.1", "port": 0, "token": None},
     })
+
+
+def _clear_state_queue():
+    """Empty the offline queue of the test state dir. A failed send queues
+    its notification, and the next successful send in the same process would
+    replay it into whatever mock server that test runs."""
+    directory = an.queue_dir()
+    for name in os.listdir(directory) if os.path.isdir(directory) else []:
+        os.remove(os.path.join(directory, name))
 
 
 def _free_port():
@@ -1205,6 +1182,39 @@ class TestHooks(unittest.TestCase):
         self.assertTrue(os.path.exists(
             os.path.join(project, ".opencode", "plugin", "agentbell.js")))
 
+    @unittest.skipUnless(shutil.which("node"), "node not available")
+    def test_opencode_reinstall_writes_the_v2_loadable_template(self):
+        """OpenCode 2.0.16 rejects a plugin module that has no default export
+        with `id` + `setup` ("Plugin must export a default definition with an
+        id and an effect or setup function"), so a reinstall has to repair an
+        install that only carries the 1.x named export. The written file must
+        be exactly what `_render_opencode_plugin()` produces - the same bytes
+        the node tests replay - and it must parse as an ES module."""
+        project = os.path.join(self.tmp, "proj_v2")
+        os.makedirs(project)
+        path = os.path.join(project, ".opencode", "plugin", "agentbell.js")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("// agentbell 1.x only\nexport const AgentBell = async () => ({});\n")
+        self.assertTrue(an.install_hooks("opencode", project=project)["changed"])
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertEqual(text, an._render_opencode_plugin())
+        for marker in ("export default {", "setup(ctx)", "payloadOf",
+                       "session.execution.succeeded", "session.execution.failed",
+                       "session.execution.interrupted", "session.idle",
+                       "permission.asked", "permission.updated"):
+            self.assertIn(marker, text)
+        # a second run changes nothing, and the file still parses
+        self.assertFalse(an.install_hooks("opencode", project=project)["changed"])
+        self.assertFalse(an.opencode_plugin_stale(project))
+        check = os.path.join(self.tmp, "proj_v2_check.mjs")
+        with open(check, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        out = subprocess.run(["node", "--check", check],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
     def test_opencode_install_migrates_legacy_agents_md_block(self):
         project = os.path.join(self.tmp, "proj_legacy")
         os.makedirs(project)
@@ -1785,6 +1795,204 @@ class TestMCP(unittest.TestCase):
         self.assertIn("notify", names)
         self.assertIn("ask_approval", names)
 
+    def test_protocol_refuses_a_tool_call_that_breaks_its_schema(self):
+        """The stdio surface reports a malformed call as a tool error, not a
+        push: the user live-tested `notify` without `message` and got a real
+        empty notification."""
+        _clear_state_queue()
+        ntfy = MockNtfy()
+        self.addCleanup(ntfy.stop)
+        cfg = make_config(ntfy.url, topic="stdio-validation")
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "notify", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "notify", "arguments": {"message": "stdio ok"}}},
+        ]
+        payload = "\n".join(json.dumps(r) for r in requests) + "\n"
+        original = an.Config
+        an.Config = lambda *a, **kw: cfg
+        old_stdin, old_stdout = sys.stdin, sys.stdout
+        try:
+            sys.stdin = io.TextIOWrapper(io.BytesIO(payload.encode()))
+            sys.stdout = stdout_buf = io.TextIOWrapper(io.BytesIO())
+            an.mcp_loop()
+            stdout_buf.flush()
+            output = stdout_buf.buffer.getvalue().decode()
+        finally:
+            sys.stdin, sys.stdout = old_stdin, old_stdout
+            an.Config = original
+        lines = [json.loads(line) for line in output.strip().splitlines()]
+        self.assertTrue(lines[0]["result"]["isError"])
+        self.assertIn("message", lines[0]["result"]["content"][0]["text"])
+        self.assertNotIn("isError", lines[1]["result"])
+        self.assertEqual(lines[1]["result"]["content"][0]["text"], "sent")
+        posts = ntfy.posts.get("stdio-validation", [])
+        self.assertEqual([p["body"] for p in posts], ["stdio ok"])
+
+
+class TestMCPArgumentValidation(unittest.TestCase):
+    """A call that breaks the schema `tools/list` advertised must be refused
+    before it can notify, ask or write history - the tools' only job is the
+    side effect, so "invalid" has to mean "nothing happened"."""
+
+    def setUp(self):
+        _clear_state_queue()
+        self.ntfy = MockNtfy()
+        self.cfg = make_config(self.ntfy.url, topic="mcpvalidation")
+        self._original = an.Config
+        an.Config = lambda *a, **kw: self.cfg
+
+    def tearDown(self):
+        an.Config = self._original
+        self.ntfy.stop()
+
+    def _refused(self, name, arguments):
+        """Call a known tool with a malformed payload; both side-effect
+        functions are booby-trapped, so reaching either one fails loudly."""
+        with unittest.mock.patch.object(
+                an, "send_notification",
+                side_effect=AssertionError("send_notification was reached")):
+            with unittest.mock.patch.object(
+                    an, "run_ask",
+                    side_effect=AssertionError("run_ask was reached")):
+                with self.assertRaises(RuntimeError) as ctx:
+                    an.mcp_tool_call(name, arguments)
+        return str(ctx.exception)
+
+    def test_notify_requires_message(self):
+        self.assertIn("message", self._refused("notify", {}))
+
+    def test_notify_rejects_null_message(self):
+        self.assertIn("message", self._refused("notify", {"message": None}))
+
+    def test_notify_rejects_a_non_string_message(self):
+        self.assertIn("message", self._refused("notify", {"message": 42}))
+        self.assertIn("string", self._refused("notify", {"message": ["hi"]}))
+
+    def test_notify_rejects_a_blank_message(self):
+        for blank in ("", "   ", "\n\t "):
+            with self.subTest(blank=blank):
+                self.assertIn("message", self._refused("notify", {"message": blank}))
+
+    def test_notify_rejects_an_unknown_priority(self):
+        self.assertIn("priority",
+                      self._refused("notify", {"message": "hi", "priority": "whenever"}))
+        self.assertIn("priority",
+                      self._refused("notify", {"message": "hi", "priority": "URGENT"}))
+
+    def test_notify_rejects_a_wrongly_typed_optional_field(self):
+        self._refused("notify", {"message": "hi", "priority": 4})
+        self._refused("notify", {"message": "hi", "title": 7})
+        self._refused("notify", {"message": "hi", "tags": ["a", "b"]})
+        self._refused("notify", {"message": "hi", "agent": 9})
+
+    def test_ask_requires_a_non_blank_question(self):
+        self.assertIn("message", self._refused("ask_approval", {}))
+        self.assertIn("message", self._refused("ask_approval", {"message": None}))
+        self.assertIn("message", self._refused("ask_approval", {"message": "  "}))
+
+    def test_ask_rejects_a_non_integer_timeout(self):
+        self._refused("ask_approval", {"message": "ok?", "timeout_seconds": "60"})
+        self._refused("ask_approval", {"message": "ok?", "timeout_seconds": 1.5})
+        self._refused("ask_approval", {"message": "ok?", "timeout_seconds": True})
+
+    def test_ask_rejects_a_non_string_label(self):
+        self._refused("ask_approval", {"message": "ok?", "yes_label": 1})
+
+    def test_a_refused_call_leaves_no_history_behind(self):
+        before = len(an.read_history(limit=0))
+        self._refused("notify", {})
+        self._refused("ask_approval", {})
+        self.assertEqual(len(an.read_history(limit=0)), before)
+        self.assertEqual(self.ntfy.posts.get("mcpvalidation", []), [])
+
+    def test_unknown_tool_still_names_itself(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            an.mcp_tool_call("make_coffee", {"message": "hi"})
+        self.assertIn("make_coffee", str(ctx.exception))
+
+    def test_a_valid_notify_keeps_its_defaults(self):
+        result = an.mcp_tool_call("notify", {"message": "mcp validation ok"})
+        self.assertEqual(result, "sent")
+        posts = self.ntfy.posts["mcpvalidation"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["body"], "mcp validation ok")
+        self.assertEqual(posts[0]["headers"]["Priority"], "3")
+        recs = [r for r in an.read_history(limit=0)
+                if r.get("message") == "mcp validation ok"]
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["event"], "notify")
+        self.assertEqual(recs[0]["priority"], "normal")
+
+    def test_explicit_nulls_on_optional_fields_keep_the_defaults(self):
+        result = an.mcp_tool_call("notify", {"message": "mcp null options",
+                                            "title": None, "priority": None,
+                                            "tags": None, "agent": None})
+        self.assertEqual(result, "sent")
+        recs = [r for r in an.read_history(limit=0)
+                if r.get("message") == "mcp null options"]
+        self.assertEqual(recs[0]["priority"], "normal")
+        self.assertIsNone(recs[0]["title"])
+        self.assertNotIn("agent", recs[0])
+
+    def test_an_unknown_key_is_still_tolerated(self):
+        result = an.mcp_tool_call("notify", {"message": "mcp extra key", "channel": "ntfy"})
+        self.assertEqual(result, "sent")
+
+    def test_a_valid_ask_reaches_run_ask_with_the_advertised_defaults(self):
+        seen = {}
+
+        def fake_run_ask(cfg, message, **kwargs):
+            seen["message"] = message
+            seen.update(kwargs)
+            return {"timeout": True}
+
+        with unittest.mock.patch.object(an, "run_ask", fake_run_ask):
+            outcome = an.mcp_tool_call("ask_approval", {"message": "ship it?"})
+        self.assertEqual(json.loads(outcome), {"timeout": True})
+        self.assertEqual(seen["message"], "ship it?")
+        self.assertEqual(seen["timeout_seconds"], an.MCP_ASK_DEFAULT_TIMEOUT)
+        self.assertEqual(seen["yes_label"], "Approve")
+        self.assertEqual(seen["no_label"], "Deny")
+        self.assertFalse(seen["print_status"])
+
+    def test_a_valid_ask_clamps_an_out_of_range_timeout(self):
+        seen = {}
+
+        def fake_run_ask(cfg, message, **kwargs):
+            seen.update(kwargs)
+            return {"timeout": True}
+
+        for raw, expected in ((0, an.MCP_ASK_DEFAULT_TIMEOUT),
+                              (5, 10),
+                              (10 ** 6, an.MCP_ASK_MAX_TIMEOUT)):
+            with self.subTest(timeout_seconds=raw):
+                with unittest.mock.patch.object(an, "run_ask", fake_run_ask):
+                    an.mcp_tool_call("ask_approval",
+                                     {"message": "ok?", "timeout_seconds": raw})
+                self.assertEqual(seen["timeout_seconds"], expected)
+
+
+class TestMCPToolSignatures(unittest.TestCase):
+    """The advertised schema is the contract the validator enforces: a field
+    that shows up as required in `tools/list` must be required here."""
+
+    def test_every_required_field_is_read_by_the_tool(self):
+        for tool in an.MCP_TOOLS:
+            with self.subTest(tool=tool["name"]):
+                schema = tool["inputSchema"]
+                self.assertEqual(schema["required"], ["message"])
+                self.assertEqual(schema["properties"]["message"]["type"], "string")
+
+    def test_signature_marks_optional_fields(self):
+        tools = {tool["name"]: an.mcp_tool_signature(tool) for tool in an.MCP_TOOLS}
+        self.assertTrue(tools["notify"].startswith("notify(message,"))
+        self.assertIn("title?", tools["notify"])
+        self.assertTrue(tools["ask_approval"].startswith("ask_approval(message,"))
+        self.assertIn("timeout_seconds?", tools["ask_approval"])
+
+
 
 class TestTopicValidation(unittest.TestCase):
     def test_valid(self):
@@ -1811,170 +2019,6 @@ class TestConfigMerge(unittest.TestCase):
         self.assertEqual(an.normalize_server(""), "")
         cfg = make_config("ntfy.sh")
         self.assertEqual(an.NtfyChannel(cfg).server(), "https://ntfy.sh")
-
-
-class TestEd25519(unittest.TestCase):
-    """RFC 8032 §7.1 test vectors - the licensing scheme rests on these."""
-
-    # (name, private seed, public key, message, signature) - all hex
-    VECTORS = [
-        ("TEST 1 (empty message)",
-         "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
-         "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
-         "",
-         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e0652249015"
-         "55fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
-        ("TEST 2 (1 byte)",
-         "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
-         "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
-         "72",
-         "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69d"
-         "a085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
-        ("TEST 3 (2 bytes)",
-         "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
-         "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
-         "af82",
-         "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3a"
-         "c18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
-    ]
-
-    def test_rfc8032_vectors(self):
-        for name, seed_hex, public_hex, message_hex, signature_hex in self.VECTORS:
-            with self.subTest(name):
-                seed = bytes.fromhex(seed_hex)
-                public = bytes.fromhex(public_hex)
-                message = bytes.fromhex(message_hex)
-                signature = bytes.fromhex(signature_hex)
-                self.assertEqual(an._ed25519_public_key(seed), public)
-                self.assertEqual(an._ed25519_sign(seed, message), signature)
-                self.assertTrue(an._ed25519_verify(public, message, signature))
-
-    def test_rfc8032_vectors_reject_a_flipped_bit(self):
-        for name, _seed_hex, public_hex, message_hex, signature_hex in self.VECTORS:
-            with self.subTest(name):
-                public = bytes.fromhex(public_hex)
-                message = bytes.fromhex(message_hex)
-                signature = bytes.fromhex(signature_hex)
-                other_message = (bytes([message[0] ^ 1]) + message[1:]) if message else b"\x00"
-                self.assertFalse(an._ed25519_verify(public, other_message, signature))
-                for index in (0, 32, 63):        # R half, S half, last byte
-                    broken = bytearray(signature)
-                    broken[index] ^= 1
-                    self.assertFalse(an._ed25519_verify(public, message, bytes(broken)))
-                broken_key = bytearray(public)
-                broken_key[0] ^= 1
-                self.assertFalse(an._ed25519_verify(bytes(broken_key), message, signature))
-
-    def test_verify_never_raises_on_garbage(self):
-        public = bytes.fromhex(self.VECTORS[0][2])
-        for key, message, signature in (
-            (b"", b"", b""),
-            (public, b"m", b""),
-            (public, b"m", b"\x00" * 63),
-            (public[:31], b"m", b"\x00" * 64),
-            (b"\xff" * 32, b"m", b"\xff" * 64),      # not a curve point
-            (public, b"m", b"\xff" * 64),            # S far above the group order
-        ):
-            self.assertFalse(an._ed25519_verify(key, message, signature))
-
-
-class TestLicense(unittest.TestCase):
-    def test_roundtrip(self):
-        with dev_keypair() as seed:
-            key = an.make_license_key("customer-123", seed=seed)
-            self.assertTrue(key.startswith("AB1-"))
-            self.assertTrue(an.check_license_key(key))
-            self.assertFalse(an.check_license_key(key + "X"))
-            self.assertFalse(an.check_license_key(key.replace("AB1", "AN1", 1)))
-        # outside the block the real public key applies again: a key signed by
-        # anything else is worthless, which is the whole point of the scheme
-        self.assertFalse(an.check_license_key(key))
-
-    def test_a_key_signed_by_another_pair_is_refused(self):
-        other = os.urandom(32)
-        forged = an.make_license_key("mallory", seed=other)
-        with dev_keypair():
-            self.assertFalse(an.check_license_key(forged))
-
-    def test_garbage_is_refused_without_raising(self):
-        for junk in (None, "", "   ", "garbage", 42, b"AB1-x", ["AB1"],
-                     "AB1", "AB1-AAAA", "AB1-AAAA-BBBB-CCCC", "AB1--",
-                     "AB1-!!!!-????", "AB1-" + "A" * 40 + "-" + "B" * 103,
-                     "AN1-MFTWK3TU-SIGNATURE", "-" * 3):
-            self.assertFalse(an.check_license_key(junk), f"accepted {junk!r}")
-
-    def test_expiry(self):
-        with dev_keypair() as seed:
-            past = (an.datetime.date.today() - an.datetime.timedelta(days=1)).isoformat()
-            self.assertFalse(an.check_license_key(
-                an.make_license_key("c", expiry=past, seed=seed)))
-            self.assertTrue(an.check_license_key(
-                an.make_license_key("c", expiry="2999-01-01", seed=seed)))
-            self.assertTrue(an.check_license_key(
-                an.make_license_key("c", seed=seed)))          # lifetime
-
-    def test_no_signing_seed_means_no_key(self):
-        """Every user build is in this state: it can verify, never mint."""
-        original = an._signing_seed
-        an._signing_seed = lambda seed=None: None
-        try:
-            self.assertIsNone(an.make_license_key("c"))
-        finally:
-            an._signing_seed = original
-
-    def test_verification_is_memoized(self):
-        with dev_keypair() as seed:
-            key = an.make_license_key("memo", seed=seed)
-            calls = []
-            original = an._ed25519_verify
-
-            def counting(*args):
-                calls.append(args)
-                return original(*args)
-
-            an._ed25519_verify = counting
-            try:
-                an._LICENSE_CACHE.clear()
-                for _ in range(5):
-                    self.assertTrue(an.check_license_key(key))
-                self.assertEqual(len(calls), 1, "premium_enabled must not re-verify per send")
-            finally:
-                an._ed25519_verify = original
-
-    def test_gate(self):
-        mock = MockNtfy()
-        try:
-            cfg = make_config(mock.url)
-            cfg.data["telegram"] = {"bot_token": "tok", "chat_id": "123"}
-            result = an.send_notification(cfg, "hi", channels=["ntfy", "telegram"])
-            self.assertFalse(result["ok"])
-            self.assertIn("premium", result["errors"][0])
-            # with a valid license, telegram is attempted (fails on network, but no gate error)
-            with dev_keypair() as seed:
-                cfg.data["license"] = an.make_license_key("c", seed=seed)
-                result = an.send_notification(cfg, "hi", channels=["ntfy", "telegram"])
-                self.assertFalse(any("premium" in e for e in result.get("errors", [])))
-        finally:
-            mock.stop()
-
-    def test_env_license(self):
-        cfg = make_config("http://x")
-        with dev_keypair() as seed:
-            key = an.make_license_key("env-customer", seed=seed)
-            old = os.environ.get(an.LICENSE_ENV)
-            os.environ[an.LICENSE_ENV] = key
-            try:
-                self.assertTrue(an.premium_enabled(cfg))
-            finally:
-                if old is None:
-                    os.environ.pop(an.LICENSE_ENV, None)
-                else:
-                    os.environ[an.LICENSE_ENV] = old
-
-    def test_env_var_is_a_signing_seed_only(self):
-        """The env var mints (author side); it never decides what is valid."""
-        with dev_keypair():
-            self.assertTrue(an.check_license_key(an.make_license_key("from-env-seed")))
 
 
 class TestEventAliases(unittest.TestCase):
@@ -2129,20 +2173,17 @@ class MockTelegram:
 
 
 class _TelegramFixture(unittest.TestCase):
-    """Base: points the Telegram API at a mock and activates a test license."""
+    """Base: points the Telegram API at a mock."""
 
     @classmethod
     def setUpClass(cls):
         cls.tg = MockTelegram()
         cls.old_base = an.TG_API_BASE
         an.TG_API_BASE = cls.tg.url
-        cls.keypair = dev_keypair()
-        cls.keypair.__enter__()
 
     @classmethod
     def tearDownClass(cls):
         an.TG_API_BASE = cls.old_base
-        cls.keypair.__exit__(None, None, None)
         cls.tg.stop()
 
     def setUp(self):
@@ -2154,8 +2195,8 @@ class _TelegramFixture(unittest.TestCase):
         for name in ("ntfy-pending", "tg-pending"):
             shutil.rmtree(os.path.join(an.state_dir(), name), ignore_errors=True)
 
-    def _tg_cfg(self, licensed=True, ntfy_url="https://ntfy.sh", channels=("telegram",)):
-        cfg = an.Config({
+    def _tg_cfg(self, ntfy_url="https://ntfy.sh", channels=("telegram",)):
+        return an.Config({
             "ntfy": {"server": ntfy_url, "topic": "tgtopic", "auth": None},
             "telegram": {"bot_token": "tok123", "chat_id": "42"},
             "channels": list(channels),
@@ -2164,9 +2205,6 @@ class _TelegramFixture(unittest.TestCase):
             "approval_timeout": 60,
             "webhook": {"listen": "127.0.0.1", "port": 0, "token": None},
         })
-        if licensed:
-            cfg.data["license"] = an.make_license_key("test-customer", seed=TEST_SEED)
-        return cfg
 
 
 class TestFormatDuration(unittest.TestCase):
@@ -2411,14 +2449,21 @@ class TestTelegramAsk(_TelegramFixture):
         self.assertTrue(any(r["event"] == "ask_result" and r["result"] == "timeout"
                             for r in records))
 
-    def test_explicit_telegram_requires_premium(self):
-        cfg = self._tg_cfg(licensed=False)
-        with self.assertRaises(RuntimeError):
+    def test_explicit_telegram_needs_a_configured_bot(self):
+        cfg = self._tg_cfg()
+        cfg.data["telegram"] = {"bot_token": None, "chat_id": None}
+        with self.assertRaises(RuntimeError) as ctx:
             an.run_ask(cfg, "Deploy?", timeout_seconds=5, print_status=False,
                        channels=["telegram"])
+        self.assertIn("not configured", str(ctx.exception))
 
-    def test_derived_channels_drop_telegram_without_license(self):
-        cfg = self._tg_cfg(licensed=False, channels=("ntfy", "telegram"))
+    def test_derived_channels_keep_a_configured_telegram(self):
+        cfg = self._tg_cfg(channels=("ntfy", "telegram"))
+        self.assertEqual(an.resolve_ask_channels(cfg), ["ntfy", "telegram"])
+
+    def test_derived_channels_drop_an_unconfigured_telegram(self):
+        cfg = self._tg_cfg(channels=("ntfy", "telegram"))
+        cfg.data["telegram"] = {"bot_token": None, "chat_id": None}
         self.assertEqual(an.resolve_ask_channels(cfg), ["ntfy"])
 
     def test_unknown_channel_rejected(self):
@@ -2819,7 +2864,9 @@ class TestRetryAndQueue(unittest.TestCase):
 
     def test_drain_permanent_failure_drops(self):
         cfg = make_config(self.ntfy.url, topic="drainperm")
-        an.enqueue_item(cfg, {"message": "telegram without license", "channels": ["telegram"],
+        # make_config has no bot token: Telegram is "not configured", which is
+        # a permanent error, so the item is dropped instead of retried forever
+        an.enqueue_item(cfg, {"message": "telegram without a bot", "channels": ["telegram"],
                               "priority": "normal", "event": "notify"})
         stats = an.drain_queue(cfg, limit=None)
         self.assertEqual(stats["dropped"], 1)
@@ -3311,7 +3358,8 @@ class TestPurge(unittest.TestCase):
     def test_purge_report_and_apply_removes_own_stuff_only(self):
         # config + state (env-based dirs shared by the test suite)
         os.makedirs(an.config_dir(), exist_ok=True)
-        self._write(an.config_path(), json.dumps({"ntfy": {"topic": "t"}, "license": "AB1-x"}))
+        self._write(an.config_path(), json.dumps({"ntfy": {"topic": "t"},
+                                                   "telegram": {"bot_token": "1:x", "chat_id": "2"}}))
         os.makedirs(an.state_dir(), exist_ok=True)
         self._write(an.history_path(), '{"event": "notify"}\n')
         os.makedirs(an.queue_dir(), exist_ok=True)
@@ -3542,11 +3590,10 @@ class TestSecrets(unittest.TestCase):
                      "action_auth": "tk_publish_only_secret"},
             "telegram": {"bot_token": "123456:AAHsuperSecretToken", "chat_id": 42},
             "webhook": {"listen": "0.0.0.0", "port": 8756, "token": "webhook-secret-token"},
-            "license": "AB1-PAYLOADPAYLOAD-SIGNATURE",
         }
         safe = json.dumps(an.redacted_config(data))
         for secret in ("hunter2", "AAHsuperSecretToken", "webhook-secret-token",
-                       "PAYLOADPAYLOAD", "SIGNATURE", "tk_publish_only_secret"):
+                       "tk_publish_only_secret"):
             self.assertNotIn(secret, safe, f"{secret} leaked into 'config show'")
         self.assertIn("bob:", safe)          # enough context to recognise it
         self.assertIn("0.0.0.0", safe)       # non-secrets stay visible
@@ -3555,7 +3602,7 @@ class TestSecrets(unittest.TestCase):
     def test_config_file_is_owner_only(self):
         tmp = tempfile.mkdtemp()
         cfg = an.Config(dict(an.default_config()), path=os.path.join(tmp, "sub", "config.json"))
-        cfg.data["license"] = "AB1-secret"
+        cfg.data["telegram"]["bot_token"] = "123456:secret"
         cfg.save()
         self.assertEqual(os.stat(cfg.path).st_mode & 0o777, 0o600)
         shutil.rmtree(tmp)
@@ -3618,7 +3665,7 @@ class TestCliWiring(unittest.TestCase):
                      ["bot", "status"], ["mcp"], ["mcp", "run"], ["mcp", "add"], ["history"],
                      ["queue"], ["queue", "list"], ["queue", "flush"], ["uninstall"],
                      ["config", "show"], ["config", "path"], ["config", "set", "k", "v"],
-                     ["bot", "install-service"], ["license", "status"],
+                     ["bot", "install-service"],
                      ["verify"], ["verify", "--agent", "x"], ["integrate"],
                      ["integrate", "--json"], ["hook", "totally_made_up_event"]):
             args = parser.parse_args(argv)
@@ -3626,6 +3673,7 @@ class TestCliWiring(unittest.TestCase):
 
     def test_test_command_reports_failure(self):
         """`agentbell test` must exit non-zero when nothing was delivered."""
+        self.addCleanup(_clear_state_queue)       # the failed send is queued
         cfg = make_config("http://127.0.0.1:1")   # nothing listening
         original = an.Config
         an.Config = lambda *a, **kw: cfg
@@ -3644,7 +3692,7 @@ class _Args:
 def _init_args(**overrides):
     values = dict(
         non_interactive=True, server=None, topic=None, ntfy_auth=None,
-        license=None, telegram_token=None, telegram_chat=None,
+        telegram_token=None, telegram_chat=None,
         quiet_hours=None, quiet_hours_mode=None,
         no_hooks=True, no_test=False, no_wait=True,
     )
@@ -4076,12 +4124,15 @@ class TestDoctor(unittest.TestCase):
         self.assertEqual(hooks["status"], an.OK)
         self.assertIn("doc-selfint", hooks["detail"])
 
-    def test_doctor_reports_an_invalid_license_key(self):
+    def test_doctor_does_not_fail_a_configured_telegram(self):
         cfg = make_config("http://127.0.0.1:1")
-        cfg.data["license"] = "AB1-NOTAREALKEY-SIGNATURE"
-        license_check = [c for c in an.doctor_checks(cfg) if c["name"] == "license"][0]
-        self.assertEqual(license_check["status"], an.FAIL)
-        self.assertIsNotNone(license_check["fix"])
+        cfg.data["telegram"] = {"bot_token": "1:x", "chat_id": "2"}
+        cfg.data["channels"] = ["ntfy", "telegram"]
+        telegram = [c for c in an.doctor_checks(cfg)
+                    if c["name"] in ("telegram", "telegram bot")]
+        self.assertTrue(telegram, "a configured Telegram gets its own row")
+        for check in telegram:
+            self.assertNotEqual(check["status"], an.FAIL, check)
 
     def test_doctor_surfaces_answer_claim_failures(self):
         an.write_history({"event": "answer_claim_failed", "error": "OSError"})
@@ -4245,49 +4296,6 @@ class TestForeignTelegramAnswer(unittest.TestCase):
 class TestAuditRegressions(unittest.TestCase):
     """One test per confirmed audit finding, so none of them can come back."""
 
-    def test_the_environment_cannot_make_an_invalid_key_verify(self):
-        """The env var signs; only LICENSE_PUBLIC_KEY decides what is accepted.
-
-        The old HMAC scheme let one env var pick the *verifier's* secret, which
-        unlocked the paid tier without any reverse engineering. Verification
-        now reads a hardcoded public key and nothing else, so an attacker's
-        key pair - however it is announced to the process - is just noise.
-        """
-        attacker = os.urandom(32)
-        forged = an.make_license_key("mallory", seed=attacker)
-        announced = an._ed25519_public_key(attacker).hex()
-        planted = {
-            "AGENTBELL_LICENSE_SECRET": attacker.hex(),
-            "AGENTBELL_LICENSE_PUBLIC_KEY": announced,
-            "AGENTBELL_PUBLIC_KEY": announced,
-            "LICENSE_PUBLIC_KEY": announced,
-        }
-        saved = {name: os.environ.get(name) for name in planted}
-        os.environ.update(planted)
-        an._LICENSE_CACHE.clear()
-        try:
-            self.assertFalse(an.check_license_key(forged),
-                             "a self-signed key must not unlock premium")
-            # the key is well formed - only the signature is the wrong one
-            with dev_keypair(attacker):
-                self.assertTrue(an.check_license_key(forged))
-        finally:
-            for name, value in saved.items():
-                if value is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = value
-            an._LICENSE_CACHE.clear()
-
-    def test_license_is_valid_through_the_whole_expiry_day(self):
-        today = an.datetime.date.today().isoformat()
-        yesterday = (an.datetime.date.today() - an.datetime.timedelta(days=1)).isoformat()
-        with dev_keypair() as seed:
-            self.assertTrue(an.check_license_key(
-                an.make_license_key("c", expiry=today, seed=seed)))
-            self.assertFalse(an.check_license_key(
-                an.make_license_key("c", expiry=yesterday, seed=seed)))
-
     @unittest.skipUnless(HAS_TOMLLIB, "tomllib requires 3.11+")
     def test_codex_feature_flag_stays_top_level(self):
         """A bare key after a [table] would belong to that table, not the root."""
@@ -4445,17 +4453,44 @@ class TestAuditRegressions(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
-    def test_unlicensed_telegram_in_config_does_not_fail_the_ntfy_send(self):
+    def _clear_queue(self):
+        for name in os.listdir(an.queue_dir()) if os.path.isdir(an.queue_dir()) else []:
+            os.remove(os.path.join(an.queue_dir(), name))
+
+    def test_an_unreachable_telegram_does_not_cost_the_ntfy_send(self):
+        """Config-derived channels ntfy + telegram: ntfy is delivered once and
+        the unreachable Telegram is queued for later, not lost and not fatal."""
         ntfy = MockNtfy()
+        self._clear_queue()
+        self.addCleanup(self._clear_queue)
+        self.addCleanup(setattr, an, "TG_API_BASE", an.TG_API_BASE)
+        an.TG_API_BASE = "http://127.0.0.1:1"      # telegram unreachable
         try:
-            cfg = make_config(ntfy.url, topic="premiumfallback")
+            cfg = make_config(ntfy.url, topic="tgdownfallback")
             cfg.data["channels"] = ["ntfy", "telegram"]
             cfg.data["telegram"] = {"bot_token": "1:x", "chat_id": 7}
-            cfg.data["license"] = None
-            result = an.send_notification(cfg, "hello")
+            with unittest.mock.patch.object(an, "RETRY_ATTEMPTS", 1):
+                result = an.send_notification(cfg, "hello")
             self.assertTrue(result["ok"], result)
             self.assertEqual([r["channel"] for r in result["results"]], ["ntfy"])
-            self.assertEqual(len(ntfy.posts.get("premiumfallback", [])), 1)
+            self.assertEqual(result["queued"], ["telegram"])
+            self.assertEqual(len(ntfy.posts.get("tgdownfallback", [])), 1)
+        finally:
+            ntfy.stop()
+
+    def test_telegram_listed_without_a_bot_is_reported_not_hidden(self):
+        """A channel the user listed but never set up is an error for that
+        channel; the other channels are still delivered."""
+        ntfy = MockNtfy()
+        try:
+            cfg = make_config(ntfy.url, topic="tgnotsetup")
+            cfg.data["channels"] = ["ntfy", "telegram"]
+            result = an.send_notification(cfg, "hello")
+            self.assertFalse(result["ok"], result)
+            self.assertEqual([r["channel"] for r in result["results"]], ["ntfy"])
+            self.assertEqual(len(ntfy.posts.get("tgnotsetup", [])), 1)
+            self.assertTrue(any(e.startswith("telegram:") and "not configured" in e
+                                for e in result["errors"]), result)
         finally:
             ntfy.stop()
 
@@ -4672,16 +4707,14 @@ class TestPartialDelivery(unittest.TestCase):
         for name in os.listdir(an.queue_dir()) if os.path.isdir(an.queue_dir()) else []:
             os.remove(os.path.join(an.queue_dir(), name))
         try:
-            with dev_keypair() as seed:
-                cfg.data["license"] = an.make_license_key("test", seed=seed)
-                an.enqueue_item(cfg, {"message": "two channels", "priority": "normal",
-                                      "channels": ["ntfy", "telegram"], "event": "notify"})
-                stats = an.drain_queue(cfg, limit=None, timeout=2.0)
-                self.assertEqual(stats["delivered"], 1)
-                self.assertEqual(stats["kept"], 1)
-                left = an.queue_list_data()["queue"]
-                self.assertEqual(len(left), 1)
-                self.assertEqual(left[0]["channels"], ["telegram"])
+            an.enqueue_item(cfg, {"message": "two channels", "priority": "normal",
+                                  "channels": ["ntfy", "telegram"], "event": "notify"})
+            stats = an.drain_queue(cfg, limit=None, timeout=2.0)
+            self.assertEqual(stats["delivered"], 1)
+            self.assertEqual(stats["kept"], 1)
+            left = an.queue_list_data()["queue"]
+            self.assertEqual(len(left), 1)
+            self.assertEqual(left[0]["channels"], ["telegram"])
         finally:
             an.TG_API_BASE = original_base
             for name in os.listdir(an.queue_dir()):
@@ -4764,8 +4797,8 @@ class TestFieldTestRegressions(unittest.TestCase):
             buf = io.StringIO()
             stdout, sys.stdout = sys.stdout, buf
             try:
-                # must return, not SystemExit: the license key and topic
-                # entered earlier in the wizard would be lost
+                # must return, not SystemExit: the topic entered earlier in
+                # the wizard would be lost
                 token = an.prompt_bot_token(reader=lambda prompt: next(answers).strip())
             finally:
                 sys.stdout = stdout
@@ -4921,13 +4954,11 @@ class TestFieldTestRegressions(unittest.TestCase):
         cfg = make_config("http://127.0.0.1:1")
         cfg.data["telegram"] = {"bot_token": "1:x", "chat_id": "42"}
         buf = io.StringIO()
-        with dev_keypair() as seed:
-            cfg.data["license"] = an.make_license_key("field-test", seed=seed)
-            stdout, sys.stdout = sys.stdout, buf
-            try:
-                an.print_next_steps(cfg)
-            finally:
-                sys.stdout = stdout
+        stdout, sys.stdout = sys.stdout, buf
+        try:
+            an.print_next_steps(cfg)
+        finally:
+            sys.stdout = stdout
         lines = [line.strip() for line in buf.getvalue().splitlines()]
         self.assertNotIn("agentbell bot", lines)
         self.assertIn("agentbell bot install-service", lines)
@@ -5037,25 +5068,6 @@ class TestWebhookToken(unittest.TestCase):
 
 class TestSecurityAuditRegressions(unittest.TestCase):
     """One test per finding of the pre-release security audit."""
-
-    def test_a_public_copy_can_verify_but_never_mint(self):
-        # what every user has: the public key, no signing seed. It checks keys
-        # and cannot produce one - the HMAC scheme it replaced shipped a secret
-        # that `pip download` + grep would have handed to anybody.
-        original_file = an.LICENSE_SEED_FILE
-        old = os.environ.get(an.LICENSE_SECRET_ENV)
-        an.LICENSE_SEED_FILE = ".no-such-license-secret"
-        os.environ.pop(an.LICENSE_SECRET_ENV, None)
-        try:
-            self.assertIsNone(an._signing_seed())
-            self.assertIsNone(an.make_license_key("mallory"))
-            forged = an.make_license_key("mallory", seed=os.urandom(32))
-            self.assertFalse(an.check_license_key(forged))
-            self.assertFalse(an.premium_enabled(make_config("http://x")))
-        finally:
-            an.LICENSE_SEED_FILE = original_file
-            if old is not None:
-                os.environ[an.LICENSE_SECRET_ENV] = old
 
     def test_action_buttons_never_carry_the_account_credential(self):
         # the headers of an http action are published inside the message, so
@@ -5250,7 +5262,7 @@ class TestSecurityAuditRegressions(unittest.TestCase):
     def test_a_config_we_own_is_never_briefly_world_readable(self):
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, "config.json")
-        an.write_json_atomic(path, {"license": "AB1-x"}, mode=0o600)
+        an.write_json_atomic(path, {"telegram": {"bot_token": "1:x"}}, mode=0o600)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         # somebody else's config keeps the mode it already had
         other = os.path.join(tmp, "settings.json")
@@ -6185,12 +6197,12 @@ class TestIntegrationGuide(unittest.TestCase):
             json.dump({"ntfy": {"server": "http://secret-server-marker",
                                 "topic": "secret-topic-marker"},
                        "telegram": {"bot_token": "secret-token-marker"},
-                       "license": "secret-license-marker"}, fh)
+                       "webhook": {"token": "secret-webhook-marker"}}, fh)
         try:
             guide = self._guide()
             blob = json.dumps(self._manifest())
             for marker in ("secret-server-marker", "secret-topic-marker",
-                           "secret-token-marker", "secret-license-marker"):
+                           "secret-token-marker", "secret-webhook-marker"):
                 self.assertNotIn(marker, guide)
                 self.assertNotIn(marker, blob)
         finally:
@@ -6493,6 +6505,406 @@ console.log(JSON.stringify(calls));
         ])
         self.assertEqual(calls[0], ["hook", "run_failed", "--agent", "opencode"])
         self.assertEqual(calls[1], ["hook", "run_completed", "--agent", "opencode"])
+
+    def test_legacy_entry_also_accepts_the_v2_payload(self):
+        """The payload key is normalised in one place, so the 1.x entry point
+        answers a `{type, data}` event too - that keeps a mixed install from
+        going silent during an upgrade."""
+        calls = self._run([
+            {"type": "message.updated",
+             "data": {"sessionID": "v2s", "info": {"role": "user", "time": {"created": 1}}}},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "v2s"}},
+        ])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:4], ["hook", "run_completed", "--agent", "opencode"])
+        self.assertEqual(calls[0][calls[0].index("--min-duration") + 1],
+                         str(an.HOOK_MIN_DURATION))
+
+
+def _render_opencode_plugin_for(command=("agentbell",)):
+    """The rendered OpenCode plugin with `command` pinned as agentbell's argv.
+
+    agentbell_command() depends on where agentbell lives on the machine: one
+    element for an installed launcher, [python, agentbell.py] for a checkout.
+    A test that records the plugin's argv must not inherit that.
+    """
+    with unittest.mock.patch.object(an, "agentbell_command", return_value=list(command)):
+        return an._render_opencode_plugin()
+
+
+@unittest.skipUnless(shutil.which("node"), "node not available")
+class TestOpenCodePluginV2Behaviour(unittest.TestCase):
+    """Replays OpenCode 2.x bus events through the real plugin file's default
+    export. Event names and payload shapes come from the installed 2.0.16
+    binary; the evidence is summarised in DECISIONS.md §38.
+
+    The clock is faked so the 10 s turn-end dedupe can be exercised without
+    the test taking ten seconds."""
+
+    HARNESS = r"""
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const calls = [];
+globalThis.Bun = { spawn(args) {
+  calls.push(args);
+  return { exited: Promise.resolve(0) };
+} };
+let now = 1000000;
+Date.now = () => now;
+const plugin = (await import(pathToFileURL(process.argv[1]).href)).default;
+assert.equal(plugin.id, "agentbell");
+assert.equal(typeof plugin.setup, "function");
+const script = JSON.parse(process.argv[2]);
+let subscribeOptions = null;
+let closed = false;
+const cleanup = plugin.setup({ event: { async *subscribe(options) {
+  subscribeOptions = options;
+  const signal = options && options.signal;
+  try {
+    for (const step of script) {
+      if (step.clock) { now += step.clock; continue; }
+      yield step;
+    }
+    await new Promise((resolve) => {
+      if (!signal) return;
+      if (signal.aborted) return resolve();
+      signal.addEventListener("abort", resolve, { once: true });
+    });
+  } finally { closed = true; }
+} } });
+assert.equal(typeof cleanup, "function");
+await new Promise((resolve) => setTimeout(resolve, 25));
+cleanup();
+for (let i = 0; i < 50 && !closed; i++) await new Promise((r) => setTimeout(r, 5));
+assert.equal(closed, true, "cleanup did not stop the subscription");
+console.log(JSON.stringify({
+  calls,
+  aborted: Boolean(subscribeOptions && subscribeOptions.signal
+                   && subscribeOptions.signal.aborted),
+}));
+"""
+
+    def _run(self, script, command=("agentbell",)):
+        tmp = tempfile.mkdtemp(prefix="agentbell-plugin-v2-")
+        plugin = os.path.join(tmp, "agentbell.mjs")
+        with open(plugin, "w", encoding="utf-8") as fh:
+            fh.write(_render_opencode_plugin_for(command))
+        out = subprocess.run(["node", "--input-type=module", "-e", self.HARNESS,
+                              plugin, json.dumps(script)],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        meta = json.loads(out.stdout.strip().splitlines()[-1])
+        # Bun.spawn gets [...command, ...args]; check the command, hand the
+        # tests only the arguments they are about
+        for call in meta["calls"]:
+            self.assertEqual(call[:len(command)], list(command))
+        meta["calls"] = [call[len(command):] for call in meta["calls"]]
+        return meta
+
+    def test_a_checkout_install_spawns_the_interpreter_and_the_script(self):
+        """agentbell.py is not executable, so agentbell_command() is
+        [python, script] and the rendered BIN is an array; both elements have
+        to reach Bun.spawn ahead of the hook arguments."""
+        meta = self._run([{"type": "session.execution.succeeded",
+                           "data": {"sessionID": "s10"}}],
+                         command=("/usr/bin/python3", "/opt/agentbell/agentbell.py"))
+        self.assertEqual(meta["calls"],
+                         [["hook", "run_completed", "--agent", "opencode"]])
+
+    def test_success_reports_the_prompt_duration_and_cleans_up(self):
+        meta = self._run([
+            {"type": "message.updated",
+             "data": {"sessionID": "s1", "info": {"role": "user", "time": {"created": 1000}}}},
+            {"clock": 1100},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "s1"}},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "s1"}},
+        ])
+        # one push for the turn, not one per completion report
+        self.assertEqual(len(meta["calls"]), 1)
+        call = meta["calls"][0]
+        self.assertEqual(call[:4], ["hook", "run_completed", "--agent", "opencode"])
+        self.assertEqual(call[call.index("--duration") + 1], "1")
+        self.assertEqual(call[call.index("--min-duration") + 1], str(an.HOOK_MIN_DURATION))
+        self.assertTrue(meta["aborted"], "the abort signal was not passed to subscribe")
+
+    def test_unknown_duration_still_notifies(self):
+        meta = self._run([{"type": "session.execution.succeeded",
+                           "data": {"sessionID": "s2"}}])
+        self.assertEqual(meta["calls"],
+                         [["hook", "run_completed", "--agent", "opencode"]])
+
+    def test_failure_notifies_and_does_not_report_a_duration(self):
+        meta = self._run([
+            {"type": "message.updated",
+             "data": {"sessionID": "s3", "info": {"role": "user", "time": {"created": 1000}}}},
+            {"type": "session.execution.failed",
+             "data": {"sessionID": "s3", "error": {"name": "APIError", "message": "boom"}}},
+        ])
+        self.assertEqual(meta["calls"], [["hook", "run_failed", "--agent", "opencode"]])
+
+    def test_permission_asked_is_throttled_to_one_ping(self):
+        meta = self._run([
+            {"type": "permission.asked", "data": {"sessionID": "s4", "id": "per_1"}},
+            {"type": "permission.asked", "data": {"sessionID": "s4", "id": "per_2"}},
+        ])
+        self.assertEqual(meta["calls"],
+                         [["hook", "permission_required", "--agent", "opencode"]])
+
+    def test_child_sessions_are_ignored(self):
+        meta = self._run([
+            {"type": "session.created", "data": {"sessionID": "child", "parentID": "root"}},
+            {"type": "message.updated",
+             "data": {"sessionID": "child", "info": {"role": "user", "time": {"created": 1}}}},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "child"}},
+            {"type": "session.execution.failed", "data": {"sessionID": "child"}},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "root"}},
+        ])
+        self.assertEqual(meta["calls"],
+                         [["hook", "run_completed", "--agent", "opencode"]])
+
+    def test_resent_prompt_does_not_start_a_turn(self):
+        meta = self._run([
+            {"type": "message.updated",
+             "data": {"sessionID": "s5", "info": {"role": "user", "time": {"created": 1000}}}},
+            {"clock": 1100},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "s5"}},
+            # 2.x re-sends the prompt after the turn (background diff summary);
+            # the old message must not be read as the start of a new one
+            {"type": "message.updated",
+             "data": {"sessionID": "s5", "info": {"role": "user", "time": {"created": 1000}}}},
+            {"clock": 10500},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "s5"}},
+            # the real next prompt does start a turn
+            {"type": "message.updated",
+             "data": {"sessionID": "s5", "info": {"role": "user", "time": {"created": 2000000}}}},
+            {"clock": 11000},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "s5"}},
+        ])
+        self.assertEqual(len(meta["calls"]), 3)
+        self.assertEqual(meta["calls"][0][meta["calls"][0].index("--duration") + 1], "1")
+        self.assertNotIn("--duration", meta["calls"][1])
+        self.assertEqual(meta["calls"][2][meta["calls"][2].index("--duration") + 1], "11")
+
+    def test_interrupt_clears_the_turn_without_notifying(self):
+        meta = self._run([
+            {"type": "message.updated",
+             "data": {"sessionID": "s6", "info": {"role": "user", "time": {"created": 1000}}}},
+            {"clock": 30000},
+            {"type": "session.execution.interrupted",
+             "data": {"sessionID": "s6", "reason": "user"}},
+            # a genuinely newer prompt (time.created after the interrupt) still
+            # starts the next turn; only a replay of the old one must not
+            {"type": "message.updated",
+             "data": {"sessionID": "s6", "info": {"role": "user", "time": {"created": 2000000}}}},
+            {"clock": 2000},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "s6"}},
+        ])
+        self.assertEqual(len(meta["calls"]), 1)
+        self.assertEqual(meta["calls"][0][meta["calls"][0].index("--duration") + 1], "2")
+
+    def test_interrupted_turn_cannot_be_rearmed_by_a_replayed_prompt(self):
+        """The interrupt is silent, but it still has to be *terminal*: OpenCode
+        re-sends the previous prompt after a turn, so a clear-only interrupt
+        would let that old prompt start a new turn and then report the gap as
+        the next turn's duration. The recorded end timestamp blocks it."""
+        meta = self._run([
+            {"type": "message.updated",
+             "data": {"sessionID": "s8", "info": {"role": "user", "time": {"created": 1000}}}},
+            {"clock": 5000},
+            {"type": "session.execution.interrupted",
+             "data": {"sessionID": "s8", "reason": "shutdown"}},
+            # same prompt, same created stamp: a replay, not a new turn
+            {"type": "message.updated",
+             "data": {"sessionID": "s8", "info": {"role": "user", "time": {"created": 1000}}}},
+            {"clock": 2000},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "s8"}},
+        ])
+        self.assertEqual(len(meta["calls"]), 1)
+        self.assertNotIn("--duration", meta["calls"][0])
+
+    def test_failed_turn_cannot_be_rearmed_by_a_replayed_prompt(self):
+        meta = self._run([
+            {"type": "message.updated",
+             "data": {"sessionID": "s9", "info": {"role": "user", "time": {"created": 1000}}}},
+            {"clock": 5000},
+            {"type": "session.execution.failed",
+             "data": {"sessionID": "s9", "error": {"name": "APIError", "message": "boom"}}},
+            {"type": "message.updated",
+             "data": {"sessionID": "s9", "info": {"role": "user", "time": {"created": 1000}}}},
+            {"clock": 2000},
+            {"type": "session.execution.succeeded", "data": {"sessionID": "s9"}},
+        ])
+        self.assertEqual(meta["calls"][0], ["hook", "run_failed", "--agent", "opencode"])
+        self.assertEqual(len(meta["calls"]), 2)
+        self.assertNotIn("--duration", meta["calls"][1])
+
+    def test_unknown_events_are_harmless(self):
+        meta = self._run([
+            {"type": "session.step.started",
+             "data": {"sessionID": "s7", "assistantMessageID": "msg_1"}},
+            {"type": "server.connected", "data": {}},
+            {"type": "whiteboard.changed", "data": {"whatever": True}},
+        ])
+        self.assertEqual(meta["calls"], [])
+
+    def test_setup_without_an_event_context_is_a_noop(self):
+        tmp = tempfile.mkdtemp(prefix="agentbell-plugin-v2-noctx-")
+        plugin = os.path.join(tmp, "agentbell.mjs")
+        with open(plugin, "w", encoding="utf-8") as fh:
+            fh.write(an._render_opencode_plugin())
+        harness = (
+            "import assert from 'node:assert/strict';\n"
+            "import { pathToFileURL } from 'node:url';\n"
+            "globalThis.Bun = { spawn() { throw new Error('unexpected spawn'); } };\n"
+            "const plugin = (await import(pathToFileURL(process.argv[1]).href)).default;\n"
+            "assert.equal(plugin.setup({}), undefined);\n"
+            "console.log('ok');\n"
+        )
+        out = subprocess.run(["node", "--input-type=module", "-e", harness, plugin],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip().splitlines()[-1], "ok")
+
+    def test_v1_loader_replay_registers_one_hook_and_delivers_once(self):
+        """Behavioral replay of the real 1.x loader, not a shape guess.
+
+        `readV1Plugin`, `getServerPlugin`, `getLegacyPlugins` and
+        `applyPlugin` below are transcribed from
+        https://raw.githubusercontent.com/anomalyco/opencode/v1.18.18/packages/opencode/src/plugin/index.ts
+        and `.../plugin/shared.ts` (the same reader is at v1.18.12).
+
+        What that source says, and what this asserts:
+        - `applyPlugin` reads `mod.default` through `readV1Plugin(..., "detect")`.
+          In detect mode an object with none of `id`/`server`/`tui` is not a
+          1.x plugin, but an object that *has* `id` and no callable `server`
+          **throws** - which is exactly what the default export did before
+          `server: AgentBell` was added. The first assertion pins that.
+        - When it does return, `applyPlugin` pushes one hook and returns, so
+          the legacy `getLegacyPlugins` walk over `Object.values(mod)` (which
+          resolves functions or objects with a server function) is never
+          reached. The assertions pin one hook; the fallback would register
+          the same function twice on this namespace.
+        - The 2.x rule is mirrored by `v2Accepts`: a plain-object `default`
+          with a string `id` and a callable `setup`, extra keys ignored. That
+          is the behaviour of the schema the 2.0.16 binary bundles, replayed
+          against the same `effect` build (`{id, setup, server}` is accepted
+          there too; DECISIONS.md §38).
+        """
+        tmp = tempfile.mkdtemp(prefix="agentbell-plugin-loader-")
+        plugin = os.path.join(tmp, "agentbell.mjs")
+        with open(plugin, "w", encoding="utf-8") as fh:
+            fh.write(_render_opencode_plugin_for())
+        harness = r"""
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+// --- transcribed from opencode v1.18.18 plugin/index.ts + shared.ts -------
+const isRecord = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+const isServerPlugin = (v) => typeof v === "function";
+function getServerPlugin(value) {
+  if (isServerPlugin(value)) return value;
+  if (!value || typeof value !== "object" || !("server" in value)) return;
+  if (!isServerPlugin(value.server)) return;
+  return value.server;
+}
+function getLegacyPlugins(mod) {
+  const seen = new Set();
+  const result = [];
+  for (const entry of Object.values(mod)) {
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    const plugin = getServerPlugin(entry);
+    if (!plugin) throw new TypeError("Plugin export is not a function");
+    result.push(plugin);
+  }
+  return result;
+}
+function readV1Plugin(mod, spec, kind, mode = "strict") {
+  const value = mod.default;
+  if (!isRecord(value)) {
+    if (mode === "detect") return;
+    throw new TypeError(`Plugin ${spec} must default export an object with ${kind}()`);
+  }
+  if (mode === "detect" && !("id" in value) && !("server" in value) && !("tui" in value)) return;
+  const server = "server" in value ? value.server : undefined;
+  const tui = "tui" in value ? value.tui : undefined;
+  if (server !== undefined && typeof server !== "function") {
+    throw new TypeError(`Plugin ${spec} has invalid server export`);
+  }
+  if (tui !== undefined && typeof tui !== "function") {
+    throw new TypeError(`Plugin ${spec} has invalid tui export`);
+  }
+  if (server !== undefined && tui !== undefined) {
+    throw new TypeError(`Plugin ${spec} must default export either server() or tui(), not both`);
+  }
+  if (kind === "server" && server === undefined) {
+    throw new TypeError(`Plugin ${spec} must default export an object with server()`);
+  }
+  return value;
+}
+const calls = [];
+const $ = (strings, ...values) => {
+  const parts = [];
+  strings.forEach((s, i) => { if (s.trim()) parts.push(s.trim()); if (i < values.length) {
+    const v = values[i]; Array.isArray(v) ? parts.push(...v) : parts.push(String(v)); } });
+  calls.push(parts);
+  const p = Promise.resolve({});
+  p.quiet = () => p; p.nothrow = () => p;
+  return p;
+};
+async function applyPlugin(mod, input) {
+  const hooks = [];
+  const plugin = readV1Plugin(mod, "file:///plugin", "server", "detect");
+  if (plugin) {
+    hooks.push(await plugin.server(input, undefined));
+    return hooks;
+  }
+  for (const server of getLegacyPlugins(mod)) hooks.push(await server(input, undefined));
+  return hooks;
+}
+// --- the 2.x rule, mirroring the schema the 2.0.16 binary bundles ---------
+function v2Accepts(mod) {
+  const v = mod.default;
+  if (!isRecord(v)) return false;
+  if (typeof v.id !== "string") return false;
+  return typeof v.setup === "function" || typeof v.effect === "function";
+}
+
+// the shape that shipped and was rejected: an `id` with no `server`
+let preFix = "";
+try { readV1Plugin({ default: { id: "agentbell", setup() {} } }, "spec", "server", "detect"); }
+catch (e) { preFix = String(e.message); }
+assert.match(preFix, /must default export an object with server\(\)/,
+  "the pre-fix default must still be rejected by the 1.x reader");
+
+const ns = await import(pathToFileURL(process.argv[1]).href);
+assert.equal(v2Accepts(ns), true, "2.x needs a plain-object default with id + setup");
+
+// The legacy walk is what a default without id/server/tui would fall into. On
+// this namespace it does not throw - both `AgentBell` and `default` resolve to
+// the same callable - but it counts them as two entries, because `seen` tracks
+// the raw export values, not the resolved plugins. So the detect path
+// returning early is what keeps this at exactly one hook, and this number is
+// the pin for that.
+const legacy = getLegacyPlugins(ns);
+assert.equal(legacy.length, 2);
+assert.equal(legacy[0], legacy[1]);
+
+const hooks = await applyPlugin(ns, { $ });
+assert.equal(hooks.length, 1, "the 1.x loader must register exactly one hook");
+assert.equal(typeof hooks[0].event, "function");
+await hooks[0].event({ event: { type: "session.execution.succeeded",
+                                data: { sessionID: "s1" } } });
+console.log(JSON.stringify({ hookCount: hooks.length,
+                             calls: calls.map((a) => a.slice(1)) }));
+"""
+        out = subprocess.run(["node", "--input-type=module", "-e", harness, plugin],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        result = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(result["hookCount"], 1)
+        self.assertEqual(result["calls"],
+                         [["hook", "run_completed", "--agent", "opencode"]])
 
 
 if __name__ == "__main__":

@@ -193,16 +193,15 @@ class TestUninstallAdvice(unittest.TestCase):
 class TestVerifyTelegramOnly(d3._Sandbox):
     """RBD-3: doctor said 'ntfy not used', verify judged the ntfy topic."""
 
-    premium_config = d3.TestDoctorTelegramOnly.premium_config
+    telegram_config = d3.TestDoctorTelegramOnly.telegram_config
 
     def delivery(self, channels, topic):
-        with base.dev_keypair():
-            cfg = self.premium_config(channels)
-            cfg.data["ntfy"]["topic"] = topic
-            cfg.save()
-            verify = an.verify_report(cfg)["checks"]
-            with unittest.mock.patch.object(an.NtfyChannel, "poll"):
-                doctor = an.doctor_checks(cfg)
+        cfg = self.telegram_config(channels)
+        cfg.data["ntfy"]["topic"] = topic
+        cfg.save()
+        verify = an.verify_report(cfg)["checks"]
+        with unittest.mock.patch.object(an.NtfyChannel, "poll"):
+            doctor = an.doctor_checks(cfg)
         return ([c for c in verify if c["name"] == "delivery"],
                 [c for c in doctor if c["name"].startswith("ntfy")])
 
