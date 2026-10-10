@@ -64,6 +64,17 @@ Rows 1 and 19 below are updated to reflect this. `pipx` itself was not
 re-tested in this pass (sandbox has no `pipx`); the isolated-pipx result
 from 2026-09-03 above still stands as pipx-specific evidence.
 
+### Public PyPI 1.8.0 install verification (2026-10-10)
+
+- A fresh Python 3.12.3 venv installed `agentbell==1.8.0` from public PyPI;
+  `agentbell --version` reported `agentbell 1.8.0`.
+- An isolated pipx environment installed `agentbell==1.8.0` from public PyPI;
+  its launcher also reported `agentbell 1.8.0`.
+- In separate fresh homes, `doctor` from both installs returned the expected
+  exit 1 for missing setup and pointed to `agentbell init`.
+- This verifies packaging and startup, not phone delivery or an OpenCode host
+  session. No real notification was sent.
+
 ### Current-checkout installation result (2026-08-22)
 
 The post-merge Linux/WSL2 installation was refreshed from `main` at commit
@@ -92,7 +103,7 @@ this retained evidence.
 
 | # | What | Command / setup | Expected |
 |---|------|-----------------|----------|
-| 1 | Install + init | `pipx install agentbell && agentbell init` | Fresh install reports the released version — **confirmed via `pip install agentbell` 2026-09-05, `pipx` itself not re-tested in this pass**; wizard completes, config saved, test push arrives, "NEXT STEPS" block printed |
+| 1 | Install + init | `pipx install agentbell && agentbell init` | Fresh install reports the released version — **`pip` and isolated `pipx` both confirmed from public PyPI on 2026-10-10 (`1.8.0`);** wizard completes, config saved, test push arrives, "NEXT STEPS" block printed |
 | 2 | doctor | `agentbell doctor` | All checks OK; exit 0 |
 | 3 | Basic notify | `agentbell notify "hello" --priority high --tags test` | Push with title/priority/tags |
 | 4 | ask via ntfy (buttons) | `agentbell ask "Deploy to prod?"` | Question + Approve/Deny on the phone; CLI exits 0/1 |
