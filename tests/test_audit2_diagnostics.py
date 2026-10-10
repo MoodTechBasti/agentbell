@@ -400,14 +400,10 @@ class TestTestCommandTelegramOnly(_Sandbox):
         patcher = unittest.mock.patch.object(an, "TG_API_BASE", self.tg.url)
         patcher.start()
         self.addCleanup(patcher.stop)
-        keypair = base.dev_keypair()
-        keypair.__enter__()
-        self.addCleanup(keypair.__exit__, None, None, None)
 
     def telegram_config(self, topic="audit2-topic-0123456789"):
         return self.config(topic=topic, channels=("telegram",),
-                           telegram={"bot_token": "123:abc", "chat_id": "42"},
-                           license=an.make_license_key("audit2", seed=base.TEST_SEED))
+                           telegram={"bot_token": "123:abc", "chat_id": "42"})
 
     def run_test_command(self, cfg):
         with unittest.mock.patch.object(an, "Config", lambda *a, **kw: cfg):
@@ -459,7 +455,7 @@ class TestNotifyQuiet(_Sandbox):
             return self.capture(an.cmd_notify, args)
 
     def test_a_failure_is_reported_on_stderr_even_with_quiet(self):
-        cfg = self.config()        # no premium: an explicit telegram send fails
+        cfg = self.config()        # no bot set up: an explicit telegram send fails
         code, out, err = self.notify(["x", "--quiet", "--channel", "telegram"], cfg)
         self.assertEqual(code, 3)
         self.assertEqual(out, "")

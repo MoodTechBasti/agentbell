@@ -80,9 +80,12 @@ What `agentbell hooks install opencode` writes to
 `~/.config/opencode/plugin/agentbell.js` (global — applies in every repo),
 or to `.opencode/plugin/agentbell.js` with `--project`.
 
-A real plugin rather than a rule file: it listens on `session.idle`,
-`session.error` and `permission.asked` / `permission.updated`, and filters out
-subagent sessions so one turn is one notification. A user message
+A real plugin rather than a rule file. One file serves both plugin loaders:
+OpenCode 1.x reads its `server` entry, 2.x reads `setup`. It listens on
+`session.idle` / `session.execution.succeeded`, `session.error` /
+`session.execution.failed` and `permission.asked` / `permission.updated`, and
+filters out subagent sessions so one turn is one notification. An interrupted
+turn stays silent. A user message
 (`message.updated`) marks the start of a turn, so the "finished" push carries
 the turn duration and `--min-duration 60` keeps turns shorter than a minute
 silent, as for Claude Code. A second idle event for the same session within
@@ -212,7 +215,7 @@ field; `curl -f` stops the script on each of them.
 
 ### `agentbell-bot.service`
 
-A systemd user unit for the premium Telegram answer daemon.
+A systemd user unit for the Telegram answer daemon.
 
 **Prefer `agentbell bot install-service`** — it writes the unit with the
 absolute path of your actual install, and falls back to a `nohup` line where

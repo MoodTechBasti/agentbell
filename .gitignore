@@ -7,10 +7,6 @@ build/
 .venv/
 venv/
 
-# author-side license secret + key minting tool (never committed)
-.license-secret
-tools/make-license.py
-
 # self-installed agent hooks (this repo dogfoods its own tool - never commit its own output)
 .clinerules/
 .continue/

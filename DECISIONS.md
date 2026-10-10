@@ -11,30 +11,14 @@
 
 **Trade-off:** no async/HTTP2 niceties. Irrelevant at this scale.
 
-## 2. Channel order: ntfy first, Telegram premium, OS fallback
+## 2. Channel order: ntfy first, Telegram second, OS fallback
 
-**Decision:** ntfy is the default free channel; OS notifications are a free fallback; Telegram is a **premium feature** gated by a lifetime license key.
+**Decision:** ntfy is the default channel; Telegram is an opt-in second channel, alone or in parallel with ntfy; OS notifications are the fallback.
 
 **Why:**
 - ntfy: no account, works on iOS + Android, self-hostable, action buttons, free-text replies — it uniquely supports the *approval flow without a public server* (see §4). Telegram cannot do this without a bot daemon.
 - Opt-in matters more than reach: the tool never spams a channel the user didn't configure.
-- The product direction is fixed on this point: the free core has to be completely usable without paying anything. Telegram and parallel delivery are a separable layer on top, not a piece cut out of the core.
-
-## 2b. Premium licensing: offline Ed25519 lifetime keys
-
-**Decision:** license keys of the form `AB1-<base32(payload)>-<base32(signature)>`, payload `agentbell|customer|expiry`, signature = Ed25519 over the payload bytes. Offline-checkable, no phone-home, no subscription. `tools/make-license.py` mints keys (author-side only, **not in the public repo**); `agentbell license activate <key>` verifies and stores. Premium gate = `send_notification` refuses the `telegram` channel without a valid key (clear error message), plus the init wizard's license flow.
-
-**Key security:** the split is asymmetric on purpose. `agentbell.py` contains `LICENSE_PUBLIC_KEY` — 64 public hex characters — and nothing else; the 32-byte private seed lives only in the git-ignored `.license-secret` (mode 0600) on my machine. Verification reads that constant and nothing else: there is deliberately no env var, config entry or file that can point it at another key, so nobody can announce their own key pair to the process and unlock the paid tier (§12i, tested).
-
-**Why it replaced HMAC** (the v1.0–v1.4 scheme, symmetric, with the secret injected into the shipped copy by `tools/build.py`): the plan is a single-file `.py` on PyPI, and a symmetric secret inside a shipped file is a secret in public — `pip download` plus `grep` and anyone could mint keys for everyone. Ed25519 removes the secret from every artifact, and with it the entire build step. Three things fell out of that, all improvements:
-
-- **Every copy verifies keys.** Under HMAC, a checkout run straight from `python3 agentbell.py` had no secret and rejected every real key, so `doctor`, `license activate` and the init wizard each needed a branch explaining "this build cannot verify keys". All gone: one code path, one message.
-- **`install.sh` installs the source file.** No staging directory, no injected copy — pipx / `pip --user` / plain copy, all from the checkout.
-- **Keys are unforgeable.** Under HMAC, extracting the secret from an author-built binary produced a working key generator. Forging an Ed25519 key means breaking Ed25519.
-
-**Implementation:** RFC 8032 in ~150 lines of stdlib Python (`hashlib.sha512` + integer arithmetic, extended coordinates) inside `agentbell.py`, covered by the RFC's own §7.1 test vectors. Signing lives in the same file: it is inert without the private seed, and the tests and the minting tool import it from there. Verification is a few milliseconds of big-int math but `premium_enabled()` runs on every send, so results are memoized per process.
-
-**Trade-off (unchanged and accepted):** the free-vs-paid split lives in the same MIT codebase, and a fork can delete the gate — it is deliberately one line deep so it stays trivial to audit (see `premium_enabled`/`send_notification`). What changed is the other half of the threat model: the *keys* can no longer be forged, and no shipped artifact contains anything that helps. No license server = zero ops and zero privacy concerns.
+- The core has to be completely usable without a Telegram account. Telegram and parallel delivery are a separable layer on top, not a piece cut out of the core.
 
 ## 3. Hook strategy per agent
 
@@ -45,7 +29,7 @@
 | Claude Code | `~/.claude/settings.json` `hooks` (`UserPromptSubmit`, `Stop`, `StopFailure`, `Notification(agent_needs_input)`, since 1.7.0 also `Notification(permission_prompt)`), `async: true` | Real shell hooks, documented; event names verified against Claude Code 2.1.232. Async so network latency never blocks a turn. `UserPromptSubmit` only writes a start marker (`--silent`) so the completion push can report the turn duration. The `permission_prompt` matcher (runs `hook permission_required`) comes from Claude Code's hooks documentation (checked 2026-09-23); it is wired and covered by tests, but not yet field-tested with a real Claude Code session. Existing installs get it only by re-running `hooks install claude`. |
 | Codex | `~/.codex/config.toml` `hooks.UserPromptSubmit` + `hooks.Stop` | Codex supports lifecycle hooks in config.toml (events verified against Codex 0.147.0). We append TOML array-of-tables blocks guarded by markers so user config is never rewritten. Hooks are enabled by default; `features.hooks = true` is written only when it cannot conflict with an existing `[features]` table, and the note now says so instead of claiming hooks are off. `SessionEnd` was considered but dropped: it fires on every exit (including `/clear`) and would spam. |
 | Gemini CLI | `~/.gemini/settings.json` `hooks.AfterAgent` | Fires once per turn after the final response — the correct "done" event. No failure event exists; documented. |
-| OpenCode | plugin in `~/.config/opencode/plugin/agentbell.js` (**v1.3.0**, was an `AGENTS.md` block) | OpenCode has a real plugin bus (`event` hook). Deterministic beats "please call the CLI": `session.idle` → run_completed, `session.error` → run_failed, `permission.asked` → permission_required. Verified against OpenCode 1.18.18. |
+| OpenCode | plugin in `~/.config/opencode/plugin/agentbell.js` (**v1.3.0**, was an `AGENTS.md` block; **both loader contracts covered since 1.8.0, §38**) | OpenCode has a real plugin bus, so deterministic beats "please call the CLI". The 1.x loader reads `default.server` (source at tag v1.18.18); the 2.x loader reads `default.setup` and ignores `server`. 1.x events: `session.idle` → run_completed, `session.error` → run_failed, `permission.asked`/`permission.updated` → permission_required. 2.x events: `session.execution.succeeded`/`.failed` on `event.data`, `permission.asked`. One file carries both; the contracts are tested offline, not field-tested on 2.x (§38). |
 | Kimi Code | `~/.kimi-code/config.toml` `[[hooks]]` (v1.4.0) | Real lifecycle hooks (`UserPromptSubmit`/`Stop`/`StopFailure`), event names re-verified against moonshotai.github.io/kimi-code (2026-08; the kimi-cli docs are being wound down in favor of Kimi Code CLI). Kimi only accepts the four fields `event`/`matcher`/`command`/`timeout` in a `[[hooks]]` table — anything else (e.g. `async`) makes it refuse to load the whole config, so the block is kept to exactly those keys. |
 | Qwen Code | `~/.qwen/settings.json` `hooks` (v1.4.0) | Speaks Claude's hooks.json format (`UserPromptSubmit`/`Stop`/`StopFailure`, no matcher on these events). Command hooks support `async: true` (re-verified against qwenlm.github.io/qwen-code-docs, 2026-08), which is used so a notification send never blocks the end of a turn. Hooks are enabled by default; `disableAllHooks: true` disables them. |
 | Cursor | `.cursor/rules/agentbell.mdc` (alwaysApply rule) | Cursor had no lifecycle shell hooks when this was decided. *(It has since documented hooks of its own, `~/.cursor/hooks.json`; agentbell does not use them yet and still installs the rule, per project.)* A rule that instructs the agent to call the CLI is the standard, reliable mechanism. This is the one file we own outright, so it is written verbatim — a `.mdc` must begin with its YAML frontmatter, and the marker-block wrapper used for shared files broke it (fixed in v1.3.0). Format re-verified against cursor.com/docs/context/rules (2026-08): `.mdc` + `alwaysApply: true`. |
@@ -104,7 +88,7 @@ phone, and refused with a notice otherwise.
 
 ## 5b. Retry & offline queue
 
-**Decision:** publish failures are classified (`TransientError`: connection errors, timeouts, 5xx/408/429; `PermanentError`: 4xx, bad config, premium gate). A transient failure is tried up to 3 times in total (`RETRY_ATTEMPTS`), with 1s/2s backoff between the tries, inside the same call. A hook stops earlier when its 6 s send budget runs out (§32), and the bot's drain stops at its 20 s budget per cycle. If the channel is still down, the notification is **queued** in `<state>/queue/` (one JSON file per item) and delivered later — the v1.1 failure mode (silent loss) is gone.
+**Decision:** publish failures are classified (`TransientError`: connection errors, timeouts, 5xx/408/429; `PermanentError`: 4xx, bad config). A transient failure is tried up to 3 times in total (`RETRY_ATTEMPTS`), with 1s/2s backoff between the tries, inside the same call. A hook stops earlier when its 6 s send budget runs out (§32), and the bot's drain stops at its 20 s budget per cycle. If the channel is still down, the notification is **queued** in `<state>/queue/` (one JSON file per item) and delivered later — the v1.1 failure mode (silent loss) is gone.
 
 **Queue limits:** max 100 items (drop-oldest + `queue_overflow` history), max age 24 h (`queue_expired`), permanent failures on replay are dropped + logged (`queue_dropped`), transient ones stay with an attempt counter (`kept`). Queued `ask` questions are pointless (the answer window closes), so `ask` never queues — it retries and then fails loudly (parallel-channel asks still let the healthy channel decide).
 
@@ -127,12 +111,12 @@ phone, and refused with a notice otherwise.
 ## 7. Deliberately not implemented (yet)
 
 1. **Windows-native hooks.** The CLI runs on Windows; agent hook configs are generated for the agents' own shells. First-class Windows support is possible but wasn't the focus. *(Superseded in part: since 1.7.0 the hook command is written for the shell each host uses on Windows — a plain path unquoted with forward slashes, which runs in cmd, PowerShell and Git Bash; otherwise `& '…'` for PowerShell hosts and double quotes for Claude Code and Kimi Code; Qwen Code hooks carry `"shell": "powershell"`. The host shells come from the hosts' source and docs as of 2026-09. The forms were run through cmd, PowerShell 5.1 and Git Bash, not inside the real host apps. A path that needs quoting still fails under Codex's `cmd /C` fallback, under Qwen builds that ignore the `shell` key, and in Claude Code without Git Bash. The Windows toast is §24; `watch` on Windows is §28 and §37.)*
-2. **Auto-update / prebuilt binaries / custom sounds** — plausible premium extras later, deliberately not built now.
+2. **Auto-update / prebuilt binaries / custom sounds** — deliberately not built now.
 3. **Multi-user / team topics, dashboards, rate limiting** — out of scope for a personal tool.
 4. **Cursor global rules.** Cursor stores global rules in its own DB; we install project-level rules (documented). 
 5. **Per-event channel routing, reply-to on plain notifications** — explicitly excluded by this iteration's goals.
 6. **Agent remote control via chat** (arbitrary Telegram commands, reply-to as a command system) — v1.2's request IDs answer *approvals*, they deliberately do not become a general command surface. See §10.
-7. **A background auto-drainer for free users.** Queue/defer delivery is opportunistic (next notify/hook/`queue flush`), never a hidden daemon. The known opt-in `bot` daemon drains when it runs.
+7. **A background auto-drainer.** Queue/defer delivery is opportunistic (next notify/hook/`queue flush`), never a hidden daemon. The known opt-in `bot` daemon drains when it runs.
 8. **Retry delivery guarantees beyond best-effort.** Retries are bounded and the queue is local; there is no at-most-once guarantee (a timed-out POST may still have been delivered, so a rare duplicate is possible on retry — the request id stays the same, so approval answers are deduplicated).
 
 ## 7b. Single-file architecture: current state and migration strategy
@@ -183,9 +167,9 @@ v1.5.0 is the first public release; the 2-week field test (started on v1.3.1) co
   terminal and gets each signal once);
 - run durations: the start marker is per session, not per agent (§26).
 
-**Decision:** Telegram approvals are a **premium** feature implemented as an opt-in long-polling daemon (`agentbell bot`), stdlib-only. `ask` publishes the question with an inline keyboard (Approve/Deny); the daemon picks up the `callback_query` via `getUpdates`, writes the answer to `<state>/tg-answers/<approval-id>.json`, and `ask` polls that file. A pid lockfile (`<state>/bot.lock`) guarantees a single poller.
+**Decision:** Telegram approvals are implemented as an opt-in long-polling daemon (`agentbell bot`), stdlib-only. `ask` publishes the question with an inline keyboard (Approve/Deny); the daemon picks up the `callback_query` via `getUpdates`, writes the answer to `<state>/tg-answers/<approval-id>.json`, and `ask` polls that file. A pid lockfile (`<state>/bot.lock`) guarantees a single poller.
 
-**Why long polling instead of a webhook daemon?** Telegram's webhook model requires a publicly reachable HTTPS endpoint (tunnel/port-forward/VPS) — exactly the infra the product avoids (see §4). Long polling needs only outbound HTTPS, runs on the same laptop/VPS as the CLI, and keeps the daemon stdlib-only (`urllib` + `json`). The free ntfy flow is untouched; the daemon is opt-in and the systemd unit example lives in `examples/`.
+**Why long polling instead of a webhook daemon?** Telegram's webhook model requires a publicly reachable HTTPS endpoint (tunnel/port-forward/VPS) — exactly the infra the product avoids (see §4). Long polling needs only outbound HTTPS, runs on the same laptop/VPS as the CLI, and keeps the daemon stdlib-only (`urllib` + `json`). The ntfy flow is untouched; the daemon is opt-in and the systemd unit example lives in `examples/`.
 
 **Why file-based answer handoff (not ports/sockets)?** The daemon and the waiting `ask` process are separate processes. Files in the state dir need no port management, survive daemon restarts, are trivially debuggable, and are atomic enough for a single-user tool at this scale.
 
@@ -194,8 +178,6 @@ v1.5.0 is the first public release; the 2-week field test (started on v1.3.1) co
 **Free-text replies:** attributed to the *newest* unexpired pending ask (pending markers written by `ask` before publishing, removed on completion). Callback buttons are unambiguous (approval id in `callback_data`).
 
 **Parallel channel semantics (ntfy + Telegram):** both channels receive the question at once; the **first answer wins** and the others are stopped; the timeout is shared. The deciding channel is recorded in the JSON output and history. A publish failure on one channel never aborts the ask as long as another channel could still decide (single-channel asks still fail hard on publish errors). If the daemon is down, ntfy still decides. On the ntfy side, button answers carry the approval id and stale ones (from an earlier ask) are filtered out by the waiter; free-text is accepted as before (v1.0 semantics).
-
-**Premium gate:** `ask --channel telegram`, the derived-config telegram path, and `agentbell bot` all require a valid license; without one, derived ask silently degrades to ntfy (warning on stderr), explicit `--channel telegram` fails with an error. The gate stays the same one-liner pattern as the delivery channel (§2b).
 
 **`agentbell watch`:** runs the command via `subprocess.run`, notifies on completion with exit code + duration (`format_duration`: `12s`, `4m12s`, `1h05m`), success → `normal`, failure → `urgent` (overridable via `--priority`/`--fail-priority`). The command's exit code is passed through (127 if it cannot be started); notification failures are printed to stderr but never change the exit code.
 
@@ -216,7 +198,7 @@ kernel lock on `bot.lock` and reads the heartbeat. The heartbeat, the
 
 - **No chat remote control.** Request IDs exist to bind *answers* to *questions*, not to route arbitrary commands. No agent command language over Telegram/ntfy.
 - **No per-event channel routing matrix** and no reply-to on plain notifications.
-- **No background daemon for free users.** Defer/queue delivery rides on activity + `queue flush`; only the known premium `bot` drains continuously.
+- **No background daemon.** Defer/queue delivery rides on activity + `queue flush`; only the known opt-in `bot` drains continuously.
 - **No multi-device sync / cloud backend / CRDT** — the queue is local, single-user, bounded.
 - **Bundle format is simple**: one summary message with timestamps; no digests, collapsing by event type, or per-day grouping. Good enough at 3-item granularity.
 
@@ -243,7 +225,7 @@ command, and hook entries only in the shape agentbell writes (§33).
 **Decision:** one command, `agentbell uninstall`, is the complete removal path:
 
 - **Default is a dry run**: it lists every found artifact (kind, path, what would happen) and deletes nothing. Deletion requires the explicit `--yes` flag. No hidden destructive behavior.
-- **Scope** (grown with the agent list; current as of v1.4.1): the CLI entry (pipx package, pip --user script + dist-info, or standalone copy — detected per install path, files verified to be ours before deletion), the config dir (incl. license key), the state dir (history, queue, deferred, bot.json, bot.lock, run markers, pending-ask dirs, tg-answers), the hooks of **all twelve supported agents** — the global configs of Claude Code, Codex, Gemini CLI, Kimi Code, Qwen Code and OpenCode, plus the project rule files of Cursor, Windsurf, Cline, Continue, Zed and Aider (`--project`, default `.`) — and the MCP registrations this tool wrote, scanning **nine client config families** (Claude Code, Claude Desktop, Gemini, Qwen Code, Kimi Code, Cursor, VS Code, OpenCode, Codex; global *and* project paths where a client has both). That covers all ten `mcp add` client names: ChatGPT Desktop shares Codex's `~/.codex/config.toml`, so removing the Codex entry removes it too.
+- **Scope** (grown with the agent list; current as of v1.4.1): the CLI entry (pipx package, pip --user script + dist-info, or standalone copy — detected per install path, files verified to be ours before deletion), the config dir, the state dir (history, queue, deferred, bot.json, bot.lock, run markers, pending-ask dirs, tg-answers), the hooks of **all twelve supported agents** — the global configs of Claude Code, Codex, Gemini CLI, Kimi Code, Qwen Code and OpenCode, plus the project rule files of Cursor, Windsurf, Cline, Continue, Zed and Aider (`--project`, default `.`) — and the MCP registrations this tool wrote, scanning **nine client config families** (Claude Code, Claude Desktop, Gemini, Qwen Code, Kimi Code, Cursor, VS Code, OpenCode, Codex; global *and* project paths where a client has both). That covers all ten `mcp add` client names: ChatGPT Desktop shares Codex's `~/.codex/config.toml`, so removing the Codex entry removes it too.
 - **Own-markers-only rule**: hooks/MCP removal operates exactly on the markers this tool wrote (`agentbell hook` commands, the TOML comment block, `<!-- agentbell:start -->`, the `agentbell` MCP keys). User hooks, foreign MCP servers and unrelated config keys are never touched; files are only deleted when they consist solely of our block.
 - **Explicitly not removed** (printed after every run): the ntfy app subscription on the phone, a Telegram bot at BotFather, `AGENTBELL_*` env vars in shell rc files. A *running* bot daemon gets a warning instead of a kill; it would recreate state files.
 - **Env overrides are honored** (paths come from `AGENTBELL_CONFIG_DIR`/`AGENTBELL_CONFIG`/`AGENTBELL_STATE_DIR` when set), with a warning that the env vars themselves are not unset.
@@ -280,23 +262,21 @@ Everything here came out of an adversarial audit of the RC plus end-to-end runs 
 
 ### 12d. `doctor`
 
-**Decision:** one command answers "why is this not working?": install + PATH, config presence and file mode, topic quality, server reachability (with auth), active quiet hours, license validity, Telegram + daemon state, wired agents, MCP registrations, queue backlog, state-dir writability, optionally a real delivery test (`--send`). Every non-OK check carries a **copy-pasteable fix command**; exit code 1 if anything failed.
+**Decision:** one command answers "why is this not working?": install + PATH, config presence and file mode, topic quality, server reachability (with auth), active quiet hours, Telegram + daemon state, wired agents, MCP registrations, queue backlog, state-dir writability, optionally a real delivery test (`--send`). Every non-OK check carries a **copy-pasteable fix command**; exit code 1 if anything failed.
 
-**Why a new command and not more flags:** the failure modes are known and finite, and a 2-week field test needs one thing to run when something is odd — not a decision tree in the README. (It also detected a build installed *without* the license secret, where every valid key looked invalid — a state the Ed25519 switch in §2b removed entirely: every copy verifies keys now, so `doctor` only ever reports the key itself as valid or not.)
+**Why a new command and not more flags:** the failure modes are known and finite, and a 2-week field test needs one thing to run when something is odd — not a decision tree in the README.
 
 ### 12e. Security pass
 
 | Issue | Fix |
 |---|---|
-| `config.json` (license key, bot token, ntfy password) was mode 644 | written 0600 via a shared atomic `write_json_atomic` |
-| `config show` printed `ntfy.auth` and the webhook token in clear | all four credentials redacted (`redacted_config`, covered by a test that greps for each secret) |
+| `config.json` (bot token, ntfy password) was mode 644 | written 0600 via a shared atomic `write_json_atomic` |
+| `config show` printed `ntfy.auth` and the webhook token in clear | every credential redacted (`redacted_config`, covered by a test that greps for each secret) |
 | macOS notifications interpolated the message into AppleScript | `_applescript_string` escaping; Windows got a *working* toast (the old branch only loaded a type and reported success); `notify-send` gets `--` |
 | Webhook bearer token compared with `==` | `hmac.compare_digest` |
 | Any Telegram user could answer an approval by pressing a button | callbacks are accepted only from the configured chat; foreign presses are logged and politely rejected |
 | `history.jsonl` grew unbounded | rotated at 2 MB, keeping the newest 2000 entries |
 | Config paths written to `~/.claude.json` etc. non-atomically | all JSON configs go through `write_json_atomic`; invalid JSON is refused, not overwritten |
-
-The premium gate is unchanged and still one line deep. Licensing was HMAC at the time, so `doctor` and `license activate` learned to *say* when a build could not verify keys instead of blaming the key — both of those branches are gone since §2b moved to Ed25519 (no build carries a secret, every build verifies).
 
 ### 12f. Partial delivery no longer loses a channel
 
@@ -317,15 +297,11 @@ The premium gate is unchanged and still one line deep. Licensing was HMAC at the
 
 ### 12i. Audit outcome (37 confirmed findings)
 
-The RC was put through a multi-agent adversarial audit: six independent readers over six failure dimensions (approval/concurrency, queue/defer, hooks/purge, security, CLI/portability, Telegram/licensing), every finding then verified by a separate skeptic that had to reproduce it against the real module. 83 raw findings, 37 confirmed, 11 explicitly refuted (documented behavior, stale line numbers, or already fixed mid-run). Each confirmed finding now has a regression test.
+The RC was put through a multi-agent adversarial audit: six independent readers over six failure dimensions (approval/concurrency, queue/defer, hooks/purge, security, CLI/portability, Telegram), every finding then verified by a separate skeptic that had to reproduce it against the real module. 83 raw findings, 37 confirmed, 11 explicitly refuted (documented behavior, stale line numbers, or already fixed mid-run). Each confirmed finding now has a regression test.
 
-Three of them changed how the product behaves, not just how it is implemented. *(The answer contract in the first one was changed again: free text is exit 0 but `approved: false` (§22), exit 3 is a runtime error, and typed-reply routing is §30.)*
+One of them changed how the product behaves, not just how it is implemented. *(The answer contract in it was changed again: free text is exit 0 but `approved: false` (§22), exit 3 is a runtime error, and typed-reply routing is §30.)*
 
 **Free-text answers are no longer collapsed.** `_parse_answer` matched a keyword *prefix*, so "yes, but use staging" became a bare `approved` and the instruction was lost. Now: an affirmation approves only when it stands alone; a negation denies even with a reason after it (fail-closed is the right direction for an approval gate, and the reason is kept); everything else is free text. The documented exit-code contract (0 approved/answered, 1 denied, 2 timeout) is unchanged — a verifier correctly refuted the related "fails open" claim as documented, tested behavior, so the README now just states the caveat for anyone chaining `ask && <command>`.
-
-**Config-derived Telegram degrades instead of failing.** With `channels: ["ntfy","telegram"]` and no license, `notify` exited 3 and hid the fact that ntfy had delivered. The premium gate stays a permanent error inside `_publish_item_channels` (the queue relies on it to drop unlicensed items instead of retrying forever), but `send_notification` now drops telegram from *config-derived* channel lists — mirroring what `resolve_ask_channels` already did for `ask`. An explicit `--channel telegram` still fails loudly.
-
-**The license env var no longer overrides a real build.** `check_license_key` honored `AGENTBELL_LICENSE_SECRET`, which let anyone pick the verifier's own secret and sign a key with it — a complete bypass of the paid tier in one env var. The fallback was narrowed to an unbuilt checkout (which validated no real key anyway), so the author/test workflow was untouched and shipped builds were not bypassable this way. The move to Ed25519 (§2b) later removed the underlying problem instead of narrowing it: verification uses the hardcoded public key only, and `AGENTBELL_LICENSE_SECRET` is now nothing but a *signing* seed for the author's minting tool — it cannot make an invalid key verify, which is the property `TestAuditRegressions.test_the_environment_cannot_make_an_invalid_key_verify` pins down.
 
 Two findings are documented rather than fixed:
 
@@ -368,8 +344,8 @@ just wasn't using it.
 ### 13b. A wizard must never discard what it already has
 
 **Bug:** a token the wizard disliked ended in `SystemExit(3)` — losing the ntfy
-topic, the quiet hours and the **license key** entered moments earlier. The
-user re-typed the key three times in a row.
+topic and the quiet hours entered moments earlier. The
+user re-typed them three times in a row.
 
 **Decision:** `prompt_bot_token` retries, and giving up returns `None` instead
 of exiting. Telegram is skipped; everything else is saved. A failure in an
@@ -378,8 +354,8 @@ of exiting. Telegram is skipped; everything else is saved. A failure in an
 ### 13c. `config set`: a fix must be one line
 
 **Problem:** `doctor` flagged the short, guessable topic correctly, but its fix
-was "run `agentbell init`" — the whole wizard, including re-entering the
-license key, to change one string. That contradicts the copy-paste promise.
+was "run `agentbell init`" — the whole wizard, including re-entering
+every answer, to change one string. That contradicts the copy-paste promise.
 
 **Decision:** `config set <dotted.key> <value>` with an **allowlist** of keys,
 each with its own validator, and `doctor` emits the complete command with a
@@ -389,13 +365,13 @@ the config *reader* — `_load` tolerantly drops an unparseable quiet-hours
 window (right, at send time), but accepting one here would silently mean "no
 quiet hours" and the user would learn that at 3am.
 
-### 13d. The premium feature depended on an open terminal
+### 13d. The Telegram buttons depended on an open terminal
 
 **Problem:** Telegram Approve/Deny buttons only exist while the answer daemon
 is running, and the documented way to keep it running was
 `cp examples/agentbell-bot.service …` — which only works from a git
 checkout. Anyone who installed via `install.sh` and moved on could not do it.
-So the headline paid feature quietly degraded to buttonless questions.
+So the Telegram buttons quietly degraded to buttonless questions.
 
 **Decision:** `bot install-service` writes the unit itself (systemd user unit,
 or a launchd agent on macOS) with the **absolute** binary path from
@@ -967,7 +943,7 @@ stored in the repository. The build job checks that the tag equals the
 `pyproject.toml` version, runs the standard package build and `twine check`,
 checks the artifact contents, then hands those exact artifacts to the publish
 job. A tag/version mismatch or an archive containing tests, internal files,
-the signing secret, extra Python runtime files or a missing console entry
+extra Python runtime files or a missing console entry
 point fails before publication. `MANIFEST.in` excludes the tests that
 setuptools otherwise adds to a source distribution by default.
 
@@ -1607,8 +1583,7 @@ service stays stopped; a crash is still restarted. The launchd job uses
 (interpreter plus script from a checkout) with `Type=exec`, so a command
 that cannot start fails the install instead of looping. It pins
 `AGENTBELL_CONFIG` and `AGENTBELL_STATE_DIR`, because a service does not
-see the shell's variables, and refuses a license key that exists only in
-`AGENTBELL_LICENSE`. It uses `enable` plus `restart`, so a running bot
+see the shell's variables. It uses `enable` plus `restart`, so a running bot
 picks up the new unit. A service that did not start (including a machine
 without systemd, where it prints a `nohup` line) exits 1. `uninstall`
 stops, disables and deletes the service first (§36).
@@ -1739,8 +1714,10 @@ hook forms turned into invalid TOML.
   the exit code is 1. A real change keeps every key and value, but the
   file is re-serialized with two-space indentation. A symlinked config is
   updated where it points; a link into a read-only store (Nix,
-  home-manager) is refused with a message. The existing mode is kept,
-  and a new file follows the umask.
+  home-manager) is refused with a message, for agentbell's own
+  `config.json` too (`config set` and `init` print it and exit 1; the
+  save is the one place that turns the writer's error into that exit).
+  The existing mode is kept, and a new file follows the umask.
 
 **Cost.** A TOML file that mixes CRLF and LF comes back in its majority
 line ending. After install and uninstall, a rule file that had no final
@@ -1793,7 +1770,7 @@ env var loses only agentbell's own entries (`config.json`;
 files. The directory goes only when nothing else is left; everything else
 is listed as kept. A directory that cannot be read is listed, and `--yes`
 fails with the reason. A symlinked config file loses only the link, with
-a warning that the target still holds the license key and tokens; a
+a warning that the target still holds the tokens; a
 symlinked config or state directory is kept. A file set by
 `AGENTBELL_CONFIG` is listed and removed. `pip --user` removal touches
 only agentbell's own files. pipx detection reads both output streams and
@@ -1839,3 +1816,192 @@ name no longer finds a `.cmd` in the current directory (`watch --
 .\build` does). The AutoRun command no longer runs before a batch file.
 The Windows test suite covers this; a real PowerShell session running
 `watch -- npm …` is not field-tested yet.
+
+---
+
+## 38. OpenCode 2.x is a different plugin surface; normalise at the boundary (2026-09-24)
+
+**What was wrong.** The OpenCode plugin agentbell installs was written
+for OpenCode 1.18.x and did nothing on 2.x — it was not even loaded. The
+installed 2.0.15/2.0.16 runtime log said so on every start:
+
+```
+level=WARN message="failed to load plugin"
+  target=~/.config/opencode/plugin/agentbell.js
+  cause=PluginModule.LoadError: Plugin must export a default definition
+        with an id and an effect or setup function.
+        (cause: SchemaError(Missing key at ["default"]))
+```
+
+`hooks status` could not see this: the file was present and byte-for-byte
+what agentbell wrote, so "installed" was true and the failure was silent.
+
+
+**What is established.**
+
+- **2.x loading.** The module is decoded with
+  `Struct({default: Union([{id, effect}, {id, setup}])})` and every other
+  key is ignored. `default` must be a plain object: replaying that schema
+  with the `effect` build the binary bundles (4.0.0-beta.83, the copy in
+  `~/.opencode/node_modules`) accepts an object, rejects a callable with
+  "Expected object", and rejects a missing default with "Missing key". An
+  object with extra keys such as `server` is accepted.
+  `setup(ctx)` may return a cleanup function, and
+  `ctx.event.subscribe({ signal })` is an async iterable. The context has no
+  `$` shell helper, which is why the plugin spawns the CLI itself.
+- **2.x events.** `session.execution.succeeded` uses the base session
+  schema `{sessionID}`, `.failed` adds `error`, `.interrupted` adds
+  `reason` (`user`/`shutdown`/`superseded`/`inactivity`); `session.created`
+  carries `parentID` on the payload; every in-binary consumer of the
+  stream reads `data`; `permission.updated` occurs zero times.
+- **1.x loading.** From the published source at tag v1.18.18
+  (`packages/opencode/src/plugin/index.ts` and `.../plugin/shared.ts`, with
+  the same reader at v1.18.12):
+
+  ```ts
+  export function readV1Plugin(mod, spec, kind, mode = "strict") {
+    const value = mod.default
+    if (!isRecord(value)) { if (mode === "detect") return; throw new TypeError(...) }
+    if (mode === "detect" && !("id" in value) && !("server" in value) && !("tui" in value)) return
+    const server = "server" in value ? value.server : undefined
+    ...
+    if (kind === "server" && server === undefined)
+      throw new TypeError(`Plugin ${spec} must default export an object with server()`)
+    return value
+  }
+
+  async function applyPlugin(load, input, hooks) {
+    const plugin = readV1Plugin(load.mod, load.spec, "server", "detect")
+    if (plugin) { ...; hooks.push(await plugin.server(input, load.options)); return }
+    for (const server of getLegacyPlugins(load.mod))
+      hooks.push(await server(input, load.options))
+  }
+  ```
+
+  So the reader takes `mod.default`; a non-object default is not a 1.x
+  plugin, and in detect mode neither is an object with none of
+  `id`/`server`/`tui`. An object that has `id` but no callable `server`
+  **throws**. When it returns a plugin, `applyPlugin` pushes exactly one
+  hook and returns; only otherwise does `getLegacyPlugins` walk
+  `Object.values(mod)` and reject anything that is neither a function nor
+  an object with a callable `server`
+  ("Plugin export is not a function"). That is why `default` carries
+  `server: AgentBell`: one hook, and the legacy walk is never reached.
+- **1.x events.** `{type, properties}` per the 1.18.12/1.18.18 typings.
+  Those typings describe the 1.x protocol and predate 2.x; they are not a
+  statement about 2.x.
+
+**Decision.** One file, both loaders, normalised at a single boundary:
+
+- a `default` object `{ id, server: AgentBell, setup(ctx) }` — 1.x reads
+  `server`, 2.x reads `setup` and ignores `server`, and
+- the named function `AgentBell({ $ })`,
+
+sharing one `handleEvent`. `payloadOf(event)` returns
+`event.data || event.properties || {}`, so nothing below the boundary
+knows which host it is on. Turn end: `session.execution.succeeded` or
+`session.idle`. Failure: `session.execution.failed` or `session.error`.
+Subagent: `parentID` on the payload or under `info`; the new session's id
+is the payload/session id in both shapes, and only the 1.x
+`session.created` form needs `info.id` — in `message.updated` `info.id` is
+the *message* id and must not be used as a session key. Permission:
+`permission.asked` or `permission.updated`. `session.execution.interrupted`
+is silent, but records the end timestamp like a failure does, so a replay
+of the old prompt cannot re-arm the turn and inflate the next duration.
+
+Everything the plugin does after that is unchanged from §17c: the turn is
+timed from the user's prompt, an OpenCode re-sent prompt never starts a
+turn, the same session may not report a turn end twice inside 10 s, an
+unknown duration still notifies (§12j), and failures always notify.
+Unknown event names are ignored, and a notification or subscription
+failure never breaks the host.
+
+**Why `server` and not a second file.** The two readers disagree about what
+`default` must provide, and the initial WIP default only satisfied 2.x. Adding
+`server: AgentBell` satisfies the 1.x reader without a second entrypoint,
+an installer that detects a host version, or two files that would each
+need their own install/uninstall/status handling. A module whose `default`
+has `id` but no `server` is a hard error in the 1.x reader, so this is not
+optional polish — it is what makes the single file load on both.
+
+**Evidence.** The 1.x reader is quoted above from
+https://raw.githubusercontent.com/anomalyco/opencode/v1.18.18/packages/opencode/src/plugin/index.ts
+and
+https://raw.githubusercontent.com/anomalyco/opencode/v1.18.18/packages/opencode/src/plugin/shared.ts
+(public source, fetched 2026-09-24; the same reader is at v1.18.12), and
+`@opencode-ai/plugin@1.18.18` declares the matching
+`PluginModule = { id?, server, tui? }`. The 1.x claim is scoped to those two
+versions; other 1.x releases are not individually tested. The 2.x schema, the
+`effect` replay and the event schemas were read from the installed 2.0.16
+binary and the `effect` build it bundles (summarised above); the 2.x failure
+line is from `~/.local/share/opencode/log/opencode.log` (2026-09-23/24). The offline
+loader replay lives in
+`tests/test_agentbell.py::test_v1_loader_replay_registers_one_hook_and_delivers_once`.
+
+**Cost.** Existing installs need one `agentbell hooks install opencode`;
+until then they stay broken on 2.x and `hooks status` cannot tell you,
+because the file matches what the old version wrote. `permission.updated`
+is kept only for 1.x; a 2.x build that emits it again is already collapsed
+by the throttle. Interrupts are silent by decision and are not
+field-tested. The fixtures pin the shapes this section describes; they do
+not predict a future rename, so a host that moves a key again will be
+silent until someone notices — the same exposure every host integration
+here has.
+
+## 39. An MCP call that breaks its own schema has no side effect (2026-09-25)
+
+**What was wrong.** `tools/list` advertises `required: ["message"]` for
+both MCP tools, and `mcp_tool_call` read the field as
+`arguments.get("message", "")`. That default turned "the client sent no
+message" into "the client sent an empty message", so a `notify` call with
+empty arguments pushed a real, empty notification to the user's phone
+(live-tested 2026-09-25). `ask_approval` had the same hole: a call without
+a question still went to the phone. The declared types and the `priority`
+enum were unenforced as well — a stray `priority` was stored as written and
+silently delivered as `normal`.
+
+**Decision.** `mcp_tool_call` validates the arguments of a *known* tool
+against that tool's advertised `inputSchema` before anything else runs, and
+raises `RuntimeError` when they do not fit. `mcp_handle` already turns that
+into the MCP tool error result (`isError: true`), so the client sees a
+failure and the user sees nothing: no `Config()` read, no
+`send_notification`, no `run_ask`, no history record.
+
+Checked, and only this: every advertised `required` key is present, the
+declared type of a value that is there matches (`string` / `integer`), and
+an enum-valued field is one of its advertised values. A required string
+field that is empty or whitespace-only is refused as well. An explicit
+`null` on an optional field stays "not set" and keeps its default, which is
+how the tools read it before; an explicit `null` for a required field is a
+type error. Unknown keys stay tolerated.
+
+**Why hand-rolled and not a validator.** The advertised subset is one
+`string`, one `integer`, one four-value enum and one required field per
+tool, and it is our own text in `MCP_TOOLS`. A JSON Schema library would be
+a runtime dependency, which `CONTRIBUTING.md` forbids outright, and a
+hand-written "general" validator would be a second contract to keep in
+sync with the schema. `MCP_TOOL_SCHEMAS` is derived from `MCP_TOOLS`, so
+the thing enforced and the thing advertised cannot drift, and
+`TestMCPToolSignatures` pins the shape this validator understands.
+
+**Why refuse instead of repairing.** Guessing would hide the client bug
+that produced the call. A blank message could be dropped, a stray priority
+could be read as `normal` — that is what the old code did, and it is how a
+broken client stays broken without anyone noticing. The client gets the
+reason in the tool result and can fix its own call.
+
+**Behavior change.** A client that sent `timeout_seconds: "60"` or
+`priority: "whenever"` and relied on the old coercion now gets an error.
+Both were already outside the published contract; the coercion was
+tolerance, not a promise.
+
+**Not in this change.** The HTTP webhook (`POST /notify`, `POST /ask`)
+reads its body the same permissive way and still accepts an empty
+`message`. It is a different surface with a different caller (a script or
+a CI job that writes its own text, not an agent handed a schema), so it
+keeps its own contract until there is a reason to tighten it.
+
+**Cost.** Every future MCP tool has to keep its entry in `MCP_TOOLS`
+inside the subset above, or the validator silently ignores the part it
+does not understand. That is the one thing to extend first if a tool ever
+needs an array, a number or a nested object.

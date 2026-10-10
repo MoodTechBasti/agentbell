@@ -1,5 +1,72 @@
 # Changelog
 
+## 1.8.0 — 2026-10-10 — OpenCode 2.x plugin, MCP argument checks, Telegram setup fixes
+
+The OpenCode plugin stopped working on OpenCode 2.x, and the fix changes
+the file agentbell installs. Re-run `agentbell hooks install opencode`
+once after upgrading.
+
+Telegram works alone or next to ntfy. `agentbell init` asks for the bot
+token from @BotFather and finds the chat id once you have messaged the bot;
+`agentbell bot install-service` keeps the answer daemon running for the
+Approve/Deny buttons, and `agentbell bot status` shows whether it is ready.
+
+### Fixed
+
+- **The OpenCode plugin loads on OpenCode 2.x again.** OpenCode 2.0
+  changed the plugin surface, and the plugin agentbell installed was
+  written for 1.18.x, so on 2.0.16 it did nothing at all: the host refused
+  the module ("Plugin must export a default definition with an id and an
+  effect or setup function") and no bus event ever reached it. The plugin
+  now has a default export `{ id, server, setup(ctx) }` (1.x reads `server`,
+  2.x reads `setup`); events are read from
+  `event.data` as well as `event.properties`; the turn end and failure are
+  `session.execution.succeeded`/`.failed` as well as `session.idle`/
+  `session.error`; `session.created` carries `parentID` on the payload or
+  under `info`; `permission.asked` joins `permission.updated`. Turn
+  duration, the re-sent-prompt guard, the 10 s turn-end dedupe, the
+  subagent filter and the permission throttle are unchanged. An
+  interrupted turn (`session.execution.interrupted`) stays silent but is
+  now terminal, so a replayed prompt cannot inflate the next turn's
+  duration.
+
+  Validated offline: the 1.x loader source at tag v1.18.18, the 2.0.16
+  loader schema and event schemas, and both offline fixtures. Not yet
+  checked on a real 1.x or 2.x session. See `DECISIONS.md` §38.
+
+- **`init --telegram-token` keeps the saved chat id.** A new bot token
+  without `--telegram-chat` replaced the chat id with nothing, so a working
+  Telegram setup stopped sending without a word. The chat id changes only
+  when `--telegram-chat` is given.
+- **`config set` and `init` explain an unwritable config instead of
+  printing a traceback.** With `config.json` as a symlink into a read-only
+  target (Nix/home-manager, a dotfiles manager) both ended in a traceback.
+  They now print `agentbell: cannot write … (a symlink to …)` with the way
+  out, exit 1 and change nothing. See `DECISIONS.md` §34.
+- **`doctor` says what a Telegram channel is missing.** A channel that is
+  listed without a bot token, a chat id, or both was just "not configured".
+  The row now names the gap, says that ntfy still delivers (`notify` reports
+  the Telegram error with exit 3 and sends on ntfy), and gives the command
+  that fixes it or drops Telegram from the channels. A token or chat id saved
+  without the other half gets a warning even when Telegram is not listed.
+
+### Changed
+
+- **An MCP tool call that breaks its own advertised schema is refused
+  instead of half-run.** `tools/list` advertised `required: ["message"]` for
+  `notify` and `ask_approval`, and the server never checked it: a client that
+  omitted `message` sent a real, empty push, and `ask_approval` without a
+  question still reached the phone. `priority` outside the advertised four
+  names was delivered as `normal`. The stdio server now checks a known
+  tool's arguments against that schema — required fields present, the
+  declared type of a value that is there (`string` / `integer`), the
+  `priority` enum — and answers with the MCP tool error (`isError: true`,
+  and no notification, approval or history record) when the call does not
+  fit. Empty and whitespace-only messages are refused too. Callers that
+  relied on the old coercion have to change: `timeout_seconds: "60"` and
+  `priority: "whenever"` are errors now, not guesses. Extra unknown keys are
+  still tolerated, and the webhook is unchanged. See `DECISIONS.md` §39.
+
 ## 1.7.0 — 2026-09-24 — audit hardening
 
 Fixes from the 2026-09-22 audit (69 findings) and three review rounds of
@@ -323,9 +390,7 @@ that is still running from an earlier version. Until it restarts, `ask`,
   `python3 -m agentbell` (`python agentbell.py bot run`), and the systemd
   unit uses `Type=exec`, so a command that cannot start fails the install.
   The unit or plist carries the installing shell's `AGENTBELL_CONFIG` and
-  `AGENTBELL_STATE_DIR`; a license key held only in `AGENTBELL_LICENSE` is
-  refused with a pointer to `agentbell license activate`. Re-running it
-  restarts a running bot. Checked with `systemd-analyze verify`, plistlib
+  `AGENTBELL_STATE_DIR`. Re-running it restarts a running bot. Checked with `systemd-analyze verify`, plistlib
   and mocked `systemctl` / `launchctl`, not yet under a real service
   manager.
 - `agentbell uninstall` stops, disables and deletes the bot service
@@ -465,7 +530,7 @@ that is still running from an earlier version. Until it restarts, `ask`,
   symlinked directory is reported as kept.
 - A config file set with `AGENTBELL_CONFIG` is listed and removed. When
   the config file is a symlink, uninstall says that only the link goes
-  and the target still holds the license key and tokens.
+  and the target still holds the tokens.
 - A pipx install is found even when `pipx list` exits 1 over a broken
   venv; if pipx cannot be asked, the plan says so. Other pip `--user`
   packages whose name starts with `agentbell` are left alone.
@@ -519,10 +584,6 @@ that is still running from an earlier version. Until it restarts, `ask`,
 - `config set ntfy.auth none` (and `ntfy.action_auth none`) no longer
   warns that a credential travels over plain http while clearing it, and
   shows the cleared value as `null` instead of `"<redacted>"`.
-- `license activate` with an invalid key, `init` and the premium refusal
-  no longer point to a purchase e-mail or a price: there is no online
-  checkout, and they say to e-mail basti@moodtechsolutions.com or open a
-  GitHub issue for a key, as the README does.
 
 ### Security
 
@@ -589,7 +650,7 @@ fixed here; the disposition and rejected alternatives are in
   this workflow on 2026-09-03, and `pipx install agentbell` is the primary
   install path. The release gate also asserts that the only Python runtime
   file in wheel and sdist is `agentbell.py`, that the console
-  entry point is present, and that tests, `internal/` and `.license-secret`
+  entry point is present, and that tests and `internal/`
   are absent. Rationale: `DECISIONS.md` §19.
 
 ### Verified
@@ -887,29 +948,13 @@ needs to know an agent to work with it: it **publishes a contract** and
   module, config and state dirs, env vars, block markers and MCP server name
   all changed with it; the entries below are written in the new names even
   where the older, never-published builds used the old one.
-- **Licensing moved from HMAC to Ed25519 signatures.** Keys now look like
-  `AB1-…` and carry an Ed25519 signature over their payload. `agentbell.py`
-  contains only the matching **public** key, so a key cannot be forged from
-  anything that ships, and the private seed never leaves the author's machine.
-  RFC 8032 is implemented in stdlib Python (SHA-512 + integer math) and covered
-  by the RFC's own §7.1 test vectors. Rationale: `DECISIONS.md` §2b.
-- **The build step is gone.** `tools/build.py` used to inject a symmetric
-  signing secret into the installed copy — a secret that a single-file release
-  on PyPI would have handed to anyone with `pip download` and `grep`. There is
-  nothing to inject any more: `install.sh` installs the source file directly
-  (pipx → `pip --user` → plain copy, unchanged fallback chain).
-- **"This build cannot verify keys" is gone**, because that state can no longer
-  exist: every copy verifies keys with the embedded public key. `doctor`, the
-  init wizard and `license activate` dropped their branches for it — a key that
-  does not check out is now simply reported as invalid, with a support hint.
 
 ### Security
 
 - Pre-release hardening pass: the webhook rejects browser-originated requests
   and oversized bodies, config and hook writes refuse to follow symlinks, the
   HTTP opener never follows redirects (credentials are not replayed to another
-  host), licensing fails closed on anything it cannot verify, and files holding
-  credentials are written with stricter modes.
+  host), and files holding credentials are written with stricter modes.
 
 ## 1.4.1 — 2026-08-16 — every integration re-verified against the live vendor docs
 
@@ -991,7 +1036,7 @@ below cost the user something during that run.
   pass through as what they are, and the wizard offers to keep the unverified
   token and carry on.
 - **A bad bot token aborted the whole wizard** (`SystemExit(3)`), throwing away
-  the ntfy topic and the license key already entered. The token prompt now
+  the ntfy topic already entered. The token prompt now
   retries, and giving up only skips Telegram — everything else stays configured.
   `find_chat_id` failing no longer crashes `init` either.
 
@@ -1078,9 +1123,6 @@ Rationale for every decision is in `DECISIONS.md` §12.
   now rejected.
 - **The queue drain blocked the daemon** for minutes on a long backlog; it is now
   capped at 20 s per cycle so approvals keep flowing.
-- **`notify` exited 3 and hid a successful ntfy delivery** when the config listed
-  Telegram without a valid license. Config-derived channels degrade; an explicit
-  `--channel telegram` still fails loudly.
 - **The approval poller and `test` ignored ntfy auth**, so both silently failed
   against a protected self-hosted ntfy.
 - **The live approval stream died after ~46 s** (read timeout equal to ntfy's
@@ -1099,17 +1141,14 @@ Rationale for every decision is in `DECISIONS.md` §12.
 
 ### Security
 
-- **The paid tier was unlockable by anyone**: `AGENTBELL_LICENSE_SECRET` let a
-  user choose the *verifier's* secret and sign their own key. A build with the
-  real secret injected now ignores the environment entirely.
 - **The Telegram bot token leaked** into `history.jsonl`, `bot.json`, queue files
   and stderr — every error message carried the full API URL. Scrubbed at the
   single choke point.
 - **`_pid_alive` terminated processes on Windows**: `os.kill(pid, 0)` maps to
   `TerminateProcess` there. It now queries the exit code instead.
-- `config.json` is written **0600** (license key, Telegram token, ntfy password)
+- `config.json` is written **0600** (Telegram token, ntfy password)
   and every config write is atomic.
-- `config show` redacts **all four** credentials — it previously printed the
+- `config show` redacts **every** credential — it previously printed the
   self-hosted ntfy password and the webhook token in clear.
 - The webhook server **refuses to listen on a non-loopback address without a
   token**, and rejects a malformed `timeout_seconds` with 400 instead of dying.
@@ -1125,7 +1164,7 @@ Rationale for every decision is in `DECISIONS.md` §12.
 ### Added
 
 - **`agentbell doctor`** — checks install, PATH, config, file mode, topic,
-  server reachability, quiet hours, license, Telegram daemon, agent hooks, MCP
+  server reachability, quiet hours, Telegram daemon, agent hooks, MCP
   registrations, queue backlog and state dir, and prints a **copy-paste fix
   command** for everything that is wrong. `--send` adds a real delivery test.
 - **Desktop apps via MCP**: `mcp add` targets `claude`, `claude-desktop`,
@@ -1144,8 +1183,6 @@ Rationale for every decision is in `DECISIONS.md` §12.
   `hook.skipped_short`). Failures and unknown durations always notify.
 - `init` and `install.sh` end with a copy-paste **NEXT STEPS** block; the wizard
   walks you through BotFather for Telegram.
-- `license activate` and `doctor` detect a build installed without the signing
-  secret, instead of blaming your key.
 - A denial can carry a reason ("no, not before the release") instead of losing it.
 
 ### Changed

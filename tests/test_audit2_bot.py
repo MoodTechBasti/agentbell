@@ -50,14 +50,13 @@ def _remove_bot_files():
             pass
 
 
-# The child imports agentbell from this checkout, points it at the mock Bot
-# API and stands in for a licensed install. Everything else is the real CLI.
+# The child imports agentbell from this checkout and points it at the mock Bot
+# API. Everything else is the real CLI.
 _BOT_CHILD = """\
 import sys
 sys.path.insert(0, sys.argv[1])
 import agentbell as an
 an.TG_API_BASE = sys.argv[2]
-an.premium_enabled = lambda cfg: True
 an.main(["bot", "run"])
 """
 
@@ -71,8 +70,7 @@ class TestBotStopsCleanlyOnSigterm(unittest.TestCase):
         sandbox = tempfile.mkdtemp(prefix="agentbell-sigterm-")
         try:
             env = dict(os.environ)
-            for key in ("AGENTBELL_CONFIG", an.LICENSE_ENV):
-                env.pop(key, None)
+            env.pop("AGENTBELL_CONFIG", None)
             for key in ("HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_STATE_HOME"):
                 env[key] = os.path.join(sandbox, key.lower())
             env[an.CONFIG_DIR_ENV] = os.path.join(sandbox, "config")
@@ -216,8 +214,6 @@ class TestInstallServiceReportsFailure(unittest.TestCase):
         self.returncode = 0
         for patch in (
             unittest.mock.patch.object(an, "Config", lambda *a, **k: cfg),
-            unittest.mock.patch.object(an, "premium_enabled", lambda cfg: True),
-            unittest.mock.patch.object(an, "check_license_key", lambda key: True),
             # never the real systemctl/launchctl of this machine
             unittest.mock.patch.object(an.subprocess, "run", self._fake_run),
         ):
@@ -410,7 +406,6 @@ class TestChatIdDiscoverySkipsGroups(unittest.TestCase):
             with unittest.mock.patch.dict(os.environ, {"AGENTBELL_CONFIG": path}), \
                     unittest.mock.patch.object(an.sys.stdin, "isatty", return_value=True), \
                     unittest.mock.patch("builtins.input", lambda prompt="": next(answers)), \
-                    unittest.mock.patch.object(an, "premium_enabled", lambda cfg: True), \
                     unittest.mock.patch.object(an.TelegramChannel, "validate_token",
                                                staticmethod(lambda token: "testbot")), \
                     unittest.mock.patch.object(an.TelegramChannel, "_call",

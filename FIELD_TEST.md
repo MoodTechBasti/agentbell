@@ -1,4 +1,4 @@
-# FIELD TEST — 2-week checklist (v1.7.0)
+# FIELD TEST — 2-week checklist (v1.8.0)
 
 Goal: use the tool like a real user for two weeks and tick off every path below.
 Budget: ~20 minutes for the first pass, then just use it.
@@ -33,7 +33,7 @@ This is local artifact evidence, **not** proof that PyPI serves agentbell:
 - A fresh release-tools venv built the v1.6.3 wheel and sdist; `twine check`
   passed both. Archive inspection found `agentbell.py` as the only Python
   runtime file and the `agentbell = agentbell:main` console entry point. No
-  tests, `internal/` files or `.license-secret` were present.
+  tests or `internal/` files were present.
 - Fresh local-wheel installs through both `pip` and an isolated pipx 1.17.2
   environment reported `agentbell 1.6.3`; `pip show` listed no requirements.
   In the deliberately unconfigured pipx home, `agentbell doctor` completed
@@ -57,7 +57,7 @@ Proof that PyPI itself serves the package, not just a local wheel:
   `agentbell-1.6.3-py3-none-any.whl` from PyPI and installed cleanly.
   `agentbell --version` reported `agentbell 1.6.3`; `agentbell doctor` ran
   its full check set (install, config, ntfy topic, channels, quiet hours,
-  license, agent hooks, MCP, state dir) and correctly flagged the two
+  agent hooks, MCP, state dir) and correctly flagged the two
   expected pre-`init` gaps (no config, no topic) with their fix commands.
 
 Rows 1 and 19 below are updated to reflect this. `pipx` itself was not
@@ -105,16 +105,16 @@ this retained evidence.
 | 10 | Codex hooks | `agentbell hooks install codex`, finish a turn | `run_completed` push; check `/hooks` inside Codex if not |
 | 11 | OpenCode plugin | `agentbell hooks install opencode`, finish a turn in **any** repo | `run_completed` push **with duration** (plugin is global); exactly one push per turn; a turn under 60 s stays silent (`hook.skipped_short`); a doubled `session.idle` shows up as at most one `hook.skipped_duplicate` record, never as a second buzz — **v1.6.0 result: failed** (24 same-second doubles in 415 turns, no short-turn filter; see the agent table), fixed in v1.6.1. **Re-verification 2026-09-03 (v1.6.2 plugin, OpenCode 1.18.26): passed.** Three consecutive real turns in one session: 9 s → one `hook.skipped_short`; 62 s → exactly one `hook.run_completed` delivered to ntfy + Telegram with `in 1m02s` in the text; 51 s → one `hook.skipped_short`. No second record for any turn; `verify --agent opencode --since 10m` reported `3 event(s): 1 delivered, 2 skipped (short turn)`, exit 0 |
 | 12 | MCP in a desktop app | `agentbell mcp add claude-desktop chatgpt-desktop`, restart the app | The app lists `notify` / `ask_approval` and can call them |
-| 13 | Telegram (premium) | `agentbell license activate <key>`, `agentbell init`, `agentbell bot install-service` | Question with Telegram buttons; a press answers the ask; `bot status` healthy after closing the terminal |
+| 13 | Telegram | `agentbell init`, `agentbell bot install-service` | Question with Telegram buttons; a press answers the ask; `bot status` healthy after closing the terminal |
 | 14 | Parallel channels | with ntfy + Telegram: `agentbell ask "Deploy?"` | Both get it; first answer wins; `channel` in `--json` says which. A button press gives `approved: true`; a typed free-text answer exits 0 with `approved: false` |
 | 15 | Quiet hours / defer | set quiet hours to "now", mode `defer`, send a low-prio notify | No push now; after the window / `queue flush` it arrives (up to 3 due items one by one, 4 or more → one summary) |
 | 16 | Offline queue | point the server at a dead port, `agentbell notify "offline"` | Exit 0 + stderr warning; `queue list` shows it; after fixing, `queue flush` delivers |
 | 17 | history | `agentbell history --limit 20` | sent / suppressed / deferred / queued / ask results all visible |
-| 18 | secrets | `agentbell config show` | license, bot token, ntfy password, `ntfy.action_auth` and webhook token redacted, the topic shortened to its first 6 characters; `ls -l` on config.json shows `-rw-------` |
+| 18 | secrets | `agentbell config show` | bot token, ntfy password, `ntfy.action_auth` and webhook token redacted, the topic shortened to its first 6 characters; `ls -l` on config.json shows `-rw-------` |
 | 19 | Full purge + re-init | `agentbell uninstall`, then `--yes`, then `pipx install agentbell && agentbell init` | Dry run lists the pipx package and everything else; purge uses `pipx uninstall agentbell`, removes config/state/hooks/MCP, and keeps foreign config — pipx-specific removal still only verified in the 2026-09-03 isolated-pipx test above, not re-run here |
-| 20 | License status | `agentbell license status` | Correct premium state |
+| 20 | Bot status | `agentbell bot status` | Shows whether the Telegram bot is configured and running |
 | 21 | Change one setting | `agentbell config set ntfy.topic <long-random>` | Written + re-subscribe hint; `doctor` turns the topic WARN into OK; no wizard needed |
-| 22 | Setup survives a hiccup | in `init`, paste a bot token while offline | Says "could not reach Telegram", offers to keep it — the license key and topic entered before are **not** lost |
+| 22 | Setup survives a hiccup | in `init`, paste a bot token while offline | Says "could not reach Telegram", offers to keep it — the topic entered before is **not** lost |
 | 23 | Self-integration (unknown agent) | hand `agentbell integrate` output to an agent NOT in the table (e.g. GitHub Copilot CLI), let it wire itself, finish one real turn | `verify --agent <slug> --since 10m` exit 0, event shown as real (not forced); push arrived with the slug as its label — **passed 2026-08-21** with GitHub Copilot CLI 1.0.80, see Tier-1 result below |
 | 24 | Double integration is detected | wire the same agent via hooks AND the Appendix A rules block on purpose, finish a turn **of at least 60 s** (a shorter turn hits `--min-duration` on the hook side, leaves only one `run_completed` record and defeats the check) | One push — the identical second one is suppressed and recorded as `hook.skipped_duplicate` (v1.6.0 delivered both); `agentbell verify` WARNs "possible double integration" either way; after removing one mechanism, a fresh window is clean (`verify --since 10m`) — **passed 2026-08-21** with GitHub Copilot CLI 1.0.80 under v1.6.0 semantics (two pushes); the default 7-day window keeps warning until the old duplicate records age out |
 | 25 | Old Aider block migration | put a pre-scope agentbell block containing `--agent aider` in an `AGENTS.md` that also has user sections; run `agentbell hooks status`, `agentbell verify --json`, then `agentbell hooks install aider` | status/text verify show the bordered ACTION REQUIRED banner; JSON has `repair_notices[0].code == "aider_agents_block_outdated"`; reinstall preserves user sections and the next status says `installed` with no banner |
@@ -147,14 +147,14 @@ evidence".
 | 41 | Server change drops credentials | on a config with `ntfy.auth` (and `ntfy.action_auth`): `agentbell config set ntfy.server https://other.example`, then `agentbell config show`; also re-run `agentbell init` and enter another server | stderr says each credential was cleared; `config show` has no auth; the next `ask`/`notify` sends no password to the new server. Setting the same server with a trailing slash or different letter case keeps them | [ ] |
 | 42 | Parallel sessions keep their own durations | two Claude Code sessions in one repo; a long turn (> 60 s) in one while a short turn ends in the other | the long turn pushes with its own duration; the short one is `hook.skipped_short` | [ ] |
 | 43 | Tuned `--min-duration` survives reinstall | change `--min-duration 60` to `120` in agentbell's `Stop` hook in `~/.claude/settings.json`, run `agentbell hooks install claude` | the hook still says `120` | [ ] |
-| 44 | OpenCode plugin update | after upgrading, `agentbell hooks status` (shows `update needed`), `agentbell hooks install opencode`, then the three turns of row 11 | status `installed`; row 11's expectations hold with the 1.7.0 plugin | [ ] |
+| 44 | OpenCode plugin update | after upgrading, `agentbell hooks status` (shows `update needed`), `agentbell hooks install opencode`, then the three turns of row 11 | status `installed`; row 11's expectations hold with the current plugin, on OpenCode 1.x and on 2.x (the 2.x loader path is validated offline only, DECISIONS §38) | [ ] |
 | 45 | Purge with a shared state dir | `AGENTBELL_STATE_DIR` pointing at a directory that also holds a foreign file, plus a foreign file inside its `runs/`; `agentbell uninstall`, then `--yes` | the dry run lists the foreign files as kept; after `--yes` they are still there and only agentbell's entries are gone | [ ] |
 | 46 | Typed reply after a lost connection | `agentbell ask "A?" --timeout 300` on a laptop; disconnect the laptop (Wi-Fi off), type `yes` as a reply in the ntfy app, wait about a minute, reconnect | `A` is not approved; a "Reply not used" notification says the reply arrived more than 30 s after it was sent; `agentbell history` has `stale_answer` with that reason; the Approve button still answers `A` | [ ] |
 
 ## Agent wiring — all 12
 
-Rows 9–11 above cover Claude Code, Codex and OpenCode; Kimi Code was in
-daily use as well and is ticked in the table below. These are all twelve,
+Rows 9–11 above cover Claude Code, Codex and OpenCode; Kimi Code was used on
+two days and is ticked in the table below. These are all twelve,
 so the gaps are visible instead of implied. **Everything unticked is untested,
 not "known good".**
 
@@ -295,7 +295,6 @@ second (the near-duplicate heuristic now only covers per-turn events).
 - **Caps**: 200 deferred items, 100 queued items / 24 h age (counted from the first queueing, also across a quiet-hours defer), history rotated at 2 MB.
 - **Six agents are wired by rule file, not by hook**: for Cursor, Windsurf, Cline, Continue, Zed and Aider agentbell writes an instruction the agent is asked to follow, per project (run `hooks install <agent>` in each repo). Cursor has since documented lifecycle hooks of its own; agentbell does not use them yet. Best-effort by construction — the model can skip it, and sometimes will. The other six (Claude Code, Codex, Gemini CLI, OpenCode, Kimi Code, Qwen Code) have real hook systems and are deterministic.
 - **ChatGPT web** cannot use a local MCP server (desktop app can).
-- **Premium**: Telegram channel, parallel delivery and Telegram buttons need a lifetime key.
 - **A manual smoke test without `--force` is indistinguishable from a real event**: `verify` marks `--force` events as smoke tests, but an agent running the plain hook command by hand looks like real wiring. The trust anchor is procedural — end the session, do one real turn, then `verify`.
 - **MCP attribution only works when the client passes `agent`**: the `notify` tool's `agent` argument is optional; calls without it appear in history without attribution.
 

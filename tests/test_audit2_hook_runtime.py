@@ -452,7 +452,6 @@ def _sandbox_env(root):
         env[key] = os.path.join(root, key.lower())
         os.makedirs(env[key], exist_ok=True)
     env.pop(an.CONFIG_FILE_ENV, None)
-    env.pop(an.LICENSE_ENV, None)
     env["PYTHONIOENCODING"] = "cp1252"     # what a Windows pipe/redirect gets
     return env
 
